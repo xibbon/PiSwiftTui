@@ -547,3 +547,16 @@ private final class ProtectedLineState: @unchecked Sendable {
         return line
     }
 }
+
+@Test func plainHelpHasNoPackageManagerChatterV085() async throws {
+    let root = try makeStdoutCleanlinessTempDir()
+    defer { try? FileManager.default.removeItem(atPath: root) }
+    let result = try await runCLI(["--help"], cwd: root, agentDir: root)
+    #expect(result.status == 0)
+    #expect(result.stdout.contains("Usage:"))
+    #expect(result.stdout.contains("[--]"))
+    #expect(result.stdout.contains("--use-theme"))
+    #expect(!result.stderr.contains("Usage:"))
+    #expect(!result.stderr.contains("changed 1 package in 471ms"))
+    #expect(!result.stderr.contains("found 0 vulnerabilities"))
+}

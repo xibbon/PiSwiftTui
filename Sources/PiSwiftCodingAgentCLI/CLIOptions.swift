@@ -48,6 +48,12 @@ struct CLIOptions: ParsableArguments {
     @Option(name: .customLong("session"), help: "Use specific session file")
     var session: String?
 
+    @Option(name: .customLong("name"), help: "Set the session display name")
+    var sessionName: String?
+
+    @Option(name: .customLong("use-theme"), help: "Use a theme for this interactive run without saving it")
+    var useTheme: String?
+
     @Option(name: .customLong("session-id"), help: "Use a specific ID for a new session")
     var sessionId: String?
 
@@ -123,6 +129,12 @@ struct CLIOptions: ParsableArguments {
     var rawMessages: [String] = []
 
     mutating func validate() throws {
+        if let useTheme, useTheme.hasPrefix("-") {
+            throw ValidationError("--use-theme requires a theme name")
+        }
+        if let sessionName, normalizeSessionName(sessionName) == nil {
+            throw ValidationError("--name requires a non-empty value")
+        }
         guard tuiModeOption == nil || InteractiveTuiMode(rawValue: tuiModeOption ?? "") != nil else {
             throw ValidationError("--tui-mode requires regular or fullscreen")
         }
@@ -273,4 +285,9 @@ extension CLIOptions {
     static func isOfflineEnvironmentEnabled(_ env: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
         env["PI_OFFLINE"] == "1"
     }
+}
+
+func normalizeSessionName(_ value: String) -> String? {
+    let name = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return name.isEmpty ? nil : name
 }

@@ -102,14 +102,13 @@ private func runConfigSubcommand(_ cli: CLIOptions) async throws {
         settingsManager: settingsManager,
         cwd: cwd,
         agentDir: agentDir,
-        initialProjectMode: cli.configLocal
+        initialProjectMode: cli.configLocal,
+        projectTrusted: trustContext.trust.trusted
     )
 }
 
 private func reportSubcommandSettingsErrors(_ settingsManager: SettingsManager, context: String) {
-    for error in settingsManager.drainErrors() {
-        fputs("Warning (\(context), \(error.scope) settings): \(error.message)\n", stderr)
-    }
+    reportStartupDiagnostics(collectSettingsDiagnostics(settingsManager))
 }
 
 struct AuthSubcommand: ParsableCommand {
@@ -134,7 +133,7 @@ struct AuthCheckSubcommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "check",
         abstract: "Check provider authentication",
-        usage: "pi auth check (--provider <provider> | --model <model>) [--credentials]"
+        usage: "\(APP_NAME) auth check (--provider <provider> | --model <model>) [--credentials]"
     )
 
     @ParentCommand var parent: AuthSubcommand
@@ -163,7 +162,7 @@ struct PrintAPIKeySubcommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "print-api-key",
         abstract: "Print an API key",
-        usage: "pi auth print-api-key (--provider <provider> | --model <model>)"
+        usage: "\(APP_NAME) auth print-api-key (--provider <provider> | --model <model>)"
     )
 
     @ParentCommand var parent: AuthSubcommand
@@ -187,7 +186,7 @@ struct PrintBearerTokenSubcommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "print-bearer-token",
         abstract: "Print an OAuth bearer token",
-        usage: "pi auth print-bearer-token (--provider <provider> | --model <model>) [--min-expiry <duration>]"
+        usage: "\(APP_NAME) auth print-bearer-token (--provider <provider> | --model <model>) [--min-expiry <duration>]"
     )
 
     @ParentCommand var parent: AuthSubcommand

@@ -290,7 +290,12 @@ public final class InteractiveMode {
     private var setToolSendMessageHandler: (@Sendable (_ handler: @escaping HookSendMessageHandler) -> Void) = { _ in }
 
     private var isInitialized = false
-    private var loadingAnimation: Loader?
+    private(set) var loadingAnimation: WorkingStatusIndicator?
+    private(set) var activeWorkingIndicatorEmbedded = false
+    private var startupDiagnostics: [ResourceDiagnostic] = []
+    private var startupToolStatuses: [ToolStatus] = []
+    private var initialThemeSetting: String?
+    private var themeController: InteractiveThemeController?
     private var lastSigintTime: TimeInterval = 0
     private var lastEscapeTime: TimeInterval = 0
 
@@ -299,7 +304,7 @@ public final class InteractiveMode {
     private var pendingTools: [String: ToolExecutionComponent] = [:]
     private var toolOutputExpanded = false
     private var hideThinkingBlock = false
-    private let defaultWorkingMessage = "Working... (esc to interrupt)"
+    private let defaultWorkingMessage = "Working"
     private var workingMessage: String?
 
     private var isBashMode = false
@@ -341,7 +346,9 @@ public final class InteractiveMode {
         setToolSendMessageHandler: @escaping @Sendable (_ handler: @escaping HookSendMessageHandler) -> Void = { _ in },
         fdPath: String? = nil,
         verbose: Bool = false,
-        tuiMode: InteractiveTuiMode? = nil
+        tuiMode: InteractiveTuiMode? = nil,
+        startupDiagnostics: [ResourceDiagnostic] = [],
+        initialThemeSetting: String? = nil
     ) {
         self.init(
             chatContainer: Container(),
@@ -349,6 +356,8 @@ public final class InteractiveMode {
             tuiConfiguration: InteractiveTuiConfiguration(mode: tuiMode ?? .regular)
         )
         self.tuiModeOverride = tuiMode
+        self.startupDiagnostics = startupDiagnostics
+        self.initialThemeSetting = initialThemeSetting
         self.session = session
         self.version = version
         self.changelogMarkdown = changelogMarkdown
@@ -360,12 +369,24 @@ public final class InteractiveMode {
         self.verboseStartup = verbose
     }
 
+    /// Construct a mounted component host for embedding and deterministic event tests.
+    convenience init(session: AgentSession, tui: TUI, editor: EditorComponentView, renderer: AltScreenRenderer? = nil) {
+        self.init(session: session, version: VERSION)
+        self.tui = tui
+        self.ui = TuiRenderAdapter(tui)
+        self.editor = editor
+        self.defaultEditor = editor as? CustomEditor
+        self.statusContainer = Container()
+        self.altScreenRenderer = renderer
+    }
+
     public func start(
         initialMessages: [String] = [],
         initialMessage: String? = nil,
         initialImages: [ImageContent]? = nil
     ) async {
         await initializeIfNeeded()
+        guard !isShuttingDown else { return }
         registerShutdownSignalHandlers()
         startBackgroundCatalogRefresh()
         if let session {
@@ -375,6 +396,9 @@ public final class InteractiveMode {
             )
         }
         renderInitialMessages()
+        renderStartupDiagnostics()
+        tui?.requestRender(force: true)
+        await tui?.waitForRender()
         emitOsc133("A") // initial prompt start
 
         if let initialMessage {
@@ -384,6 +408,7 @@ public final class InteractiveMode {
             await prompt(message, images: nil)
         }
 
+        guard !isShuttingDown else { return }
         await withCheckedContinuation { continuation in
             self.exitContinuation = continuation
         }
@@ -414,11 +439,13 @@ public final class InteractiveMode {
         keybindings = KeybindingsManager.create()
 
         if tui == nil {
-            let created = TUI(terminal: ProcessTerminal())
+            applyInteractiveTerminalCapabilities(session.settingsManager)
+            let created = TUI(terminal: ProcessTerminal(), showHardwareCursor: session.settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
             tui = created
             ui = TuiRenderAdapter(created)
         }
         guard let tui else { return }
+        tui.setClearOnShrink(session.settingsManager.getClearOnShrink())
 
         tui.onGlobalInput = { [weak self] data in
             guard let self else { return false }
@@ -444,18 +471,24 @@ public final class InteractiveMode {
         )
         hideThinkingBlock = settingsManager.getHideThinkingBlock()
 
-        initTheme(settingsManager.getTheme(), enableWatcher: true)
+        themeController = InteractiveThemeController(ui: tui, getSettingsManager: { [weak self] in
+            self?.session?.settingsManager ?? settingsManager
+        }, showError: { [weak self] in self?.showError($0) }, onChanged: { [weak self] in
+            self?.updateEditorBorderColor()
+        }, initialThemeSetting: initialThemeSetting)
 
         let pendingMessages = Container()
         let status = Container()
         let widgets = Container()
         let defaultEditor = CustomEditor(
+            ui: tui,
             theme: getEditorTheme(),
             keybindings: keybindings,
             options: EditorOptions(
                 paddingX: settingsManager.getEditorPaddingX(),
                 autocompleteMaxVisible: settingsManager.getAutocompleteMaxVisible()
-            )
+            ),
+            embedWorkingStatus: true
         )
         let editorContainer = Container()
         let footerDataProvider = FooterDataProvider()
@@ -487,6 +520,13 @@ public final class InteractiveMode {
             SlashCommand(name: "settings", description: "Open settings menu"),
             SlashCommand(name: "config", description: "Configure resources"),
             SlashCommand(name: "model", description: "Select model"),
+            SlashCommand(name: "thinking", description: "Set thinking level", argumentHint: "<level>", getArgumentCompletions: { [weak self] query in
+                let levels = self?.session?.getAvailableThinkingLevels() ?? []
+                let items = levels.map { AutocompleteItem(value: $0.rawValue, label: $0.rawValue) }
+                return fuzzyFilter(items, query: query) { $0.value }
+            }),
+            SlashCommand(name: "share", description: "Share session as a private gist"),
+            SlashCommand(name: "trust", description: "Manage project trust"),
             SlashCommand(name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling"),
             SlashCommand(name: "theme", description: "Select theme"),
             SlashCommand(
@@ -580,8 +620,10 @@ public final class InteractiveMode {
             scrollbarStyle: fullscreenScrollbarStyle
         )
         self.composition = composition
-        let altScreenRenderer = tui.enableAltScreen(options: AltScreenRendererOptions(
-            wheelScrollLines: tuiConfiguration.mouseWheelStep
+        let altScreenRenderer = tui.enableAltScreen(options: interactiveAltScreenOptions(
+            wheelScrollLines: tuiConfiguration.mouseWheelStep,
+            copyOnSelect: settingsManager.getFullscreenCopyOnSelect(),
+            onRightClickPaste: { [weak self] in self?.handleClipboardImagePaste() }
         ))
         altScreenRenderer.setLayoutRoot(composition.fullscreenRoot)
         self.altScreenRenderer = altScreenRenderer
@@ -589,15 +631,27 @@ public final class InteractiveMode {
             _ = tui.switchRenderer(to: .altScreen)
         }
         tui.setFocus(defaultEditor)
+        defaultEditor.onAction(.clear) { [weak self] in self?.handleCtrlC() }
+        defaultEditor.onAction(.exit) { [weak self] in self?.handleCtrlD() }
+        defaultEditor.onSubmit = { [weak self] text in self?.handleStartupSubmit(text) }
         tui.start()
 
-        if settingsManager.getTheme() == nil {
-            let detectedTheme = await detectTerminalTheme(ui: tui, timeoutMs: 100)
-            _ = setTheme(detectedTheme.rawValue, enableWatcher: true)
-            tui.invalidate()
-            tui.requestRender()
-        }
+        await themeController?.applyFromSettings()
 
+        let statuses = ManagedToolStatuses()
+        async let installedFd = ensureTool("fd", onStatus: { [weak self] status in
+            statuses.append(status)
+            Task { @MainActor [weak self] in self?.drainManagedToolStatuses(statuses) }
+        })
+        async let installedRg = ensureTool("rg", onStatus: { [weak self] status in
+            statuses.append(status)
+            Task { @MainActor [weak self] in self?.drainManagedToolStatuses(statuses) }
+        })
+        let (fd, _) = await (installedFd, installedRg)
+        guard !isShuttingDown else { return }
+        fdPath = fd
+        drainManagedToolStatuses(statuses)
+        rebuildAutocomplete()
         await initializeHooksAndCustomTools()
         configureKeyHandlers()
         subscribeToAgent()
@@ -627,6 +681,7 @@ public final class InteractiveMode {
         let rendererMode: TuiMode = mode == .fullscreen ? .altScreen : .mainScreen
         guard tui.switchRenderer(to: rendererMode) else { return false }
         tuiConfiguration.mode = mode
+        mountWorkingIndicator()
         return true
     }
 
@@ -646,13 +701,14 @@ public final class InteractiveMode {
         if wasFullscreen {
             _ = tui.switchRenderer(to: .mainScreen)
         }
-        let renderer = tui.enableAltScreen(options: AltScreenRendererOptions(wheelScrollLines: normalized))
+        let renderer = tui.enableAltScreen(options: interactiveAltScreenOptions(wheelScrollLines: normalized, copyOnSelect: session?.settingsManager.getFullscreenCopyOnSelect() ?? true, onRightClickPaste: { [weak self] in self?.handleClipboardImagePaste() }))
         renderer.setLayoutRoot(composition.fullscreenRoot)
         altScreenRenderer = renderer
         tuiConfiguration.mouseWheelStep = normalized
         if wasFullscreen {
             _ = tui.switchRenderer(to: .altScreen)
         }
+        mountWorkingIndicator()
     }
 
     @MainActor
@@ -865,7 +921,7 @@ public final class InteractiveMode {
                 guard let self else { return HookThemeResult(success: false, error: "UI not available") }
                 switch selection {
                 case .name(let name):
-                    let result = setTheme(name, enableWatcher: true)
+                    let result = self.themeController?.setThemeName(name) ?? setTheme(name, enableWatcher: true)
                     if result.success {
                         self.session?.settingsManager.setTheme(name)
                         self.ui.requestRender()
@@ -873,7 +929,7 @@ public final class InteractiveMode {
                     }
                     return HookThemeResult(success: false, error: result.error)
                 case .theme(let theme):
-                    setThemeInstance(theme)
+                    self.themeController?.setThemeInstance(theme)
                     self.ui.requestRender()
                     return HookThemeResult(success: true)
                 }
@@ -1030,7 +1086,7 @@ public final class InteractiveMode {
 
         loadingAnimation?.stop()
         loadingAnimation = nil
-        statusContainer?.clear()
+        clearWorkingIndicator()
 
         _ = session.sessionManager.newSession(NewSessionOptions(parentSession: options?.parentSession))
         session.agent.messages = []
@@ -1461,7 +1517,8 @@ public final class InteractiveMode {
         if let editor {
             editorContainer.addChild(editor)
             tui.setFocus(editor)
-            tui.requestRender()
+            mountWorkingIndicator()
+        tui.requestRender()
         }
     }
 
@@ -1549,7 +1606,7 @@ public final class InteractiveMode {
             Task { await self?.openExternalEditor() }
         }
         defaultEditor.onAction(.copyMessage) { [weak self] in
-            self?.handleCopyCommand()
+            self?.handleCopyCommand(preferSelection: true)
         }
         defaultEditor.onAction(.followUp) { [weak self] in
             Task { @MainActor in
@@ -1596,6 +1653,61 @@ public final class InteractiveMode {
         }
     }
 
+    func handleStartupSubmit(_ text: String) {
+        editor?.setText(text)
+        showStatus("Startup is still in progress")
+    }
+
+    private func drainManagedToolStatuses(_ statuses: ManagedToolStatuses) {
+        for status in statuses.drain() {
+            startupToolStatuses.append(status)
+            showManagedToolStatus(status)
+        }
+    }
+
+    func showManagedToolStatus(_ status: ToolStatus) {
+        let message = status.type == .warning ? "Warning: \(status.message)" : status.message
+        chatContainer.addChild(Text(theme.fg(status.type == .warning ? .warning : .dim, message), paddingX: 1, paddingY: 0))
+        scheduleRender()
+    }
+
+    func renderStartupDiagnostics() {
+        for status in startupToolStatuses { showManagedToolStatus(status) }
+        startupToolStatuses.removeAll()
+        for diagnostic in startupDiagnostics {
+            switch diagnostic.type {
+            case "error": showError(diagnostic.message)
+            case "warning": showWarning(diagnostic.message)
+            default: showStatus(diagnostic.message)
+            }
+        }
+        startupDiagnostics.removeAll()
+    }
+
+    private func mountWorkingIndicator() {
+        defaultEditor?.setWorkingStatusIndicator(nil)
+        statusContainer?.clear()
+        activeWorkingIndicatorEmbedded = false
+        guard let loadingAnimation else { return }
+        if let workingEditor = editor as? any WorkingStatusEditor, workingEditor.embedWorkingStatus {
+            workingEditor.setWorkingStatusIndicator(loadingAnimation)
+            activeWorkingIndicatorEmbedded = true
+        } else {
+            statusContainer?.addChild(loadingAnimation)
+        }
+    }
+
+    private func clearWorkingIndicator() {
+        defaultEditor?.setWorkingStatusIndicator(nil)
+        (editor as? any WorkingStatusEditor)?.setWorkingStatusIndicator(nil)
+        statusContainer?.clear()
+        if !activeWorkingIndicatorEmbedded, tui?.mode == .mainScreen,
+           session?.settingsManager.getClearOnShrink() == true {
+            statusContainer?.addChild(Spacer(2))
+        }
+        activeWorkingIndicatorEmbedded = false
+    }
+
     private func subscribeToAgent() {
         guard let session else { return }
         unsubscribe = session.subscribe { [weak self] event in
@@ -1606,7 +1718,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleSessionEvent(_ event: AgentSessionEvent) {
+    func handleSessionEvent(_ event: AgentSessionEvent) {
         footer?.invalidate()
 
         switch event {
@@ -1621,12 +1733,19 @@ public final class InteractiveMode {
             if aborted {
                 showStatus("Auto-compaction cancelled")
             } else if let result {
-                chatContainer.clear()
-                renderInitialMessages()
+                let entries = session.map { interactiveContextEntries($0.sessionManager) } ?? []
+                guard let first = entries.first, case .compaction = first else {
+                    showError("Completed compaction is missing from the session context")
+                    return
+                }
+                renderInitialMessages(entries: Array(entries.dropFirst()))
                 let compactionMessage = CompactionSummaryMessage(summary: result.summary, tokensBefore: result.tokensBefore, timestamp: Int64(Date().timeIntervalSince1970 * 1000))
                 let component = CompactionSummaryMessageComponent(message: compactionMessage)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
+                if let usage = result.usage { addSummaryCostNotice(usage) }
+                footer?.invalidate()
+                if session?.isStreaming == true { mountWorkingIndicator() }
                 showStatus("Compaction completed")
             }
         case .autoRetryStart(let attempt, let maxAttempts, _, let errorMessage):
@@ -1639,21 +1758,25 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleAgentEvent(_ event: AgentEvent) {
+    func handleAgentEvent(_ event: AgentEvent) {
         guard let session, let statusContainer, let tui else { return }
 
         switch event {
         case .agentStart:
+            pendingTools.removeAll()
+
+        case .turnStart:
+            if session.settingsManager.getShowTerminalProgress() { tui.terminal.setProgress(true) }
+            guard loadingAnimation == nil else { return }
             loadingAnimation?.stop()
             statusContainer.clear()
-            let loader = Loader(
-                ui: tui,
-                spinnerColorFn: { theme.fg(.accent, $0) },
-                messageColorFn: { theme.fg(.muted, $0) },
-                message: workingMessage ?? defaultWorkingMessage
-            )
+            let embedded = (editor as? any WorkingStatusEditor)?.embedWorkingStatus == true
+            let color: ((String) -> String)? = embedded ? { [weak self] text in
+                self?.editor?.borderColor(text) ?? theme.fg(.muted, text)
+            } : nil
+            let loader = WorkingStatusIndicator(ui: tui, message: workingMessage ?? defaultWorkingMessage, colorFn: color)
             loadingAnimation = loader
-            statusContainer.addChild(loader)
+            mountWorkingIndicator()
             scheduleRender()
 
         case .messageStart(let message):
@@ -1695,8 +1818,8 @@ public final class InteractiveMode {
                             let component = ToolExecutionComponent(
                                 toolName: call.name,
                                 args: call.arguments,
-                                options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages()),
-                                customTool: customTools[call.name]?.tool,
+                                options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), renderShell: getRegisteredToolDefinition(call.name)?.renderShell ?? .default),
+                                customTool: getRegisteredToolDefinition(call.name),
                                 ui: tui
                             )
                             component.setExpanded(toolOutputExpanded)
@@ -1725,6 +1848,7 @@ public final class InteractiveMode {
                     for component in pendingTools.values {
                         component.setArgsComplete()
                     }
+                    maybeShowAssistantDiagnostics(assistant)
                 }
                 streamingComponent = nil
                 streamingMessage = nil
@@ -1736,8 +1860,8 @@ public final class InteractiveMode {
                 let component = ToolExecutionComponent(
                     toolName: toolName,
                     args: args,
-                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages()),
-                    customTool: customTools[toolName]?.tool,
+                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), renderShell: getRegisteredToolDefinition(toolName)?.renderShell ?? .default),
+                    customTool: getRegisteredToolDefinition(toolName),
                     ui: tui
                 )
                 component.setExpanded(toolOutputExpanded)
@@ -1782,7 +1906,8 @@ public final class InteractiveMode {
         case .agentEnd:
             loadingAnimation?.stop()
             loadingAnimation = nil
-            statusContainer.clear()
+            clearWorkingIndicator()
+            tui.terminal.setProgress(false)
             if let streamingComponent {
                 chatContainer.removeChild(streamingComponent)
                 self.streamingComponent = nil
@@ -1794,13 +1919,13 @@ public final class InteractiveMode {
             emitOsc133("A") // prompt start — ready for next input
             scheduleRender()
 
-        case .turnStart, .turnEnd:
+        case .turnEnd:
             break
         }
     }
 
     @MainActor
-    private func renderInitialMessages() {
+    func renderInitialMessages(entries suppliedEntries: [SessionEntry]? = nil) {
         guard let session, let tui else { return }
         let resourceOptions = pendingResourceDisplayOptions
         pendingResourceDisplayOptions = nil
@@ -1811,7 +1936,7 @@ public final class InteractiveMode {
         }
         var toolCalls: [String: (name: String, args: [String: AnyCodable])] = [:]
 
-        let entries = activeSessionEntries(session.sessionManager)
+        let entries = suppliedEntries ?? interactiveContextEntries(session.sessionManager)
         let cacheMisses = settingsManagerCacheMisses(session, entries: entries)
         for entry in entries {
             switch entry {
@@ -1825,13 +1950,14 @@ public final class InteractiveMode {
                     }
                 }
                 addMessageToChat(message)
+                if assistant.stopReason != .aborted && assistant.stopReason != .error { maybeShowAssistantDiagnostics(assistant) }
             case .toolResult(let toolResult):
                 let toolInfo = toolCalls[toolResult.toolCallId]
                 let component = ToolExecutionComponent(
                     toolName: toolInfo?.name ?? toolResult.toolName,
                     args: toolInfo?.args ?? [:],
-                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages()),
-                    customTool: customTools[toolInfo?.name ?? toolResult.toolName]?.tool,
+                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), renderShell: getRegisteredToolDefinition(toolInfo?.name ?? toolResult.toolName)?.renderShell ?? .default),
+                    customTool: getRegisteredToolDefinition(toolInfo?.name ?? toolResult.toolName),
                     ui: tui
                 )
                 component.setExpanded(toolOutputExpanded)
@@ -1843,6 +1969,18 @@ public final class InteractiveMode {
                 if let miss = cacheMisses[messageEntry.id] {
                     chatContainer.addChild(Text(theme.fg(.warning, formatCacheMissNotice(miss)), paddingX: 1, paddingY: 0))
                 }
+            case .compaction(let entry):
+                let component = CompactionSummaryMessageComponent(message: CompactionSummaryMessage(summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: 0))
+                component.setExpanded(toolOutputExpanded)
+                chatContainer.addChild(component)
+                if let usage = entry.usage { addSummaryCostNotice(usage) }
+            case .branchSummary(let entry):
+                let component = BranchSummaryMessageComponent(message: BranchSummaryMessage(summary: entry.summary, fromId: entry.fromId, timestamp: 0))
+                component.setExpanded(toolOutputExpanded)
+                chatContainer.addChild(component)
+                if let usage = entry.usage { addSummaryCostNotice(usage, branch: true) }
+            case .customMessage(let entry):
+                addMessageToChat(makeHookAgentMessage(HookMessage(customType: entry.customType, content: entry.content, display: entry.display, details: entry.details, timestamp: 0)))
             case .custom(let entry):
                 if let renderer = session.hookRunner?.getEntryRenderer(entry.customType) {
                     let component = CustomEntryComponent(entry: entry, renderer: renderer)
@@ -1861,6 +1999,26 @@ public final class InteractiveMode {
         }
 
         scheduleRender()
+    }
+
+    @MainActor
+    func addSummaryCostNotice(_ usage: Usage, branch: Bool = false) {
+        guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
+        chatContainer.addChild(Spacer(1))
+        chatContainer.addChild(Text(theme.fg(.warning, summaryCostNotice(usage: usage, branch: branch)), paddingX: 1, paddingY: 0))
+    }
+
+    func maybeShowAssistantDiagnostics(_ message: AssistantMessage) {
+        guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
+        for notice in assistantDiagnosticNotices(message) {
+            chatContainer.addChild(Spacer(1))
+            chatContainer.addChild(Text(theme.fg(.warning, notice), paddingX: 1, paddingY: 0))
+        }
+    }
+
+    @MainActor
+    private func getRegisteredToolDefinition(_ name: String) -> CustomTool? {
+        session?.hookRunner?.getExtensionTools().first { $0.name == name } ?? customTools[name]?.tool
     }
 
     @MainActor
@@ -2363,10 +2521,15 @@ public final class InteractiveMode {
                 theme.getThinkingBorderColor(level)(text)
             }
         }
+        loadingAnimation?.invalidate()
     }
 
     @MainActor
     private func handleEscape() {
+        if session?.isCompacting == true {
+            Task { await session?.abort() }
+            return
+        }
         if loadingAnimation != nil {
             _ = restoreQueuedMessagesToEditor(abort: true)
             return
@@ -2449,6 +2612,10 @@ public final class InteractiveMode {
     private func performShutdown(fromSignal: Bool = false) async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
+        loadingAnimation?.stop()
+        loadingAnimation = nil
+        clearWorkingIndicator()
+        tui?.terminal.setProgress(false)
         unregisterShutdownSignalHandlers()
 
         if fromSignal {
@@ -2467,7 +2634,8 @@ public final class InteractiveMode {
         // Consume delayed terminal capability replies while input is still in raw mode. This
         // prevents them from reaching the parent shell after terminal state is restored.
         tui?.terminal.drainInput(maxMs: 100, idleMs: 10)
-        tui?.stop()
+        themeController?.dispose()
+        stopInteractiveTui()
 
         if !fromSignal {
             await emitSessionShutdownEvents()
@@ -2476,6 +2644,16 @@ public final class InteractiveMode {
         if let continuation = exitContinuation {
             exitContinuation = nil
             continuation.resume()
+        }
+    }
+
+    func stopInteractiveTui(_ output: FullscreenExitOutput? = nil) {
+        if tui?.mode == .altScreen, (output ?? session?.settingsManager.getFullscreenExitOutput()) == .resumeHint {
+            altScreenRenderer?.stop(preserveScreen: true)
+            tui?.stop()
+            if let session { tui?.terminal.write("\nResume this session with: \(APP_NAME) --resume \(session.sessionId)\n") }
+        } else {
+            tui?.stop()
         }
     }
 
@@ -2581,7 +2759,7 @@ public final class InteractiveMode {
     @MainActor
     private func cycleThinkingLevel() {
         guard let session else { return }
-        if let newLevel = session.cycleThinkingLevel() {
+        if let newLevel = session.cycleThinkingLevel(options: ModelMutationOptions(persist: false)) {
             footer?.invalidate()
             updateEditorBorderColor()
             showStatus("Thinking level: \(newLevel.rawValue)")
@@ -2594,7 +2772,7 @@ public final class InteractiveMode {
     private func cycleModel(direction: ModelCycleDirection) async {
         guard let session else { return }
         do {
-            let result = try await session.cycleModel(direction: direction == .forward ? .forward : .backward)
+            let result = try await session.cycleModel(direction: direction == .forward ? .forward : .backward, options: ModelMutationOptions(persist: false))
             if let result {
                 footer?.invalidate()
                 updateEditorBorderColor()
@@ -2637,7 +2815,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func toggleThinkingBlockVisibility() {
+    func toggleThinkingBlockVisibility() {
         hideThinkingBlock.toggle()
         session?.settingsManager.setHideThinkingBlock(hideThinkingBlock)
 
@@ -2645,15 +2823,12 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func applyThinkingBlockVisibility() {
-        chatContainer.clear()
-        renderInitialMessages()
-
-        if let streamingComponent, let streamingMessage {
-            streamingComponent.setHideThinkingBlock(hideThinkingBlock)
-            streamingComponent.updateContent(streamingMessage)
-            chatContainer.addChild(streamingComponent)
+    func applyThinkingBlockVisibility() {
+        for case let component as AssistantMessageComponent in chatContainer.children {
+            component.setHideThinkingBlock(hideThinkingBlock)
         }
+        streamingComponent?.setHideThinkingBlock(hideThinkingBlock)
+        scheduleRender()
 
         showStatus("Thinking blocks: \(hideThinkingBlock ? "hidden" : "visible")")
     }
@@ -2687,7 +2862,7 @@ public final class InteractiveMode {
 
             if process.terminationStatus == 0 {
                 let newContent = (try? String(contentsOfFile: tmpFile, encoding: .utf8)) ?? currentText
-                editor.setText(newContent.trimmingCharacters(in: .newlines))
+                editor.setText(splitBom(newContent).text.trimmingCharacters(in: .newlines))
             }
         } catch {
             showWarning("Failed to open external editor")
@@ -2736,7 +2911,7 @@ public final class InteractiveMode {
         }
 
         if trimmed == "/settings" {
-            showSettingsSelector()
+            await showSettingsSelector()
             editor.setText("")
             return
         }
@@ -2754,6 +2929,22 @@ public final class InteractiveMode {
             let searchTerm = trimmed.hasPrefix("/model ") ? String(trimmed.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines) : nil
             editor.setText("")
             await handleModelCommand(searchTerm)
+            return
+        }
+        if trimmed == "/trust" {
+            editor.setText("")
+            showTrustSelector()
+            return
+        }
+        if trimmed == "/thinking" || trimmed.hasPrefix("/thinking ") {
+            let argument = trimmed == "/thinking" ? nil : String(trimmed.dropFirst(10))
+            editor.setText("")
+            handleThinkingCommand(argument)
+            return
+        }
+        if trimmed == "/share" {
+            editor.setText("")
+            await handleShareCommand()
             return
         }
         if trimmed == "/theme" {
@@ -3104,13 +3295,14 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func showSettingsSelector() {
+    private func showSettingsSelector() async {
         guard let session else { return }
         let settingsManager = session.settingsManager
 
-        let availableThinking = getSupportedThinkingLevels(session.agent.state.model).compactMap {
-            PiSwiftAgent.ThinkingLevel(rawValue: $0.rawValue)
-        }
+        let availableThinking = THINKING_LEVEL_OPTIONS
+        let provider = settingsManager.getDefaultProvider()
+        let modelId = settingsManager.getDefaultModel()
+        let defaultModel = provider.flatMap { provider in modelId.map { "\(provider)/\($0)" } } ?? "not set"
 
         let config = SettingsConfig(
             autoCompact: settingsManager.getCompactionEnabled(),
@@ -3121,9 +3313,9 @@ public final class InteractiveMode {
             steeringMode: settingsManager.getSteeringMode(),
             followUpMode: settingsManager.getFollowUpMode(),
             transport: settingsManager.getTransport(),
-            thinkingLevel: session.agent.state.thinkingLevel,
+            thinkingLevel: ThinkingLevel(rawValue: settingsManager.getDefaultThinkingLevel() ?? "") ?? DEFAULT_THINKING_LEVEL,
             availableThinkingLevels: availableThinking,
-            currentTheme: settingsManager.getTheme() ?? "dark",
+            currentTheme: themeController?.getThemeSelection() ?? "dark",
             availableThemes: getAvailableThemes(),
             hideThinkingBlock: hideThinkingBlock,
             showCacheMissNotices: settingsManager.getShowCacheMissNotices(),
@@ -3140,7 +3332,15 @@ public final class InteractiveMode {
             mermaidEnabled: settingsManager.getMermaidEnabled(),
             mermaidRenderWhileStreaming: settingsManager.getMermaidRenderWhileStreaming(),
             latexEnabled: settingsManager.getLatexEnabled(),
-            outputPad: settingsManager.getOutputPad()
+            outputPad: settingsManager.getOutputPad(),
+            defaultModel: defaultModel,
+            currentModel: session.agent.state.model,
+            availableDefaultModels: await session.modelRegistry.getAvailable(),
+            modelThinkingLevels: settingsManager.getAllModelThinkingLevels(),
+            fullscreenExitOutput: settingsManager.getFullscreenExitOutput(),
+            fullscreenCopyOnSelect: settingsManager.getFullscreenCopyOnSelect(),
+            terminalTheme: themeController?.getTerminalTheme() ?? .dark,
+            thinkingCycleKey: formatKeyDisplay(keybindings.getKeys(.cycleThinkingLevel))
         )
 
         showSelector { done in
@@ -3175,21 +3375,12 @@ public final class InteractiveMode {
                     settingsManager.setTransport(transport)
                     session.agent.transport = transport
                 },
-                onThinkingLevelChange: { [weak self] level in
-                    session.agent.thinkingLevel = level
-                    settingsManager.setDefaultThinkingLevel(level.rawValue)
-                    self?.updateEditorBorderColor()
-                },
+                onThinkingLevelChange: { _ in },
                 onThemeChange: { [weak self] name in
-                    let result = setTheme(name, enableWatcher: true)
                     settingsManager.setTheme(name)
-                    if result.success == false {
-                        self?.showError("Failed to load theme \(name): \(result.error ?? "unknown error")")
-                    }
+                    Task { @MainActor in await self?.themeController?.setThemeSetting(name) }
                 },
-                onThemePreview: { name in
-                    _ = setTheme(name, enableWatcher: true)
-                },
+                onThemePreview: { [weak self] name in self?.themeController?.preview(name) },
                 onHideThinkingBlockChange: { [weak self] hide in
                     self?.hideThinkingBlock = hide
                     settingsManager.setHideThinkingBlock(hide)
@@ -3256,8 +3447,29 @@ public final class InteractiveMode {
                     self?.tuiConfiguration.outputPad = padding == 0 ? 0 : 1
                     self?.refreshMarkdownRendering()
                 },
-                onCancel: {
-                    done()
+                onCancel: { done() },
+                onModelThinkingLevelChange: { [weak self] provider, modelId, level in
+                    settingsManager.setModelThinkingLevel(provider, modelId, level)
+                    let current = session.agent.state.model
+                    if current.provider == provider && current.id == modelId {
+                        session.setThinkingLevel(level, options: ModelMutationOptions(persist: false))
+                        self?.footer?.invalidate()
+                        self?.updateEditorBorderColor()
+                    }
+                },
+                onModelThinkingLevelRemove: { [weak self] provider, modelId in
+                    settingsManager.removeModelThinkingLevel(provider, modelId)
+                    let current = session.agent.state.model
+                    if current.provider == provider && current.id == modelId {
+                        session.setThinkingLevel(ThinkingLevel(rawValue: settingsManager.getDefaultThinkingLevel() ?? "") ?? DEFAULT_THINKING_LEVEL, options: ModelMutationOptions(persist: false))
+                        self?.footer?.invalidate()
+                        self?.updateEditorBorderColor()
+                    }
+                },
+                onFullscreenExitOutputChange: { settingsManager.setFullscreenExitOutput($0) },
+                onFullscreenCopyOnSelectChange: { [weak self] enabled in
+                    settingsManager.setFullscreenCopyOnSelect(enabled)
+                    self?.altScreenRenderer?.setCopyOnSelect(enabled)
                 }
             )
 
@@ -3323,6 +3535,38 @@ public final class InteractiveMode {
     }
 
     @MainActor
+    func handleThinkingCommand(_ searchTerm: String?) {
+        guard let session else { return }
+        let levels = session.getAvailableThinkingLevels()
+        let searchTerm = searchTerm?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let searchTerm, !searchTerm.isEmpty else {
+            showSelector { done in
+                let selector = ThinkingSelectorComponent(
+                    currentLevel: session.agent.state.thinkingLevel, availableLevels: levels,
+                    onSelect: { [weak self] in self?.selectThinkingLevel($0, persist: false); done() },
+                    onCancel: { done() },
+                    onSelectAsDefault: { [weak self] in self?.selectThinkingLevel($0, persist: true); done() },
+                    defaultThinkingLevel: ThinkingLevel(rawValue: session.settingsManager.getDefaultThinkingLevel() ?? "") ?? DEFAULT_THINKING_LEVEL,
+                    cycleKey: self.formatKeyDisplay(self.keybindings.getKeys(.cycleThinkingLevel)))
+                return (component: selector, focus: selector)
+            }
+            return
+        }
+        guard let level = levels.first(where: { $0.rawValue == searchTerm.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }) else {
+            showError("Unknown thinking level \"\(searchTerm)\". Available levels: \(levels.map(\.rawValue).joined(separator: ", ")).")
+            return
+        }
+        selectThinkingLevel(level, persist: false)
+    }
+
+    func selectThinkingLevel(_ level: ThinkingLevel, persist: Bool) {
+        session?.setThinkingLevel(level, options: ModelMutationOptions(persist: persist))
+        footer?.invalidate()
+        updateEditorBorderColor()
+        showStatus(persist ? "Default thinking level: \(level.rawValue)" : "Thinking level: \(level.rawValue)")
+    }
+
+    @MainActor
     private func handleModelCommand(_ searchTerm: String?) async {
         guard let session else { return }
         let trimmed = searchTerm?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3333,7 +3577,7 @@ public final class InteractiveMode {
 
         if let model = await findExactModelMatch(trimmed) {
             do {
-                try await session.setModel(model)
+                try await session.setModel(model, options: ModelMutationOptions(persist: false))
                 footer?.invalidate()
                 updateEditorBorderColor()
                 showStatus("Model: \(model.id)")
@@ -3380,31 +3624,26 @@ public final class InteractiveMode {
     private func showModelSelector(initialSearchInput: String? = nil) {
         guard let session, let tui else { return }
         showSelector { done in
+            let select: (Model, Bool) -> Void = { [weak self] model, persist in
+                Task { @MainActor in
+                    do {
+                        try await session.setModel(model, options: ModelMutationOptions(persist: persist))
+                        self?.footer?.invalidate()
+                        self?.updateEditorBorderColor()
+                        done()
+                        self?.showStatus(persist ? "Default model: \(model.provider)/\(model.id)" : "Model: \(model.id)")
+                    } catch { done(); self?.showError(error.localizedDescription) }
+                }
+            }
+            let settings = session.settingsManager
+            let defaultModel = settings.getDefaultProvider().flatMap { provider in
+                settings.getDefaultModel().map { ModelSelection(provider: provider, id: $0) }
+            }
             let selector = ModelSelectorComponent(
-                tui: tui,
-                currentModel: session.agent.state.model,
-                settingsManager: session.settingsManager,
-                modelRegistry: session.modelRegistry,
-                scopedModels: session.scopedModels,
-                onSelect: { [weak self] model in
-                    Task { @MainActor in
-                        guard let self else { return }
-                        do {
-                            try await session.setModel(model)
-                            self.footer?.invalidate()
-                            self.updateEditorBorderColor()
-                            done()
-                            self.showStatus("Model: \(model.id)")
-                        } catch {
-                            done()
-                            self.showError(error.localizedDescription)
-                        }
-                    }
-                },
-                onCancel: {
-                    done()
-                },
-                initialSearchInput: initialSearchInput
+                tui: tui, currentModel: session.agent.state.model, defaultModel: defaultModel,
+                modelRegistry: session.modelRegistry, scopedModels: session.scopedModels,
+                onSelect: { select($0, false) }, onCancel: { done() },
+                initialSearchInput: initialSearchInput, onSelectAsDefault: { select($0, true) }
             )
             return (component: selector, focus: selector)
         }
@@ -3416,11 +3655,6 @@ public final class InteractiveMode {
         // Render whatever is cached immediately; the catalogs refresh in the background below
         // and the selector is updated in place (#7153).
         var allModels = await session.modelRegistry.getAvailable()
-
-        guard !allModels.isEmpty else {
-            showStatus("No models available")
-            return
-        }
 
         let sessionScopedModels = session.scopedModels
         let hasSessionScope = !sessionScopedModels.isEmpty
@@ -3435,7 +3669,11 @@ public final class InteractiveMode {
                 return []
             }
             let scoped = await resolveModelScope(patterns, session.modelRegistry)
-            return scoped.map { "\($0.model.provider)/\($0.model.id)" }
+            var ids = scoped.map { "\($0.model.provider)/\($0.model.id)" }
+            for pattern in patterns {
+                if await resolveModelScope([pattern], session.modelRegistry).isEmpty, !ids.contains(pattern) { ids.append(pattern) }
+            }
+            return ids
         }
 
         if hasSessionScope {
@@ -3449,9 +3687,11 @@ public final class InteractiveMode {
         var currentEnabledIds = enabledModelIds
 
         let updateSessionModels: ([String]) async -> Void = { enabledIds in
-            if enabledIds.count > 0 && enabledIds.count < allModels.count {
+            let availableIds = Set(allModels.map { "\($0.provider)/\($0.id)" })
+            let enabledAvailable = enabledIds.filter { availableIds.contains($0) }
+            if !enabledAvailable.isEmpty && !availableIds.isSubset(of: Set(enabledIds)) {
                 let currentThinkingLevel = session.agent.state.thinkingLevel
-                let scoped = await resolveModelScope(enabledIds, session.modelRegistry)
+                let scoped = await resolveModelScope(enabledAvailable, session.modelRegistry)
                 let resolved = scoped.map { scopedModel in
                     let level = scopedModel.isThinkingExplicit ? (scopedModel.thinkingLevel ?? .off) : currentThinkingLevel
                     return ScopedModel(model: scopedModel.model, thinkingLevel: level, isThinkingExplicit: scopedModel.isThinkingExplicit)
@@ -3476,44 +3716,17 @@ public final class InteractiveMode {
                     refreshStatus: "Refreshing model catalogs…"
                 ),
                 callbacks: ModelsCallbacks(
-                    onModelToggle: { modelId, enabled in
+                    onChange: { enabledIds in
                         selectionChanged = true
-                        if enabled {
-                            if !currentEnabledIds.contains(modelId) {
-                                currentEnabledIds.append(modelId)
-                            }
-                        } else {
-                            currentEnabledIds.removeAll { $0 == modelId }
-                        }
-                        Task { await updateSessionModels(currentEnabledIds) }
+                        let ids = enabledIds ?? []
+                        currentEnabledIds = ids
+                        Task { await updateSessionModels(ids) }
                     },
                     onPersist: { enabledIds in
-                        let newPatterns = enabledIds.count == allModels.count ? nil : enabledIds
-                        session.settingsManager.setEnabledModels(newPatterns)
+                        let allIds = Set(allModels.map { "\($0.provider)/\($0.id)" })
+                        let normalized = enabledIds.flatMap { $0.count == allModels.count && $0.allSatisfy { allIds.contains($0) } ? nil : $0 }
+                        session.settingsManager.setEnabledModels(normalized)
                         self.showStatus("Model selection saved to settings")
-                    },
-                    onEnableAll: { allModelIds in
-                        selectionChanged = true
-                        currentEnabledIds = allModelIds
-                        Task { await updateSessionModels(currentEnabledIds) }
-                    },
-                    onClearAll: {
-                        selectionChanged = true
-                        currentEnabledIds = []
-                        Task { await updateSessionModels(currentEnabledIds) }
-                    },
-                    onToggleProvider: { _, modelIds, enabled in
-                        selectionChanged = true
-                        for id in modelIds {
-                            if enabled {
-                                if !currentEnabledIds.contains(id) {
-                                    currentEnabledIds.append(id)
-                                }
-                            } else {
-                                currentEnabledIds.removeAll { $0 == id }
-                            }
-                        }
-                        Task { await updateSessionModels(currentEnabledIds) }
                     },
                     onCancel: {
                         done()
@@ -3535,7 +3748,7 @@ public final class InteractiveMode {
                 allModels = await session.modelRegistry.getAvailable()
                 if !selectionChanged && !hasSessionScope {
                     currentEnabledIds = await configuredEnabledIds()
-                    selector.updateModels(allModels, enabledModelIds: hasFilter ? currentEnabledIds : nil)
+                    selector.updateModels(allModels, enabledModelIds: .some(hasFilter ? currentEnabledIds : nil))
                 } else {
                     selector.updateModels(allModels)
                 }
@@ -3553,23 +3766,43 @@ public final class InteractiveMode {
     }
 
     @MainActor
+    private func showTrustSelector() {
+        guard let session else { return }
+        let settings = session.settingsManager
+        let cwd = session.sessionManager.getCwd()
+        let saved = settings.getGlobalSettings().projectTrust ?? [:]
+        let ancestor = saved.keys.filter { cwd == $0 || cwd.hasPrefix($0 + "/") }.max { $0.count < $1.count }
+        let decision = ancestor.map { ProjectTrustUpdate(path: $0, decision: saved[$0]) }
+        showSelector { done in
+            let selector = ProjectTrustSelectorComponent(cwd: cwd, options: getProjectTrustOptions(cwd), onSelect: { [weak self] selection in
+                settings.applyProjectTrustUpdates(selection.updates)
+                done()
+                self?.showStatus("Saved trust decision: \(selection.trusted ? "trusted" : "untrusted"). Restart \(APP_NAME) for this to take effect.")
+            }, onCancel: { done() }, savedDecision: decision,
+               projectTrusted: settings.getProjectTrust(cwd) ?? !hasTrustRequiringProjectResources(cwd))
+            return (component: selector, focus: selector)
+        }
+    }
+
+    @MainActor
     private func showThemeSelector() {
         guard let settingsManager = session?.settingsManager else { return }
-        let current = settingsManager.getTheme() ?? "dark"
+        let current = themeController?.getThemeSelection() ?? "dark"
         showSelector { done in
             let selector = ThemeSelectorComponent(
                 currentTheme: current,
                 onSelect: { [weak self] name in
-                    _ = setTheme(name, enableWatcher: true)
                     settingsManager.setTheme(name)
+                    Task { @MainActor in await self?.themeController?.setThemeSetting(name) }
                     done()
                     self?.showStatus("Theme: \(name)")
                 },
                 onCancel: {
+                    self.themeController?.preview(current)
                     done()
                 },
                 onPreview: { name in
-                    _ = setTheme(name, enableWatcher: true)
+                    self.themeController?.preview(name)
                 }
             )
             return (component: selector, focus: selector.getSelectList())
@@ -3696,7 +3929,7 @@ public final class InteractiveMode {
             loadingAnimation.stop()
             self.loadingAnimation = nil
         }
-        statusContainer?.clear()
+        clearWorkingIndicator()
 
         pendingMessagesContainer?.clear()
         pendingSteeringMessages.removeAll()
@@ -3911,17 +4144,34 @@ public final class InteractiveMode {
         Task { @MainActor [weak self] in
             let outcome = await runBoundedCatalogRefresh(
                 registry: session.modelRegistry,
-                providers: [providerId],
                 signal: CancellationToken()
             )
             guard let self else { return }
             if let warning = CatalogRefreshStatus.authMessage(outcome, actionLabel: actionLabel) {
                 self.showWarning(warning)
             }
-            await session.refreshActiveModel()
+            if actionLabel.hasPrefix("Logged in"), !session.modelRegistry.hasConfiguredAuth(session.agent.state.model) {
+                let available = await session.modelRegistry.getAvailable().filter { $0.provider == providerId }
+                if let model = await selectDefaultModel(available: available, registry: session.modelRegistry) {
+                    do {
+                        try await session.setModel(model, options: ModelMutationOptions(persist: true))
+                        self.updateEditorBorderColor()
+                    } catch { self.showError(error.localizedDescription) }
+                }
+            } else {
+                await session.refreshActiveModel()
+            }
             self.footer?.invalidate()
             self.ui.requestRender()
         }
+    }
+
+    @MainActor
+    private func handleShareCommand() async {
+        guard let session, let tui, let editorContainer, let editor else { return }
+        await shareSession(session: session, tui: tui, editorContainer: editorContainer, editor: editor,
+                           showStatus: { [weak self] in self?.showStatus($0) },
+                           showError: { [weak self] in self?.showError($0) })
     }
 
     @MainActor
@@ -3931,7 +4181,9 @@ public final class InteractiveMode {
         let outputPath = parts.count > 1 ? parts[1] : nil
 
         do {
-            let exported = try session.exportToHtml(outputPath)
+            let exported = try outputPath?.hasSuffix(".jsonl") == true
+                ? session.exportToJsonl(outputPath)
+                : session.exportToHtml(outputPath, themeName: theme.name)
             showStatus("Exported to: \(exported)")
         } catch {
             showError("Export failed: \(error.localizedDescription)")
@@ -3939,7 +4191,12 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    func handleCopyCommand() {
+    func handleCopyCommand(preferSelection: Bool = false) {
+        if preferSelection, tui?.mode == .altScreen, let renderer = altScreenRenderer,
+           !renderer.getCopyOnSelect(), renderer.hasActiveSelection() {
+            Task { @MainActor in _ = await renderer.copyActiveSelectionToClipboard() }
+            return
+        }
         guard let text = session?.getLastAssistantText()?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty else {
             showError("No agent messages to copy yet.")
@@ -4229,6 +4486,10 @@ public final class InteractiveMode {
         }
 
         await session.reload()
+        applyInteractiveTerminalCapabilities(session.settingsManager)
+        tui.setClearOnShrink(session.settingsManager.getClearOnShrink())
+        altScreenRenderer?.setCopyOnSelect(session.settingsManager.getFullscreenCopyOnSelect())
+        await themeController?.applyFromSettings()
         let extensionResult = await session.reloadExtensions()
         keybindings = KeybindingsManager.create()
         skills = session.resourceLoader.getSkills().skills
@@ -4319,15 +4580,23 @@ public final class InteractiveMode {
     @MainActor
     private func handleCompactCommand(_ customInstructions: String?) {
         guard let session else { return }
-        Task {
+        loadingAnimation?.stop()
+        loadingAnimation = nil
+        clearWorkingIndicator()
+        if session.settingsManager.getShowTerminalProgress() { tui?.terminal.setProgress(true) }
+        showStatus("Compacting...")
+        Task { @MainActor in
+            defer { tui?.terminal.setProgress(false) }
             do {
                 _ = try await session.compact(customInstructions: customInstructions)
-                chatContainer.clear()
-                renderInitialMessages()
+                var entries = interactiveContextEntries(session.sessionManager)
+                if let first = entries.first, case .compaction = first {
+                    entries.removeFirst()
+                    entries.append(first)
+                }
+                renderInitialMessages(entries: entries)
                 showStatus("Compaction complete")
-            } catch {
-                showError(error.localizedDescription)
-            }
+            } catch { showError(error.localizedDescription) }
         }
     }
 
@@ -4440,22 +4709,6 @@ private func decodeHookMessage(_ custom: AgentCustomMessage) -> HookMessage? {
     }
 
     return HookMessage(customType: customType, content: .text(""), display: display, details: nil, timestamp: custom.timestamp)
-}
-
-/// Returns entries on the current leaf's ancestry in persisted (oldest-first) order.
-/// Unlike `buildSessionContext`, this deliberately retains `.custom` entries for UI-only
-/// rendering while leaving model context construction to the library.
-private func activeSessionEntries(_ sessionManager: SessionManager) -> [SessionEntry] {
-    let entries = sessionManager.getEntries()
-    let byId = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
-    var ids: [String] = []
-    var current = sessionManager.getLeafId()
-    while let id = current, let entry = byId[id] {
-        ids.append(id)
-        current = entry.parentId
-    }
-    let active = Set(ids)
-    return entries.filter { active.contains($0.id) }
 }
 
 private func settingsManagerCacheMisses(_ session: AgentSession, entries: [SessionEntry]) -> [String: CacheMiss] {

@@ -4,7 +4,7 @@ import PiSwiftAgent
 import PiSwiftAI
 import PiSwiftCodingAgent
 
-private let thinkingDescriptions: [ThinkingLevel: String] = [
+let thinkingDescriptions: [ThinkingLevel: String] = [
     .off: "No reasoning",
     .minimal: "Very brief reasoning (~1k tokens)",
     .low: "Light reasoning (~2k tokens)",
@@ -41,6 +41,14 @@ public struct SettingsConfig: Sendable {
     public var mermaidRenderWhileStreaming: Bool
     public var latexEnabled: Bool
     public var outputPad: Int
+    public var defaultModel: String
+    public var currentModel: Model?
+    public var availableDefaultModels: [Model]
+    public var modelThinkingLevels: [String: ThinkingLevel]
+    public var fullscreenExitOutput: FullscreenExitOutput
+    public var thinkingCycleKey: String
+    public var terminalTheme: TerminalColorScheme
+    public var fullscreenCopyOnSelect: Bool
 
     public init(
         autoCompact: Bool,
@@ -68,7 +76,15 @@ public struct SettingsConfig: Sendable {
         mermaidEnabled: Bool,
         mermaidRenderWhileStreaming: Bool,
         latexEnabled: Bool,
-        outputPad: Int
+        outputPad: Int,
+        defaultModel: String = "not set",
+        currentModel: Model? = nil,
+        availableDefaultModels: [Model] = [],
+        modelThinkingLevels: [String: ThinkingLevel] = [:],
+        fullscreenExitOutput: FullscreenExitOutput = .transcript,
+        fullscreenCopyOnSelect: Bool = true,
+        terminalTheme: TerminalColorScheme = .dark,
+        thinkingCycleKey: String = "Shift+Tab"
     ) {
         self.autoCompact = autoCompact
         self.showImages = showImages
@@ -96,6 +112,14 @@ public struct SettingsConfig: Sendable {
         self.mermaidRenderWhileStreaming = mermaidRenderWhileStreaming
         self.latexEnabled = latexEnabled
         self.outputPad = outputPad
+        self.defaultModel = defaultModel
+        self.currentModel = currentModel
+        self.availableDefaultModels = availableDefaultModels
+        self.modelThinkingLevels = modelThinkingLevels
+        self.fullscreenExitOutput = fullscreenExitOutput
+        self.fullscreenCopyOnSelect = fullscreenCopyOnSelect
+        self.terminalTheme = terminalTheme
+        self.thinkingCycleKey = thinkingCycleKey
     }
 }
 
@@ -125,6 +149,10 @@ public struct SettingsCallbacks {
     public var onMermaidRenderWhileStreamingChange: (Bool) -> Void
     public var onLatexEnabledChange: (Bool) -> Void
     public var onOutputPadChange: (Int) -> Void
+    public var onModelThinkingLevelChange: (String, String, ThinkingLevel) -> Void
+    public var onModelThinkingLevelRemove: (String, String) -> Void
+    public var onFullscreenExitOutputChange: (FullscreenExitOutput) -> Void
+    public var onFullscreenCopyOnSelectChange: (Bool) -> Void
     public var onCancel: () -> Void
 
     public init(
@@ -153,7 +181,11 @@ public struct SettingsCallbacks {
         onMermaidRenderWhileStreamingChange: @escaping (Bool) -> Void,
         onLatexEnabledChange: @escaping (Bool) -> Void,
         onOutputPadChange: @escaping (Int) -> Void,
-        onCancel: @escaping () -> Void
+        onCancel: @escaping () -> Void,
+        onModelThinkingLevelChange: @escaping (String, String, ThinkingLevel) -> Void = { _, _, _ in },
+        onModelThinkingLevelRemove: @escaping (String, String) -> Void = { _, _ in },
+        onFullscreenExitOutputChange: @escaping (FullscreenExitOutput) -> Void = { _ in },
+        onFullscreenCopyOnSelectChange: @escaping (Bool) -> Void = { _ in }
     ) {
         self.onAutoCompactChange = onAutoCompactChange
         self.onShowImagesChange = onShowImagesChange
@@ -181,64 +213,27 @@ public struct SettingsCallbacks {
         self.onLatexEnabledChange = onLatexEnabledChange
         self.onOutputPadChange = onOutputPadChange
         self.onCancel = onCancel
+        self.onModelThinkingLevelChange = onModelThinkingLevelChange
+        self.onModelThinkingLevelRemove = onModelThinkingLevelRemove
+        self.onFullscreenExitOutputChange = onFullscreenExitOutputChange
+        self.onFullscreenCopyOnSelectChange = onFullscreenCopyOnSelectChange
     }
 }
 
-private final class SelectSubmenu: Container {
-    private let selectList: SelectList
+@MainActor
+private final class SettingsSubmenuState { var isOpen = false }
 
-    init(
-        title: String,
-        description: String,
-        options: [SelectItem],
-        currentValue: String,
-        onSelect: @escaping (String) -> Void,
-        onCancel: @escaping () -> Void,
-        onSelectionChange: ((String) -> Void)?
-    ) {
-        self.selectList = SelectList(items: options, maxVisible: min(options.count, 10), theme: getSelectListTheme())
-        super.init()
-
-        addChild(Text(theme.bold(theme.fg(.accent, title)), paddingX: 0, paddingY: 0))
-
-        if !description.isEmpty {
-            addChild(Spacer(1))
-            addChild(Text(theme.fg(.muted, description), paddingX: 0, paddingY: 0))
-        }
-
-        addChild(Spacer(1))
-
-        if let idx = options.firstIndex(where: { $0.value == currentValue }) {
-            selectList.setSelectedIndex(idx)
-        }
-
-        selectList.onSelect = { item in
-            onSelect(item.value)
-        }
-        selectList.onCancel = onCancel
-        if let onSelectionChange {
-            selectList.onSelectionChange = { item in
-                onSelectionChange(item.value)
-            }
-        }
-
-        addChild(selectList)
-        addChild(Spacer(1))
-        addChild(Text(theme.fg(.dim, "  Enter to select · Esc to go back"), paddingX: 0, paddingY: 0))
-    }
-
-    override func handleInput(_ data: String) {
-        selectList.handleInput(data)
-    }
-}
-
-public final class SettingsSelectorComponent: Container, SystemCursorAware {
+public final class SettingsSelectorComponent: Container, MouseFocusOwner, SystemCursorAware {
+    private let submenuState: SettingsSubmenuState
     private let settingsList: SettingsList
     public var usesSystemCursor: Bool = false {
         didSet { settingsList.usesSystemCursor = usesSystemCursor }
     }
 
     public init(config: SettingsConfig, callbacks: SettingsCallbacks) {
+        let submenuState = SettingsSubmenuState()
+        self.submenuState = submenuState
+        let overrideState = ModelThinkingOverrideState(config.modelThinkingLevels)
         let supportsImages = getCapabilities().images != nil
 
         var items: [SettingItem] = [
@@ -280,7 +275,7 @@ public final class SettingsSelectorComponent: Container, SystemCursorAware {
             SettingItem(
                 id: "show-cache-miss-notices",
                 label: "Show cache miss notices",
-                description: "Show significant prompt-cache misses in the transcript",
+                description: "Show transcript notices for cache costs and provider recovery diagnostics",
                 currentValue: config.showCacheMissNotices ? "true" : "false",
                 values: ["true", "false"]
             ),
@@ -369,28 +364,31 @@ public final class SettingsSelectorComponent: Container, SystemCursorAware {
                 values: ["0", "1"]
             ),
             SettingItem(
-                id: "thinking",
-                label: "Thinking level",
-                description: "Reasoning depth for thinking-capable models",
-                currentValue: config.thinkingLevel.rawValue,
-                submenu: { currentValue, done in
-                    SelectSubmenu(
-                        title: "Thinking Level",
-                        description: "Select reasoning depth for thinking-capable models",
-                        options: config.availableThinkingLevels.map { level in
-                            SelectItem(value: level.rawValue, label: level.rawValue, description: thinkingDescriptions[level])
-                        },
-                        currentValue: currentValue,
-                        onSelect: { value in
-                            if let level = ThinkingLevel(rawValue: value) {
-                                callbacks.onThinkingLevelChange(level)
-                            }
-                            done(value)
-                        },
-                        onCancel: { done(nil) },
-                        onSelectionChange: nil
-                    )
+                id: "model-thinking",
+                label: "Default thinking level per model",
+                description: "Override the default thinking level for specific models. \(config.thinkingCycleKey) cycles in-session.",
+                currentValue: overrideState.summary,
+                submenu: { _, done in
+                    submenuState.isOpen = true
+                    return makeModelThinkingSubmenu(config: config, callbacks: callbacks, state: overrideState, done: { value in
+                        submenuState.isOpen = false
+                        done(value)
+                    })
                 }
+            ),
+            SettingItem(
+                id: "fullscreen-exit-output",
+                label: "Fullscreen exit output",
+                description: "Print the transcript or only a session resume hint when exiting fullscreen mode",
+                currentValue: config.fullscreenExitOutput.rawValue,
+                values: ["transcript", "resume-hint"]
+            ),
+            SettingItem(
+                id: "fullscreen-copy-on-select",
+                label: "Fullscreen copy on select",
+                description: "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X",
+                currentValue: config.fullscreenCopyOnSelect ? "true" : "false",
+                values: ["true", "false"]
             ),
             SettingItem(
                 id: "theme",
@@ -398,23 +396,13 @@ public final class SettingsSelectorComponent: Container, SystemCursorAware {
                 description: "Color theme for the interface",
                 currentValue: config.currentTheme,
                 submenu: { currentValue, done in
-                    SelectSubmenu(
-                        title: "Theme",
-                        description: "Select color theme",
-                        options: config.availableThemes.map { SelectItem(value: $0, label: $0) },
-                        currentValue: currentValue,
-                        onSelect: { value in
-                            callbacks.onThemeChange(value)
+                    submenuState.isOpen = true
+                    return ThemeSettingsSubmenu(currentTheme: currentValue, terminalTheme: config.terminalTheme,
+                        availableThemes: config.availableThemes, callbacks: callbacks, done: { value in
+                            submenuState.isOpen = false
+                            if let value { callbacks.onThemeChange(value) }
                             done(value)
-                        },
-                        onCancel: {
-                            callbacks.onThemePreview?(currentValue)
-                            done(nil)
-                        },
-                        onSelectionChange: { value in
-                            callbacks.onThemePreview?(value)
-                        }
-                    )
+                        })
                 }
             ),
         ]
@@ -518,6 +506,10 @@ public final class SettingsSelectorComponent: Container, SystemCursorAware {
                     if let value = FullscreenScrollbarMode(rawValue: newValue) {
                         callbacks.onFullscreenScrollbarChange(value)
                     }
+                case "fullscreen-exit-output":
+                    if let value = FullscreenExitOutput(rawValue: newValue) { callbacks.onFullscreenExitOutputChange(value) }
+                case "fullscreen-copy-on-select":
+                    callbacks.onFullscreenCopyOnSelectChange(newValue == "true")
                 case "mouse-wheel-step":
                     if let value = Int(newValue) {
                         callbacks.onMouseWheelStepChange(value)
@@ -554,7 +546,150 @@ public final class SettingsSelectorComponent: Container, SystemCursorAware {
         // SettingsList treats Space as activation before it reaches its search input. Ignore the
         // separator while search is active. The fuzzy matcher still matches a multi-word label
         // when the query words are concatenated (for example, "outputpadding").
-        if data == " " { return }
+        if data == " " && !submenuState.isOpen { return }
         settingsList.handleInput(data)
     }
+}
+
+@MainActor
+private final class ModelThinkingOverrideState {
+    var levels: [String: ThinkingLevel]
+    init(_ levels: [String: ThinkingLevel]) { self.levels = levels }
+    var summary: String { levels.isEmpty ? "none" : "\(levels.count) configured" }
+}
+
+@MainActor
+private func makeModelThinkingSubmenu(config: SettingsConfig, callbacks: SettingsCallbacks,
+                                     state: ModelThinkingOverrideState,
+                                     done: @escaping (String?) -> Void) -> SteppedSubmenu {
+    let modelKey: (Model) -> String = { "\($0.provider)/\($0.id)" }
+    let currentKey = config.currentModel.map(modelKey)
+    let models = Dictionary(config.availableDefaultModels.map { (modelKey($0), $0) }, uniquingKeysWith: { _, new in new })
+    let steps = [
+        SteppedSubmenuStep(key: "model", title: { _ in "Per-Model Thinking Level" },
+            description: { _ in "Select a model to configure" }, options: { _ in
+                let sorted = config.availableDefaultModels.sorted { lhs, rhs in
+                    let lhsKey = modelKey(lhs), rhsKey = modelKey(rhs)
+                    if (lhsKey == currentKey) != (rhsKey == currentKey) { return lhsKey == currentKey }
+                    if (lhsKey == config.defaultModel) != (rhsKey == config.defaultModel) { return lhsKey == config.defaultModel }
+                    return lhs.provider.localizedCompare(rhs.provider) == .orderedAscending
+                }
+                if sorted.isEmpty {
+                    return [SelectItem(value: "__none__", label: "No models available", description: "Log in to a provider or configure an API key first")]
+                }
+                return sorted.map { model in
+                    SelectItem(value: modelKey(model), label: "\(model.id) [\(model.provider)]", description: state.levels[modelKey(model)]?.rawValue)
+                }
+            }, preselect: { _ in currentKey ?? (models[config.defaultModel] != nil ? config.defaultModel : nil) },
+            searchable: true, layout: SelectListLayoutOptions(minPrimaryColumnWidth: 12, maxPrimaryColumnWidth: 46)),
+        SteppedSubmenuStep(key: "level", title: { context in
+            let key = context["model"] ?? ""
+            return "Thinking Level for \(models[key].map { "\($0.id) [\($0.provider)]" } ?? key)"
+        }, description: { _ in "Select default thinking level for this model" }, options: { context in
+            guard let key = context["model"], let model = models[key] else { return [] }
+            let levels: [ThinkingLevel] = model.reasoning
+                ? getSupportedThinkingLevels(model).compactMap { ThinkingLevel(rawValue: $0.rawValue) } : [.off]
+            var items = levels.map { level in
+                SelectItem(value: level.rawValue, label: (level == state.levels[key] ? "✓ " : "  ") + level.rawValue, description: thinkingDescriptions[level])
+            }
+            if state.levels[key] != nil {
+                items.append(SelectItem(value: "__clear__", label: "  (clear override)", description: "Revert to global default (\(config.thinkingLevel.rawValue))"))
+            }
+            return items
+        }, preselect: { state.levels[$0["model"] ?? ""]?.rawValue })
+    ]
+    return SteppedSubmenu(steps: steps, onComplete: { context in
+        guard let key = context["model"], let model = models[key], let value = context["level"] else { return }
+        if value == "__clear__" {
+            callbacks.onModelThinkingLevelRemove(model.provider, model.id)
+            state.levels.removeValue(forKey: key)
+        } else if let level = ThinkingLevel(rawValue: value) {
+            callbacks.onModelThinkingLevelChange(model.provider, model.id, level)
+            state.levels[key] = level
+        }
+    }, onCancel: { done(state.summary) }, loop: true)
+}
+
+@MainActor
+private final class ThemeSettingsSubmenu: Container, MouseFocusOwner {
+    private let original: String
+    private let terminalTheme: TerminalColorScheme
+    private let availableThemes: [String]
+    private let callbacks: SettingsCallbacks
+    private let done: (String?) -> Void
+    private var single: String
+    private var light: String
+    private var dark: String
+    private var active: (any Component)?
+
+    init(currentTheme: String, terminalTheme: TerminalColorScheme, availableThemes: [String],
+         callbacks: SettingsCallbacks, done: @escaping (String?) -> Void) {
+        self.original = currentTheme; self.terminalTheme = terminalTheme
+        self.availableThemes = availableThemes; self.callbacks = callbacks; self.done = done
+        let pair = parseAutoThemeSetting(currentTheme)
+        let fixed = availableThemes.contains(currentTheme) ? currentTheme : (availableThemes.contains("dark") ? "dark" : availableThemes.first ?? "dark")
+        light = pair?.light ?? fixed
+        dark = pair?.dark ?? fixed
+        single = pair.map { terminalTheme == .light ? $0.light : $0.dark } ?? fixed
+        super.init()
+        if pair == nil { showSingle() } else { showAutomatic() }
+    }
+    private var automaticSetting: String { "\(light)/\(dark)" }
+    private func items(current: String) -> [SelectItem] {
+        availableThemes.map { SelectItem(value: $0, label: ($0 == current ? "✓ " : "  ") + $0) }
+    }
+    private func setContent(_ content: any Component, input: (any Component)? = nil) {
+        clear(); addChild(content); active = input ?? content
+    }
+    private func cancel() { callbacks.onThemePreview?(original); done(nil) }
+    private func showSingle() {
+        let options = [SelectItem(value: "/", label: "  Automatic", description: "Use separate themes for light and dark terminal appearance")] + items(current: single)
+        setContent(SelectSubmenu(title: "Theme", description: "Select a theme, or choose Automatic to follow terminal appearance.",
+            options: options, currentValue: single, onSelect: { [weak self] value in
+                guard let self else { return }
+                if value == "/" { callbacks.onThemePreview?(automaticSetting); showAutomatic() }
+                else { single = value; done(value) }
+            }, onCancel: { [weak self] in self?.cancel() }, onSelectionChange: { [weak self] value in
+                guard let self else { return }
+                callbacks.onThemePreview?(value == "/" ? automaticSetting : value)
+            }))
+    }
+    private func showAutomatic() {
+        let content = Container()
+        content.addChild(Text(theme.bold(theme.fg(.accent, "Automatic Theme")), paddingX: 0, paddingY: 0))
+        content.addChild(Spacer(1))
+        content.addChild(Text(theme.fg(.muted, "Choose themes for terminal light and dark appearance.\nLight/dark detection requires terminal support."), paddingX: 0, paddingY: 0))
+        content.addChild(Spacer(1))
+        let options = [
+            SettingItem(id: "light-theme", label: "Light theme", currentValue: light, submenu: { [weak self] value, done in
+                guard let self else { return Container() }
+                return themeSelect(title: "Light Theme", current: value, done: done, onSelect: { [weak self] value in
+                    guard let self else { return }; light = value; callbacks.onThemePreview?(automaticSetting); done(value)
+                })
+            }),
+            SettingItem(id: "dark-theme", label: "Dark theme", currentValue: dark, submenu: { [weak self] value, done in
+                guard let self else { return Container() }
+                return themeSelect(title: "Dark Theme", current: value, done: done, onSelect: { [weak self] value in
+                    guard let self else { return }; dark = value; callbacks.onThemePreview?(automaticSetting); done(value)
+                })
+            }),
+            SettingItem(id: "apply", label: "Apply", currentValue: "save and go back", values: ["save and go back"]),
+            SettingItem(id: "single-mode", label: "Change mode", currentValue: "switch to single theme", values: ["switch to single theme"])
+        ]
+        let list = SettingsList(items: options, maxVisible: 4, theme: getSettingsListTheme(), onChange: { [weak self] id, _ in
+            guard let self else { return }
+            if id == "apply" { done(automaticSetting) }
+            else if id == "single-mode" { single = terminalTheme == .light ? light : dark; callbacks.onThemePreview?(single); showSingle() }
+        }, onCancel: { [weak self] in self?.cancel() })
+        content.addChild(list)
+        setContent(content, input: list)
+    }
+    private func themeSelect(title: String, current: String, done: @escaping (String?) -> Void,
+                             onSelect: @escaping (String) -> Void) -> SelectSubmenu {
+        SelectSubmenu(title: title, description: "Select the theme to use for terminal appearance", options: items(current: current),
+                      currentValue: current, onSelect: onSelect, onCancel: { [weak self] in
+                          guard let self else { return }; callbacks.onThemePreview?(automaticSetting); done(nil)
+                      }, onSelectionChange: callbacks.onThemePreview)
+    }
+    override func handleInput(_ data: String) { active?.handleInput(data) }
 }

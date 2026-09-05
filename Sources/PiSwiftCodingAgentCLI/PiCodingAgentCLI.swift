@@ -38,12 +38,16 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
 
         let cwd = FileManager.default.currentDirectoryPath
         let agentDir = getAgentDir()
+        let startupSettingsManager = SettingsManager.create(cwd, agentDir, projectTrusted: false)
+        let startupSettingsDiagnostics = collectSettingsDiagnostics(startupSettingsManager)
+        applyStartupTerminalSettings(startupSettingsManager)
         let authStorage = AuthStorage.create(getAuthPath())
         let modelRegistry = ModelRegistry(authStorage, agentDir)
         let eventBus = createEventBus()
         time("discoverModels")
 
         if let listModelsOption = parsed.listModels {
+            reportStartupDiagnostics(startupSettingsDiagnostics)
             switch listModelsOption {
             case .all:
                 await listModels(modelRegistry, nil)
@@ -82,7 +86,6 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             return .tui
         }()
         if trustMode == .tui {
-            let startupSettingsManager = SettingsManager.create(cwd, agentDir, projectTrusted: false)
             await runFirstTimeSetupIfNeeded(
                 settingsManager: startupSettingsManager,
                 isInteractive: true
@@ -102,7 +105,13 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         )
         let trust = trustContext.trust
         let settingsManager = trustContext.settingsManager
-        reportSettingsErrors(settingsManager, context: "startup")
+        var runtimeDiagnostics: [ResourceDiagnostic] = []
+        if trustMode == .tui, let useTheme = cli.useTheme {
+            var overrides = Settings()
+            overrides.theme = useTheme
+            settingsManager.applyOverrides(overrides)
+        }
+        applyStartupTerminalSettings(settingsManager)
         time("SettingsManager.create")
         let themeName = settingsManager.getTheme()
         initTheme(themeName, enableWatcher: parsed.print != true && parsed.mode == nil)
@@ -138,6 +147,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 ?? settingsManager.getSessionDir()
             let cwdValue = cwd
             resumeSession = await selectSession(
+                settingsManager: settingsManager,
+                projectTrusted: trust.trusted,
                 currentSessionsLoader: { onProgress in
                     await SessionManager.list(cwdValue, sessionDir, onProgress)
                 },
@@ -165,7 +176,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 resolvedSessionDirArgs.sessionDir = settingsDir
             }
         }
-        let sessionManager = createSessionManager(resolvedSessionDirArgs, cwd: cwd, resumeSession: resumeSession)
+        let sessionManager = try createSessionManager(resolvedSessionDirArgs, cwd: cwd, resumeSession: resumeSession)
+        if let name = cli.sessionName.flatMap(normalizeSessionName) {
+            sessionManager.appendSessionInfo(name)
+        }
         time("createSessionManager")
 
         var scopedModels: [ScopedModel] = []
@@ -190,7 +204,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         }
         let sessionContext = sessionManager.buildSessionContext()
         let hasExistingSession = !sessionContext.messages.isEmpty
-        let defaultThinkingLevel = ThinkingLevel(rawValue: settingsManager.getDefaultThinkingLevel() ?? "off") ?? .off
+        let defaultThinkingLevel = ThinkingLevel(rawValue: settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL.rawValue) ?? DEFAULT_THINKING_LEVEL
         let useScopedModels = !scopedModels.isEmpty && parsed.continue != true && parsed.resume != true
 
         if !scopedModels.isEmpty {
@@ -209,18 +223,13 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             shouldPrintMessages
         )
         let initialModel = initialSelection.model
-        var initialThinking: ThinkingLevel = defaultThinkingLevel
-        if hasExistingSession {
-            initialThinking = ThinkingLevel(rawValue: sessionContext.thinkingLevel) ?? initialThinking
-        }
-        if let scopedModel = initialSelection.scopedModel {
-            if scopedModel.isThinkingExplicit || !hasExistingSession {
-                initialThinking = scopedModel.thinkingLevel ?? initialThinking
-            }
-        }
-        if let cliThinking = initialSelection.cliThinkingLevel {
-            initialThinking = cliThinking
-        }
+        var initialThinking = startupThinkingLevel(
+            settingsManager: settingsManager,
+            model: initialModel,
+            restoredLevel: hasExistingSession ? sessionContext.thinkingLevel : nil,
+            scopedModel: initialSelection.scopedModel,
+            cliLevel: parsed.thinking ?? initialSelection.cliThinkingLevel
+        )
 
         if !isInteractive && initialModel == nil {
             fputs("No models available.\n", stderr)
@@ -278,6 +287,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         ))
         await resourceLoader.reload()
         time("resourceLoader.reload")
+        runtimeDiagnostics += resourceLoader.getExtensions().diagnostics
+        runtimeDiagnostics += resourceLoader.getSkills().diagnostics
+        runtimeDiagnostics += resourceLoader.getPrompts().diagnostics
+        runtimeDiagnostics += resourceLoader.getThemes().diagnostics
 
         let allBuiltInToolsMap = createAllTools(
             cwd: cwd,
@@ -292,24 +305,16 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         //   --tools <names>    → explicit allowlist (overrides above defaults)
         //   (default)          → enable read/bash/edit/write built-ins
         let excludedToolNames = Set(parsed.excludeTools ?? [])
-        let selectedToolNames: [ToolName]
-        if parsed.noTools == true {
-            selectedToolNames = parsed.tools ?? []
-        } else if parsed.noBuiltinTools == true {
-            // Keep only explicitly-named tools (extension / custom tools added separately below).
-            selectedToolNames = parsed.tools ?? []
-        } else {
-            selectedToolNames = parsed.tools ?? [.read, .bash, .edit, .write]
-        }
-        let filteredSelectedToolNames = selectedToolNames.filter { !excludedToolNames.contains($0.rawValue) }
+        let disableCustomTools = parsed.noTools == true && parsed.tools == nil
+        let filteredSelectedToolNames = startupToolNames(parsed, settingsManager: settingsManager)
         let baseHookPaths = parsed.noExtensions == true ? [] : settingsManager.getHooks()
         let hookPaths = baseHookPaths + (parsed.hooks ?? [])
         let hookLoadResult = parsed.noExtensions == true
             ? loadHooks(hookPaths, cwd: cwd, eventBus: eventBus)
             : discoverAndLoadHooks(hookPaths, cwd, getAgentDir(), eventBus)
         time("discoverAndLoadHooks")
-        for error in hookLoadResult.errors {
-            fputs("Failed to load hook \"\(error.path)\": \(error.error)\n", stderr)
+        runtimeDiagnostics += hookLoadResult.errors.map {
+            ResourceDiagnostic(type: "error", message: "Failed to load hook \"\($0.path)\": \($0.error)")
         }
 
         let baseCustomToolPaths = parsed.noExtensions == true ? [] : settingsManager.getCustomTools()
@@ -319,8 +324,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             ? loadCustomTools(customToolPaths, cwd, builtInToolNames, eventBus)
             : discoverAndLoadCustomTools(customToolPaths, cwd, builtInToolNames, getAgentDir(), eventBus)
         time("discoverAndLoadCustomTools")
-        for error in customToolsResult.errors {
-            fputs("Failed to load custom tool \"\(error.path)\": \(error.error)\n", stderr)
+        runtimeDiagnostics += customToolsResult.errors.map {
+            ResourceDiagnostic(type: "error", message: "Failed to load custom tool \"\($0.path)\": \($0.error)")
         }
 
         let extensionPaths = parsed.noExtensions == true ? [] : settingsManager.getExtensionPaths()
@@ -334,8 +339,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 includeProjectExtensions: trust.trusted
             )
         time("discoverAndLoadExtensions")
-        for error in extensionResult.errors {
-            fputs("Failed to load extension: \(error.localizedDescription)\n", stderr)
+        runtimeDiagnostics += extensionResult.errors.map {
+            ResourceDiagnostic(type: "error", message: "Failed to load extension: \($0.localizedDescription)")
         }
 
         // Built-in in-process extensions (compiled into the binary, no dylib involved).
@@ -354,8 +359,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             return LoadExtensionsResult(hooks: hooks, errors: errors)
         }
         let inlineExtensionResult = loadInlineExtensions()
-        for error in inlineExtensionResult.errors {
-            fputs("Failed to load inline extension: \(error.localizedDescription)\n", stderr)
+        runtimeDiagnostics += inlineExtensionResult.errors.map {
+            ResourceDiagnostic(type: "error", message: "Failed to load inline extension: \($0.localizedDescription)")
         }
 
         let allHooks = hookLoadResult.hooks + extensionResult.hooks + inlineExtensionResult.hooks
@@ -382,13 +387,13 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         }
 
         let wrappedCustomTools = wrapCustomTools(customToolsResult.tools, getCustomToolContext)
-            .filter { !excludedToolNames.contains($0.name) }
+            .filter { !disableCustomTools && !excludedToolNames.contains($0.name) }
 
         let extDefs = (hookRunner?.getExtensionTools() ?? []).map {
             LoadedCustomTool(path: "<extension>", resolvedPath: "<extension>", tool: $0)
         }
         let wrappedExtensionTools = wrapCustomTools(extDefs, getCustomToolContext)
-            .filter { !excludedToolNames.contains($0.name) }
+            .filter { !disableCustomTools && !excludedToolNames.contains($0.name) }
 
         let selectedToolNameSet = Set(filteredSelectedToolNames.map { $0.rawValue })
         let customToolsByName = Dictionary(uniqueKeysWithValues: wrappedCustomTools.map { ($0.name, $0) })
@@ -544,7 +549,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             wrapExtensionTools: { tools in
                 let defs = tools.map { LoadedCustomTool(path: "<extension>", resolvedPath: "<extension>", tool: $0) }
                 let wrapped = wrapCustomTools(defs, getCustomToolContext)
-                    .filter { !excludedToolNames.contains($0.name) }
+                    .filter { !disableCustomTools && !excludedToolNames.contains($0.name) }
                 return hookRunner.map { wrapToolsWithHooks(wrapped, $0) } ?? wrapped
             }
         ))
@@ -557,6 +562,16 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         }
         customToolsResult.setSendMessageHandler(sendMessageHandler)
         sendMessageHandlerBox.withLock { $0 = sendMessageHandler }
+
+        runtimeDiagnostics += collectSettingsDiagnostics(settingsManager)
+        let diagnosticDisposition = startupDiagnosticDisposition(
+            startup: startupSettingsDiagnostics,
+            runtime: runtimeDiagnostics,
+            isInteractive: isInteractive
+        )
+        let startupDiagnostics = diagnosticDisposition.diagnostics
+        if diagnosticDisposition.shouldPrint { reportStartupDiagnostics(startupDiagnostics) }
+        if diagnosticDisposition.hasRuntimeErrors { throw ExitCode.failure }
 
         if mode == .rpc {
             await runRpcMode(createdSession)
@@ -579,8 +594,6 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 print("Model scope: \(modelList) (Ctrl+P to cycle)")
             }
 
-            let fdPath = await ensureTool("fd")
-            time("ensureTool(fd)")
             printTimings()
             let interactiveMode = await MainActor.run {
                 InteractiveMode(
@@ -591,9 +604,11 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                     customTools: customToolsResult.tools,
                     setToolUIContext: customToolsResult.setUIContext,
                     setToolSendMessageHandler: customToolsResult.setSendMessageHandler,
-                    fdPath: fdPath,
+                    fdPath: nil,
                     verbose: parsed.verbose == true,
-                    tuiMode: cli.parsedTuiModeOverride
+                    tuiMode: cli.parsedTuiModeOverride,
+                    startupDiagnostics: startupDiagnostics,
+                    initialThemeSetting: cli.useTheme
                 )
             }
             await interactiveMode.start(
@@ -618,9 +633,17 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
     }
 
     private static func helpDiscussion() -> String {
-        let toolNames = ToolName.allCases.map { $0.rawValue }.joined(separator: ", ")
         return """
+Usage: \(APP_NAME) [options] [--] [@files...] [messages...]
+
+Options:
+  --use-theme <name[/name]>  Set the initial interactive theme for this run
+  --                        End option parsing; treat remaining arguments as messages/files
+
 Examples:
+  # Prompt beginning with a dash
+  \(APP_NAME) -p -- "- Summarize these points"
+
   # Interactive mode
   \(APP_NAME)
 
@@ -691,8 +714,14 @@ Environment Variables:
   \(ENV_AGENT_DIR) - Session storage directory (default: ~/\(CONFIG_DIR_NAME)/agent)
   \(ENV_CODING_AGENT_SESSION_DIR) - Override session file directory
 
-Available Tools (default: read, bash, edit, write):
-  \(toolNames)
+Built-in Tool Names:
+  read  - Read file contents
+  bash  - Execute bash commands
+  edit  - Edit files with find/replace
+  write - Write files (creates/overwrites)
+  grep  - Search file contents (read-only, off by default)
+  find  - Find files by glob pattern (read-only, off by default)
+  ls    - List directory contents (read-only, off by default)
 """
     }
 
@@ -701,6 +730,10 @@ Available Tools (default: read, bash, edit, write):
         var i = 0
         while i < args.count {
             let arg = args[i]
+            if arg == "--" {
+                result.append(contentsOf: args[i...])
+                break
+            }
             if arg == "-ne" {
                 result.append("--no-extensions")
                 i += 1
@@ -757,11 +790,12 @@ Available Tools (default: read, bash, edit, write):
             "--append-system-prompt", "--mode", "--tui-mode", "--thinking", "--session",
             "--session-id", "--session-dir", "--models", "-m", "--tools",
             "--exclude-tools", "--hook", "--tool", "--export", "--skills",
-            "--theme", "--list-models-search",
+            "--theme", "--use-theme", "--name", "--list-models-search",
         ]
         var index = 0
         while index < args.count {
             let argument = args[index]
+            if argument == "--" { return args }
             if argument.hasPrefix("-") {
                 if valueOptions.contains(argument), index + 1 < args.count {
                     index += 2
@@ -785,10 +819,10 @@ Available Tools (default: read, bash, edit, write):
     }
 }
 
-private func reportSettingsErrors(_ settingsManager: SettingsManager, context: String) {
-    let errors = settingsManager.drainErrors()
-    for error in errors {
-        fputs("Warning (\(context), \(error.scope) settings): \(error.message)\n", stderr)
+func reportStartupDiagnostics(_ diagnostics: [ResourceDiagnostic]) {
+    for diagnostic in diagnostics {
+        let prefix = diagnostic.type == "error" ? "Error: " : diagnostic.type == "warning" ? "Warning: " : ""
+        fputs(prefix + diagnostic.message + "\n", stderr)
     }
 }
 
@@ -845,15 +879,15 @@ private func getChangelogForDisplay(_ parsed: Args, _ settingsManager: SettingsM
     return nil
 }
 
-private func createSessionManager(_ parsed: Args, cwd: String, resumeSession: String?) -> SessionManager {
+func createSessionManager(_ parsed: Args, cwd: String, resumeSession: String?) throws -> SessionManager {
     if parsed.noSession == true {
         return SessionManager.inMemory(cwd)
     }
     if let resumeSession {
-        return SessionManager.open(resumeSession, parsed.sessionDir)
+        return try SessionManager.openValidated(resumeSession, parsed.sessionDir)
     }
     if let session = parsed.session {
-        return SessionManager.open(session, parsed.sessionDir)
+        return try SessionManager.openValidated(session, parsed.sessionDir)
     }
     if parsed.continue == true {
         return SessionManager.continueRecent(cwd, parsed.sessionDir)

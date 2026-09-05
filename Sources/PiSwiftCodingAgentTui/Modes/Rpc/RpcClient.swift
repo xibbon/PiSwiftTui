@@ -33,6 +33,7 @@ public enum RpcCommandType: String, Sendable {
     case steer
     case followUp = "follow_up"
     case abort
+    case clearQueue = "clear_queue"
     case newSession = "new_session"
     case getState = "get_state"
     case setSessionName = "set_session_name"
@@ -207,13 +208,18 @@ public struct RpcHookError: Sendable {
 public struct RpcAgentEvent: Sendable {
     public var type: String
     public var message: AgentMessage?
-    /// Kind of the streamed assistant delta (`text_delta`, `tool_call_start`, …), taken from the
+    /// Kind of the streamed assistant delta (`text_delta`, `toolcall_start`, …), taken from the
     /// `assistantMessageEvent.type` field.
     public var assistantMessageEvent: String?
     /// Index of the content block this delta belongs to, for ordering reassembly.
     public var assistantMessageContentIndex: Int?
     /// Incremental payload for `text_delta` / `thinking_delta` / `tool_call_delta` events.
     public var assistantMessageDelta: String?
+    /// Cumulative usage from a message_update frame.
+    public var usage: Usage?
+    /// Tool identity from a toolcall_start frame.
+    public var assistantMessageToolCallId: String?
+    public var assistantMessageToolName: String?
     public var messages: [AgentMessage]?
     public var toolResults: [ToolResultMessage]?
     public var toolCallId: String?
@@ -229,6 +235,9 @@ public struct RpcAgentEvent: Sendable {
         assistantMessageEvent: String? = nil,
         assistantMessageContentIndex: Int? = nil,
         assistantMessageDelta: String? = nil,
+        usage: Usage? = nil,
+        assistantMessageToolCallId: String? = nil,
+        assistantMessageToolName: String? = nil,
         messages: [AgentMessage]? = nil,
         toolResults: [ToolResultMessage]? = nil,
         toolCallId: String? = nil,
@@ -243,6 +252,9 @@ public struct RpcAgentEvent: Sendable {
         self.assistantMessageEvent = assistantMessageEvent
         self.assistantMessageContentIndex = assistantMessageContentIndex
         self.assistantMessageDelta = assistantMessageDelta
+        self.usage = usage
+        self.assistantMessageToolCallId = assistantMessageToolCallId
+        self.assistantMessageToolName = assistantMessageToolName
         self.messages = messages
         self.toolResults = toolResults
         self.toolCallId = toolCallId
@@ -446,6 +458,16 @@ public actor RpcClient {
 
     public func abort() async throws {
         _ = try await send(["type": "abort"])
+    }
+
+    public func clearQueue() async throws -> (steering: [String], followUp: [String]) {
+        let response = try await send(["type": "clear_queue"])
+        guard let data = try responseData(response) as? [String: Any],
+              let steering = data["steering"] as? [String],
+              let followUp = data["followUp"] as? [String] else {
+            throw RpcClientError("Invalid clear_queue response")
+        }
+        return (steering, followUp)
     }
 
     public func newSession(parentSession: String? = nil) async throws -> Bool {
@@ -892,7 +914,7 @@ private func decodeHookUIRequest(_ dict: [String: Any]) -> RpcHookUIRequest? {
     }
 }
 
-private func decodeAgentEvent(_ dict: [String: Any]) -> RpcAgentEvent? {
+func decodeAgentEvent(_ dict: [String: Any]) -> RpcAgentEvent? {
     guard let type = dict["type"] as? String else { return nil }
     switch type {
     case "agent_start", "agent_settled", "turn_start", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end":
@@ -921,7 +943,12 @@ private func decodeAgentEvent(_ dict: [String: Any]) -> RpcAgentEvent? {
             message: message,
             assistantMessageEvent: eventObject?["type"] as? String,
             assistantMessageContentIndex: eventObject?["contentIndex"] as? Int,
-            assistantMessageDelta: eventObject?["delta"] as? String
+            assistantMessageDelta: eventObject?["delta"] as? String,
+            usage: (dict["usage"] as? [String: Any]).map(decodeUsage),
+            assistantMessageToolCallId: eventObject?["id"] as? String,
+            assistantMessageToolName: eventObject?["toolName"] as? String,
+            toolCallId: eventObject?["id"] as? String,
+            toolName: eventObject?["toolName"] as? String
         )
     case "message_end":
         let messageDict = dict["message"] as? [String: Any]

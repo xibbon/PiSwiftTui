@@ -5,12 +5,16 @@ import PiSwiftCodingAgent
 import PiSwiftCodingAgentTui
 
 public func selectSession(
+    settingsManager: SettingsManager = SettingsManager.create(),
+    projectTrusted: Bool = true,
     currentSessionsLoader: @escaping SessionsLoader,
     allSessionsLoader: @escaping SessionsLoader
 ) async -> String? {
     await withCheckedContinuation { continuation in
         Task { @MainActor in
-            let ui = TUI(terminal: ProcessTerminal())
+            applyStartupTerminalSettings(settingsManager)
+            let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
+            ui.setClearOnShrink(getClearOnShrink(cwd: FileManager.default.currentDirectoryPath, agentDir: getAgentDir(), loadProjectSettings: projectTrusted))
             var resolved = false
 
             let selector = SessionSelectorComponent(

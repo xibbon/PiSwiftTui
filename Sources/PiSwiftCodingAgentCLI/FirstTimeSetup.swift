@@ -61,7 +61,9 @@ func presentFirstTimeSetup(settingsManager: SettingsManager) async -> FirstTimeS
     await withCheckedContinuation { continuation in
         Task { @MainActor in
             initTheme(settingsManager.getTheme(), enableWatcher: false)
-            let ui = TUI(terminal: ProcessTerminal())
+            applyStartupTerminalSettings(settingsManager)
+            let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
+            ui.setClearOnShrink(getClearOnShrink(cwd: FileManager.default.currentDirectoryPath, agentDir: getAgentDir(), loadProjectSettings: false))
             ui.start()
             let initialTheme: String
             if let configuredTheme = settingsManager.getTheme() {

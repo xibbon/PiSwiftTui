@@ -11,7 +11,9 @@ public func selectProjectTrustOption(
     await withCheckedContinuation { continuation in
         Task { @MainActor in
             initTheme(settingsManager.getTheme(), enableWatcher: true)
-            let ui = TUI(terminal: ProcessTerminal())
+            applyStartupTerminalSettings(settingsManager)
+            let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
+            ui.setClearOnShrink(getClearOnShrink(cwd: cwd, agentDir: getAgentDir(), loadProjectSettings: false))
             var resolved = false
             let options = getProjectTrustOptions(cwd, includeSessionOnly: includeSessionOnly)
 
@@ -31,12 +33,25 @@ public func selectProjectTrustOption(
                     ui.stop()
                     stopThemeWatcher()
                     continuation.resume(returning: nil)
-                }
+                },
+                savedDecision: startupSavedTrustDecision(cwd: cwd, settingsManager: settingsManager),
+                projectTrusted: settingsManager.getProjectTrust(cwd)
             )
 
             ui.addChild(selector)
             ui.setFocus(selector)
             ui.start()
         }
+    }
+}
+
+func startupSavedTrustDecision(cwd: String, settingsManager: SettingsManager) -> ProjectTrustUpdate? {
+    let decisions = settingsManager.getGlobalSettings().projectTrust ?? [:]
+    var current = normalizeProjectTrustPathForOptions(cwd)
+    while true {
+        if let decision = decisions[current] { return ProjectTrustUpdate(path: current, decision: decision) }
+        let parent = URL(fileURLWithPath: current).deletingLastPathComponent().path
+        if parent == current { return nil }
+        current = parent
     }
 }

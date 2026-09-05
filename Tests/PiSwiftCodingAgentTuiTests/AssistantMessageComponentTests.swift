@@ -25,12 +25,12 @@ private func makeAssistantMessage(content: [ContentBlock]) -> AssistantMessage {
     ]))
 
     let content = try #require(component.children.first as? Container)
-    let markdownChildren = content.children.compactMap { $0 as? Markdown }
-
-    #expect(markdownChildren.count == 2)
-    let thinkingRender = markdownChildren[0].render(width: 120).joined(separator: "\n")
+    let thinkingRegions = content.children.compactMap { $0 as? MouseRegion }
+    #expect(thinkingRegions.count == 1)
+    let thinkingRender = try #require(thinkingRegions.first).render(width: 120).joined(separator: "\n")
     #expect(thinkingRender.contains("first thought"))
     #expect(thinkingRender.contains("second thought"))
+
 }
 
 @MainActor
@@ -46,7 +46,7 @@ private func makeAssistantMessage(content: [ContentBlock]) -> AssistantMessage {
     )
 
     let content = try #require(component.children.first as? Container)
-    let thinkingLabels = content.children.compactMap { $0 as? Text }.filter {
+    let thinkingLabels = content.children.compactMap { $0 as? MouseRegion }.filter {
         $0.render(width: 120).joined(separator: "\n").contains("Thinking...")
     }
 

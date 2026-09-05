@@ -9,12 +9,15 @@ public func selectConfig(
     settingsManager: SettingsManager,
     cwd: String,
     agentDir: String,
-    initialProjectMode: Bool = false
+    initialProjectMode: Bool = false,
+    projectTrusted: Bool = true
 ) async {
     await withCheckedContinuation { continuation in
         Task { @MainActor in
             initTheme(settingsManager.getTheme(), enableWatcher: true)
-            let ui = TUI(terminal: ProcessTerminal())
+            applyStartupTerminalSettings(settingsManager)
+            let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
+            ui.setClearOnShrink(getClearOnShrink(cwd: cwd, agentDir: agentDir, loadProjectSettings: projectTrusted))
             var resolved = false
 
             let selector = ConfigSelectorComponent(

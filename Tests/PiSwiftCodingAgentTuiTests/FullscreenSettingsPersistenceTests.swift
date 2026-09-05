@@ -244,7 +244,7 @@ private final class OutputPaddingTestUI: RenderRequesting {
 @Suite(.serialized)
 struct FullscreenScrollbarThemeTests {
     @MainActor
-    @Test func scrollbarUsesThumbTokenAndLegacyThemeFallsBackToSelectedBackground() throws {
+    @Test func scrollbarUsesForegroundTokensAndLegacyThemeFallsBackToText() throws {
         let name = "pi-scrollbar-\(UUID().uuidString)"
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(name)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -274,7 +274,7 @@ struct FullscreenScrollbarThemeTests {
             scrollbar: .always,
             scrollbarStyle: fullscreenScrollbarStyle
         )
-        #expect(composition.transcriptScrollView.scrollbarStyle("x") == theme.fg(.scrollbarThumb, "x"))
+        #expect(composition.transcriptScrollView.scrollbarThumbStyle("x") == theme.fg(.scrollbarThumb, "x"))
 
         colors.removeValue(forKey: ThemeColor.scrollbarThumb.rawValue)
         let legacyName = "\(name)-legacy"
@@ -283,6 +283,6 @@ struct FullscreenScrollbarThemeTests {
         try JSONSerialization.data(withJSONObject: legacyTheme, options: [.prettyPrinted]).write(to: legacyPath)
         setRegisteredThemes([HookThemeInfo(name: legacyName, path: legacyPath.path)])
         let resolved = getResolvedThemeColors(legacyName)
-        #expect(resolved[ThemeColor.scrollbarThumb.rawValue] == resolved[ThemeBg.selectedBg.rawValue])
+        #expect(resolved[ThemeColor.scrollbarThumb.rawValue] == resolved[ThemeColor.text.rawValue])
     }
 }

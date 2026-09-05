@@ -93,7 +93,8 @@ public struct InteractiveComposition {
                 primary: true,
                 overscroll: .chain,
                 scrollbar: scrollbar.miniTuiValue,
-                scrollbarStyle: scrollbarStyle
+                scrollbarTrackStyle: { theme.fg(.scrollbarTrack, $0) },
+                scrollbarThumbStyle: scrollbarStyle
             )
         )
         dock = VStack(children: [
@@ -115,4 +116,38 @@ public struct InteractiveComposition {
             )),
         ])
     }
+}
+
+@MainActor
+public func interactiveAltScreenOptions(
+    wheelScrollLines: Int = 1,
+    copyOnSelect: Bool = true,
+    onRightClickPaste: (() -> Void)? = nil,
+    openURL: ((String) -> Void)? = nil
+) -> AltScreenRendererOptions {
+    AltScreenRendererOptions(
+        wheelScrollLines: wheelScrollLines,
+        openURL: openURL ?? { url in
+            let process = Process()
+            #if os(macOS)
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            #else
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xdg-open")
+            #endif
+            process.arguments = [url]
+            try? process.run()
+        },
+        onRightClickPaste: onRightClickPaste,
+        searchMatchStyle: { theme.underline(theme.bg(.searchMatchBg, theme.fg(.searchMatchText, $0))) },
+        searchCurrentMatchStyle: { theme.bold(theme.inverse(theme.bg(.searchMatchBg, theme.fg(.searchMatchText, $0)))) },
+        searchNavigationButtonStyle: { text, hovered in hovered ? theme.underline(text) : text },
+        scrollToEndIndicator: {
+            let key = formatKeys(getKeybindings().getKeys(TUIKeybinding.altScreenBottom))
+            return theme.bg(.selectedBg, theme.fg(.text, " ↓ Jump to latest message" + (key.isEmpty ? "" : " · \(key)") + " "))
+        },
+        copyOnSelect: copyOnSelect,
+        copySelection: { text in
+            do { try copyToClipboard(text); return true } catch { return false }
+        }
+    )
 }

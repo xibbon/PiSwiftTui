@@ -2,7 +2,8 @@ import Foundation
 import MiniTui
 import PiSwiftCodingAgent
 
-public final class ProjectTrustSelectorComponent: Container {
+public final class ProjectTrustSelectorComponent: Container, MouseFocusOwner {
+    private let savedDecision: ProjectTrustUpdate?
     private let cwd: String
     private let options: [ProjectTrustOption]
     private var selectedIndex = 0
@@ -14,8 +15,11 @@ public final class ProjectTrustSelectorComponent: Container {
         cwd: String,
         options: [ProjectTrustOption],
         onSelect: @escaping (ProjectTrustOption) -> Void,
-        onCancel: @escaping () -> Void
+        onCancel: @escaping () -> Void,
+        savedDecision: ProjectTrustUpdate? = nil,
+        projectTrusted: Bool? = nil
     ) {
+        self.savedDecision = savedDecision
         self.cwd = cwd
         self.options = options
         self.onSelectCallback = onSelect
@@ -27,6 +31,10 @@ public final class ProjectTrustSelectorComponent: Container {
         addChild(Spacer(1))
         addChild(Text(theme.fg(.accent, "Project trust required"), paddingX: 1, paddingY: 0))
         addChild(Text(theme.fg(.muted, cwd), paddingX: 1, paddingY: 0))
+        if let projectTrusted {
+            let saved = savedDecision.map { "\($0.decision == true ? "trusted" : "untrusted") (\($0.path))" } ?? "none"
+            addChild(Text(theme.fg(.muted, "Saved decision: \(saved)\nCurrent session: \(projectTrusted ? "trusted" : "untrusted")"), paddingX: 1, paddingY: 0))
+        }
         addChild(Spacer(1))
         addChild(listContainer)
         addChild(Spacer(1))
@@ -34,6 +42,9 @@ public final class ProjectTrustSelectorComponent: Container {
         addChild(Spacer(1))
         addChild(DynamicBorder())
 
+        if let savedDecision {
+            selectedIndex = options.firstIndex { $0.savedPath == savedDecision.path && $0.trusted == savedDecision.decision } ?? 0
+        }
         updateList()
     }
 
@@ -41,10 +52,12 @@ public final class ProjectTrustSelectorComponent: Container {
         listContainer.clear()
         for (index, option) in options.enumerated() {
             let isSelected = index == selectedIndex
-            let prefix = isSelected ? "> " : "  "
+            let prefix = isSelected ? "→ " : "  "
+            let current = option.savedPath != nil && option.savedPath == savedDecision?.path && option.trusted == savedDecision?.decision
+            let marker = current ? theme.fg(.accent, "✓ ") : "  "
             let line = isSelected
-                ? theme.fg(.accent, prefix + option.label)
-                : prefix + theme.fg(.text, option.label)
+                ? theme.fg(.accent, prefix + marker + option.label)
+                : prefix + marker + theme.fg(.text, option.label)
             listContainer.addChild(Text(line, paddingX: 1, paddingY: 0))
         }
     }

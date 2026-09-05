@@ -16,7 +16,7 @@ public final class ThemeSelectorComponent: Container {
 
         let themes = getAvailableThemes()
         let items = themes.map { name in
-            SelectItem(value: name, label: name, description: name == currentTheme ? "(current)" : nil)
+            SelectItem(value: name, label: (name == currentTheme ? "✓ " : "  ") + name)
         }
         self.selectList = SelectList(items: items, maxVisible: 10, theme: getSelectListTheme())
 

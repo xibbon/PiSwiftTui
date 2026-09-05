@@ -9,14 +9,18 @@ private func isEnabled(_ enabledIds: EnabledIds, _ id: String) -> Bool {
     enabledIds == nil || enabledIds?.contains(id) == true
 }
 
-private func toggle(_ enabledIds: EnabledIds, _ id: String) -> EnabledIds {
-    guard var enabledIds else { return [id] }
+private func normalizeEnabled(_ ids: [String], _ allIds: [String]) -> EnabledIds {
+    ids.count == allIds.count && ids.allSatisfy { allIds.contains($0) } ? nil : ids
+}
+
+private func toggle(_ enabledIds: EnabledIds, _ allIds: [String], _ id: String) -> EnabledIds {
+    guard var enabledIds else { return allIds.filter { $0 != id } }
     if let index = enabledIds.firstIndex(of: id) {
         enabledIds.remove(at: index)
     } else {
         enabledIds.append(id)
     }
-    return enabledIds
+    return normalizeEnabled(enabledIds, allIds)
 }
 
 private func enableAll(_ enabledIds: EnabledIds, _ allIds: [String], targetIds: [String]? = nil) -> EnabledIds {
@@ -25,7 +29,7 @@ private func enableAll(_ enabledIds: EnabledIds, _ allIds: [String], targetIds: 
     for id in targets where !enabledIds.contains(id) {
         enabledIds.append(id)
     }
-    return enabledIds.count == allIds.count ? nil : enabledIds
+    return normalizeEnabled(enabledIds, allIds)
 }
 
 private func clearAll(_ enabledIds: EnabledIds, _ allIds: [String], targetIds: [String]? = nil) -> EnabledIds {
@@ -56,7 +60,7 @@ private func getSortedIds(_ enabledIds: EnabledIds, _ allIds: [String]) -> [Stri
 
 private struct ModelItem {
     let fullId: String
-    let model: Model
+    let model: Model?
     let enabled: Bool
 }
 
@@ -81,32 +85,21 @@ public struct ModelsConfig: Sendable {
 }
 
 public struct ModelsCallbacks {
-    public var onModelToggle: (String, Bool) -> Void
-    public var onPersist: ([String]) -> Void
-    public var onEnableAll: ([String]) -> Void
-    public var onClearAll: () -> Void
-    public var onToggleProvider: (String, [String], Bool) -> Void
+    public var onChange: ([String]?) -> Void
+    public var onPersist: ([String]?) -> Void
     public var onCancel: () -> Void
 
-    public init(
-        onModelToggle: @escaping (String, Bool) -> Void,
-        onPersist: @escaping ([String]) -> Void,
-        onEnableAll: @escaping ([String]) -> Void,
-        onClearAll: @escaping () -> Void,
-        onToggleProvider: @escaping (String, [String], Bool) -> Void,
-        onCancel: @escaping () -> Void
-    ) {
-        self.onModelToggle = onModelToggle
+    public init(onChange: @escaping ([String]?) -> Void,
+                onPersist: @escaping ([String]?) -> Void,
+                onCancel: @escaping () -> Void) {
+        self.onChange = onChange
         self.onPersist = onPersist
-        self.onEnableAll = onEnableAll
-        self.onClearAll = onClearAll
-        self.onToggleProvider = onToggleProvider
         self.onCancel = onCancel
     }
 }
 
 @MainActor
-public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, SelectorClosable {
+public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, SystemCursorAware, Focusable, SelectorClosable {
     private var modelsById: [String: Model] = [:]
     private var allIds: [String] = []
     private var enabledIds: EnabledIds = nil
@@ -122,6 +115,10 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
     /// Cancels the background catalog refresh when the selector closes (#7153).
     public let refreshSignal = CancellationToken()
     private var closed = false
+    public var focused: Bool {
+        get { searchInput.focused }
+        set { searchInput.focused = newValue }
+    }
     public var usesSystemCursor: Bool {
         get { searchInput.usesSystemCursor }
         set { searchInput.usesSystemCursor = newValue }
@@ -164,7 +161,8 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
 
     /// Replaces the model set after a background catalog refresh. `enabledModelIds` is supplied
     /// only when the caller recomputed the enabled scope; otherwise the current scope is kept.
-    public func updateModels(_ models: [Model], enabledModelIds: [String]? = nil) {
+    public func updateModels(_ models: [Model], enabledModelIds: [String]?? = nil) {
+        let selectedId = filteredItems[safe: selectedIndex]?.fullId
         modelsById = [:]
         allIds = []
         for model in models {
@@ -174,11 +172,12 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
         }
         if let enabledModelIds {
             enabledIds = enabledModelIds
-        } else if let current = enabledIds {
-            // Drop ids the refreshed catalogs no longer contain.
-            enabledIds = current.filter { modelsById[$0] != nil }
         }
         refresh()
+        if let index = filteredItems.firstIndex(where: { $0.fullId == selectedId }) {
+            selectedIndex = index
+            updateList()
+        }
     }
 
     public func setRefreshStatus(_ message: String, isError: Bool) {
@@ -199,16 +198,16 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
     public var isClosed: Bool { closed }
 
     private func buildItems() -> [ModelItem] {
-        getSortedIds(enabledIds, allIds).compactMap { id in
-            guard let model = modelsById[id] else { return nil }
-            return ModelItem(fullId: id, model: model, enabled: isEnabled(enabledIds, id))
+        getSortedIds(enabledIds, allIds).map { id in
+            return ModelItem(fullId: id, model: modelsById[id], enabled: isEnabled(enabledIds, id))
         }
     }
 
     private func getFooterText() -> String {
         let enabledCount = enabledIds?.count ?? allIds.count
         let allEnabled = enabledIds == nil
-        let countText = allEnabled ? "all enabled" : "\(enabledCount)/\(allIds.count) enabled"
+        let unavailable = enabledIds?.filter { modelsById[$0] == nil }.count ?? 0
+        let countText = allEnabled ? "all enabled" : "\(enabledCount)/\(allIds.count) enabled\(unavailable > 0 ? " · \(unavailable) unavailable" : "")"
         let parts = ["Enter toggle", "^A all", "^X clear", "^P provider", "Alt+Up/Down reorder", "^S save", countText]
         let hint = theme.fg(.dim, "  \(parts.joined(separator: " · "))")
         if isDirty {
@@ -223,7 +222,7 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
         if query.isEmpty {
             filteredItems = items
         } else {
-            filteredItems = fuzzyFilter(items, query: query) { "\($0.model.id) \($0.model.provider)" }
+            filteredItems = fuzzyFilter(items, query: query) { "\($0.fullId) \($0.model?.name ?? "")" }
         }
         selectedIndex = min(selectedIndex, max(0, filteredItems.count - 1))
         updateList()
@@ -240,16 +239,16 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
 
         let startIndex = max(0, min(selectedIndex - maxVisible / 2, filteredItems.count - maxVisible))
         let endIndex = min(startIndex + maxVisible, filteredItems.count)
-        let allEnabled = enabledIds == nil
-
         for i in startIndex..<endIndex {
             let item = filteredItems[i]
             let isSelected = i == selectedIndex
             let prefix = isSelected ? theme.fg(.accent, "→ ") : "  "
-            let modelText = isSelected ? theme.fg(.accent, item.model.id) : item.model.id
-            let providerBadge = theme.fg(.muted, " [\(item.model.provider)]")
-            let status = allEnabled ? "" : (item.enabled ? theme.fg(.success, " ✓") : theme.fg(.dim, " ✗"))
-            listContainer.addChild(Text("\(prefix)\(modelText)\(providerBadge)\(status)", paddingX: 0, paddingY: 0))
+            let id = item.model?.id ?? item.fullId
+            let styledId = item.model == nil ? theme.strikethrough(id) : id
+            let modelText = isSelected ? theme.fg(.accent, styledId) : styledId
+            let providerBadge = theme.fg(.muted, item.model.map { " [\($0.provider)]" } ?? " [unavailable]")
+            let status = item.model != nil && item.enabled ? theme.fg(.accent, "✓ ") : "  "
+            listContainer.addChild(Text("\(prefix)\(status)\(modelText)\(providerBadge)", paddingX: 0, paddingY: 0))
         }
 
         if startIndex > 0 || endIndex < filteredItems.count {
@@ -274,7 +273,7 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
         }
 
         if matchesKey(data, Key.alt("up")) || matchesKey(data, Key.alt("down")) {
-            guard let item = filteredItems[safe: selectedIndex], isEnabled(enabledIds, item.fullId) else { return }
+            guard enabledIds != nil, let item = filteredItems[safe: selectedIndex], isEnabled(enabledIds, item.fullId) else { return }
             let delta = matchesKey(data, Key.alt("up")) ? -1 : 1
             let enabledList = enabledIds ?? allIds
             guard let currentIndex = enabledList.firstIndex(of: item.fullId) else { return }
@@ -284,18 +283,15 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
             isDirty = true
             selectedIndex += delta
             refresh()
+            callbacks.onChange(enabledIds)
             return
         }
 
         if kb.matches(data, TUIKeybinding.selectConfirm) {
             guard let item = filteredItems[safe: selectedIndex] else { return }
-            let wasAllEnabled = enabledIds == nil
-            enabledIds = toggle(enabledIds, item.fullId)
+            enabledIds = toggle(enabledIds, allIds, item.fullId)
             isDirty = true
-            if wasAllEnabled {
-                callbacks.onClearAll()
-            }
-            callbacks.onModelToggle(item.fullId, isEnabled(enabledIds, item.fullId))
+            callbacks.onChange(enabledIds)
             refresh()
             return
         }
@@ -304,7 +300,7 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
             let targetIds = searchInput.getValue().isEmpty ? nil : filteredItems.map { $0.fullId }
             enabledIds = enableAll(enabledIds, allIds, targetIds: targetIds)
             isDirty = true
-            callbacks.onEnableAll(targetIds ?? allIds)
+            callbacks.onChange(enabledIds)
             refresh()
             return
         }
@@ -313,27 +309,27 @@ public final class ScopedModelsSelectorComponent: Container, SystemCursorAware, 
             let targetIds = searchInput.getValue().isEmpty ? nil : filteredItems.map { $0.fullId }
             enabledIds = clearAll(enabledIds, allIds, targetIds: targetIds)
             isDirty = true
-            callbacks.onClearAll()
+            callbacks.onChange(enabledIds)
             refresh()
             return
         }
 
         if matchesKey(data, Key.ctrl("p")) {
             guard let item = filteredItems[safe: selectedIndex] else { return }
-            let provider = item.model.provider
+            guard let provider = item.model?.provider else { return }
             let providerIds = allIds.filter { modelsById[$0]?.provider == provider }
             let allEnabled = providerIds.allSatisfy { isEnabled(enabledIds, $0) }
             enabledIds = allEnabled
                 ? clearAll(enabledIds, allIds, targetIds: providerIds)
                 : enableAll(enabledIds, allIds, targetIds: providerIds)
             isDirty = true
-            callbacks.onToggleProvider(provider, providerIds, !allEnabled)
+            callbacks.onChange(enabledIds)
             refresh()
             return
         }
 
         if matchesKey(data, Key.ctrl("s")) {
-            callbacks.onPersist(enabledIds ?? allIds)
+            callbacks.onPersist(enabledIds)
             isDirty = false
             footerText.setText(getFooterText())
             return

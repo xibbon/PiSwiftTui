@@ -11,6 +11,7 @@ public final class AssistantMessageComponent: Container {
     private let contentContainer: Container
     private var hideThinkingBlock: Bool
     private var lastMessage: AssistantMessage?
+    private var thinkingVisibilityOverrides: [Int: Bool] = [:]
     private var hasToolCalls: Bool = false
     private var markdownConfiguration: InteractiveTuiConfiguration
     private var isStreaming: Bool
@@ -51,6 +52,8 @@ public final class AssistantMessageComponent: Container {
 
     public func setHideThinkingBlock(_ hide: Bool) {
         hideThinkingBlock = hide
+        thinkingVisibilityOverrides.removeAll()
+        if let lastMessage { updateContent(lastMessage) }
     }
 
     public func setStreaming(_ streaming: Bool) {
@@ -103,6 +106,7 @@ public final class AssistantMessageComponent: Container {
             contentContainer.addChild(Spacer(1))
         }
 
+        var thinkingRunIndex = 0
         var index = 0
         while index < message.content.count {
             let block = message.content[index]
@@ -143,23 +147,28 @@ public final class AssistantMessageComponent: Container {
                     }
                 }
 
-                if hideThinkingBlock {
-                    contentContainer.addChild(Text(
+                let runIndex = thinkingRunIndex
+                thinkingRunIndex += 1
+                let hidden = thinkingVisibilityOverrides[runIndex] ?? hideThinkingBlock
+                let thinkingComponent: Component
+                if hidden {
+                    thinkingComponent = Text(
                         theme.italic(theme.fg(.thinkingText, "Thinking...")),
-                        paddingX: markdownConfiguration.outputPad,
-                        paddingY: 0
-                    ))
+                        paddingX: markdownConfiguration.outputPad, paddingY: 0)
                 } else {
-                    let style = DefaultTextStyle(color: { theme.fg(.thinkingText, $0) }, italic: true)
-                    contentContainer.addChild(Markdown(
+                    thinkingComponent = Markdown(
                         thinkingBlocks.joined(separator: "\n\n"),
-                        paddingX: markdownConfiguration.outputPad,
-                        paddingY: 0,
+                        paddingX: markdownConfiguration.outputPad, paddingY: 0,
                         theme: getMarkdownTheme(),
-                        defaultTextStyle: style,
-                        options: markdownOptions(includeMermaid: false)
-                    ))
+                        defaultTextStyle: DefaultTextStyle(color: { theme.fg(.thinkingText, $0) }, italic: true),
+                        options: markdownOptions(includeMermaid: false))
                 }
+                contentContainer.addChild(MouseRegion(child: thinkingComponent) { [weak self] event in
+                    guard let self, event.type == .click, event.button == .left else { return nil }
+                    self.thinkingVisibilityOverrides[runIndex] = !hidden
+                    if let lastMessage = self.lastMessage { self.updateContent(lastMessage) }
+                    return TuiMouseEventResult(handled: true)
+                })
                 if hasVisibleContentAfter {
                     contentContainer.addChild(Spacer(1))
                 }

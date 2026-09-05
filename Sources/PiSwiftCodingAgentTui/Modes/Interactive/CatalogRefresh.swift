@@ -101,8 +101,8 @@ func runBoundedCatalogRefresh(
     }
     defer { timeoutTask.cancel() }
 
-    let result = await registry.refresh(
-        ModelsRefreshOptions(providers: providers, signal: signal)
+    let result = await interactiveCatalogRefreshCoordinator.refresh(
+        registry: registry, providers: providers, signal: signal
     )
     return BoundedCatalogRefreshOutcome(result: result, timedOut: state.timedOut)
 }
@@ -170,3 +170,85 @@ enum CatalogRefreshStatus {
         return "\(actionLabel), but its model catalog could not be refreshed; using cached models."
     }
 }
+
+/// One operation serves concurrent callers. Each caller retains its own cancellation token.
+@MainActor
+final class InteractiveCatalogRefreshCoordinator {
+    @MainActor
+    private final class Active {
+        let signal = CancellationToken()
+        var task: Task<Void, Never>?
+        var waiters: [UUID: CheckedContinuation<ModelsRefreshResult, Never>] = [:]
+    }
+    private struct Key: Hashable {
+        let runtime: ObjectIdentifier
+        let providers: [String]?
+    }
+    private var active: [Key: Active] = [:]
+
+    func refresh(registry: ModelRegistry, providers: [String]? = nil,
+                 signal: CancellationToken) async -> ModelsRefreshResult {
+        await refresh(runtime: registry, providers: providers, signal: signal) { signal in
+            await registry.refresh(ModelsRefreshOptions(providers: providers, signal: signal))
+        }
+    }
+
+    func refresh(runtime: AnyObject, providers: [String]? = nil, signal: CancellationToken,
+                 operation: @escaping @MainActor (CancellationToken) async -> ModelsRefreshResult
+    ) async -> ModelsRefreshResult {
+        guard !signal.isCancelled, !Task.isCancelled else { return ModelsRefreshResult(aborted: true) }
+        let key = Key(runtime: ObjectIdentifier(runtime), providers: providers?.sorted())
+        let entry: Active
+        if let existing = active[key] {
+            entry = existing
+        } else {
+            entry = Active()
+            active[key] = entry
+            entry.task = Task { @MainActor [weak self] in
+                let result = await operation(entry.signal)
+                guard let self, self.active[key] === entry else { return }
+                self.active.removeValue(forKey: key)
+                let waiters = entry.waiters.values
+                entry.waiters.removeAll()
+                for waiter in waiters { waiter.resume(returning: result) }
+            }
+        }
+        let id = UUID()
+        // CancellationToken exposes polling, but its observer registration is library-internal.
+        let observer = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                if signal.isCancelled {
+                    self?.cancelWaiter(key: key, entry: entry, id: id)
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        defer { observer.cancel() }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                entry.waiters[id] = continuation
+                if signal.isCancelled || Task.isCancelled {
+                    cancelWaiter(key: key, entry: entry, id: id)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelWaiter(key: key, entry: entry, id: id)
+            }
+        }
+    }
+
+    private func cancelWaiter(key: Key, entry: Active, id: UUID) {
+        guard let waiter = entry.waiters.removeValue(forKey: id) else { return }
+        waiter.resume(returning: ModelsRefreshResult(aborted: true))
+        if entry.waiters.isEmpty, active[key] === entry {
+            active.removeValue(forKey: key)
+            entry.signal.cancel()
+            entry.task?.cancel()
+        }
+    }
+}
+
+@MainActor
+private let interactiveCatalogRefreshCoordinator = InteractiveCatalogRefreshCoordinator()

@@ -21,11 +21,15 @@ private final class PendingHookRequests: Sendable {
     }
 }
 
-private final class RpcOutput: Sendable {
-    private let output: MachineReadableOutput
+final class RpcOutput: Sendable {
+    private let write: @Sendable ([String: Any]) -> Void
 
     init(output: MachineReadableOutput) {
-        self.output = output
+        self.write = { output.writeJSONLine($0) }
+    }
+
+    init(write: @escaping @Sendable ([String: Any]) -> Void) {
+        self.write = write
     }
 
     static func takeOverStdout() -> RpcOutput {
@@ -33,7 +37,7 @@ private final class RpcOutput: Sendable {
     }
 
     func send(_ object: [String: Any]) {
-        output.writeJSONLine(object)
+        write(object)
     }
 }
 
@@ -276,6 +280,7 @@ private func makeErrorResponse(_ id: Any?, _ command: String, _ message: String)
 
 public func runRpcMode(_ session: AgentSession) async {
     let output = RpcOutput.takeOverStdout()
+    var pendingCompactions: [Task<Void, Never>] = []
 
     // Upstream refreshes the catalogs here in the background (interactive mode starts its own
     // refresh after TUI initialization). RPC startup must not wait on the network.
@@ -368,6 +373,20 @@ public func runRpcMode(_ session: AgentSession) async {
             continue
         }
 
+        // Manual compaction must not block the input loop: abort can cancel it.
+        if commandType == "compact" {
+            let request = mapToAnyCodable(dict)
+            let task = Task {
+                let command = request.mapValues(\.jsonValue)
+                do {
+                    output.send(try await handleRpcCommand("compact", command, session, output))
+                } catch {
+                    output.send(makeErrorResponse(command["id"], "compact", error.localizedDescription))
+                }
+            }
+            pendingCompactions.append(task)
+            continue
+        }
         let response: [String: Any]
         do {
             response = try await handleRpcCommand(commandType, dict, session, output)
@@ -376,9 +395,10 @@ public func runRpcMode(_ session: AgentSession) async {
         }
         output.send(response)
     }
+    for task in pendingCompactions { await task.value }
 }
 
-private func handleRpcCommand(
+func handleRpcCommand(
     _ commandType: String,
     _ dict: [String: Any],
     _ session: AgentSession,
@@ -425,6 +445,10 @@ private func handleRpcCommand(
         session.followUp(message)
         return makeSuccessResponse(idValue, "follow_up", nil)
 
+    case "clear_queue":
+        let cleared = session.clearQueue()
+        return makeSuccessResponse(idValue, "clear_queue", ["steering": cleared.steering, "followUp": cleared.followUp])
+
     case "abort":
         await session.abort()
         return makeSuccessResponse(idValue, "abort", nil)
@@ -466,11 +490,11 @@ private func handleRpcCommand(
         guard let model = session.modelRegistry.find(provider, modelId) else {
             return makeErrorResponse(idValue, "set_model", "Model not found: \(provider)/\(modelId)")
         }
-        try await session.setModel(model)
+        try await session.setModel(model, options: ModelMutationOptions(persist: false))
         return makeSuccessResponse(idValue, "set_model", modelToDict(model))
 
     case "cycle_model":
-        let result = try await session.cycleModel(direction: .forward)
+        let result = try await session.cycleModel(direction: .forward, options: ModelMutationOptions(persist: false))
         if let result {
             return makeSuccessResponse(idValue, "cycle_model", [
                 "model": modelToDict(result.model),
@@ -489,11 +513,11 @@ private func handleRpcCommand(
               let level = ThinkingLevel(rawValue: raw) else {
             return makeErrorResponse(idValue, "set_thinking_level", "Invalid thinking level")
         }
-        session.setThinkingLevel(level)
+        session.setThinkingLevel(level, options: ModelMutationOptions(persist: false))
         return makeSuccessResponse(idValue, "set_thinking_level", nil)
 
     case "cycle_thinking_level":
-        if let level = session.cycleThinkingLevel() {
+        if let level = session.cycleThinkingLevel(options: ModelMutationOptions(persist: false)) {
             return makeSuccessResponse(idValue, "cycle_thinking_level", ["level": level.rawValue])
         }
         return makeSuccessResponse(idValue, "cycle_thinking_level", NSNull())

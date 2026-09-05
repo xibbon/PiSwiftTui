@@ -2,8 +2,13 @@ import Foundation
 import MiniTui
 import PiSwiftCodingAgent
 
-public final class CustomEditor: Component, SystemCursorAware, EditorComponent {
-    private let editor: Editor
+public protocol WorkingStatusEditor: EditorComponent {
+    var embedWorkingStatus: Bool { get }
+    func setWorkingStatusIndicator(_ indicator: WorkingStatusIndicator?)
+}
+
+public final class CustomEditor: Component, SystemCursorAware, EditorComponent, WorkingStatusEditor {
+    private let editor: WorkingBorderEditor
     private let keybindings: KeybindingsManager
     private var explicitHistory: [String] = []
     private var explicitHistoryIndex = -1
@@ -40,9 +45,20 @@ public final class CustomEditor: Component, SystemCursorAware, EditorComponent {
         set { editor.borderColor = newValue }
     }
 
-    public init(theme: EditorTheme, keybindings: KeybindingsManager, options: EditorOptions = EditorOptions()) {
-        self.editor = Editor(theme: theme, options: options)
+    public init(ui: TUI? = nil, theme: EditorTheme, keybindings: KeybindingsManager, options: EditorOptions = EditorOptions(), embedWorkingStatus: Bool = false) {
+        self.editor = WorkingBorderEditor(ui: ui, theme: theme, options: options)
+        self.editor.embedWorkingStatus = embedWorkingStatus
         self.keybindings = keybindings
+    }
+
+    public var embedWorkingStatus: Bool { editor.embedWorkingStatus }
+
+    public func setWorkingStatusIndicator(_ indicator: WorkingStatusIndicator?) {
+        editor.workingStatusIndicator = indicator
+    }
+
+    public func handleMouse(_ event: TuiMouseEvent) -> TuiMouseEventResult? {
+        editor.handleMouse(event)
     }
 
     public func onAction(_ action: AppAction, handler: @escaping () -> Void) {
@@ -177,5 +193,37 @@ public final class CustomEditor: Component, SystemCursorAware, EditorComponent {
             explicitHistoryIndex = -1
             editor.setText(explicitHistoryDraft)
         }
+    }
+}
+
+private final class WorkingBorderEditor: Editor {
+    var embedWorkingStatus = false
+    var workingStatusIndicator: WorkingStatusIndicator?
+
+    override func renderTopBorder(width: Int, hiddenLineCount: Int) -> String {
+        guard embedWorkingStatus, let indicator = workingStatusIndicator, width > 0 else {
+            return super.renderTopBorder(width: width, hiddenLineCount: hiddenLineCount)
+        }
+        var status = indicator.renderInBorder(width: max(1, width - 5))
+        var statusWidth = visibleWidth(status)
+        guard statusWidth > 0 else { return super.renderTopBorder(width: width, hiddenLineCount: hiddenLineCount) }
+        let label = hiddenLineCount > 0 ? " ↑ \(hiddenLineCount) more " : ""
+        let labelWidth = visibleWidth(label)
+        let start = (width - labelWidth) / 2
+        func fits() -> Bool { !label.isEmpty && labelWidth + 2 <= width && start - (4 + statusWidth) >= 1 }
+        if !label.isEmpty && !fits() {
+            status = indicator.renderSpinnerInBorder(width: width)
+            statusWidth = visibleWidth(status)
+        }
+        if fits() {
+            return borderColor("── ") + status + borderColor(" " + String(repeating: "─", count: start - 4 - statusWidth) + label + String(repeating: "─", count: width - start - labelWidth))
+        }
+        if width >= statusWidth + 5 {
+            return borderColor("── ") + status + borderColor(" " + String(repeating: "─", count: width - statusWidth - 4))
+        }
+        status = indicator.renderSpinnerInBorder(width: width)
+        statusWidth = visibleWidth(status)
+        let prefix = min(3, max(0, width - statusWidth))
+        return borderColor(String(repeating: "─", count: prefix)) + status + borderColor(String(repeating: "─", count: max(0, width - prefix - statusWidth)))
     }
 }

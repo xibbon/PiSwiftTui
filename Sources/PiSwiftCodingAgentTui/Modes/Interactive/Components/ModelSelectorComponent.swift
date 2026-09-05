@@ -3,6 +3,12 @@ import MiniTui
 import PiSwiftAI
 import PiSwiftCodingAgent
 
+public struct ModelSelection: Sendable, Equatable {
+    public let provider: String
+    public let id: String
+    public init(provider: String, id: String) { self.provider = provider; self.id = id }
+}
+
 private struct ModelItem {
     let provider: String
     let id: String
@@ -15,14 +21,23 @@ private struct ScopedModelItem {
 }
 
 @MainActor
-public final class ModelSelectorComponent: Container, SystemCursorAware, SelectorClosable {
+public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCursorAware, Focusable, SelectorClosable {
     private let searchInput: Input
     private let listContainer: Container
     private var allModels: [ModelItem] = []
+    private var scopedModelItems: [ModelItem] = []
+    private var isScoped: Bool
+    private var activeModels: [ModelItem] { isScoped ? scopedModelItems : allModels }
+    private let scopeText = Text("", paddingX: 0, paddingY: 0)
     private var filteredModels: [ModelItem] = []
     private var selectedIndex = 0
     private let currentModel: Model?
-    private let settingsManager: SettingsManager
+    private let defaultModel: ModelSelection?
+    private let onSelectAsDefaultCallback: ((Model) -> Void)?
+    public var focused: Bool {
+        get { searchInput.focused }
+        set { searchInput.focused = newValue }
+    }
     private let modelRegistry: ModelRegistry
     private let onSelectCallback: (Model) -> Void
     private let onCancelCallback: () -> Void
@@ -43,16 +58,19 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
     public init(
         tui: TUI,
         currentModel: Model?,
-        settingsManager: SettingsManager,
+        defaultModel: ModelSelection? = nil,
         modelRegistry: ModelRegistry,
         scopedModels: [ScopedModel],
         onSelect: @escaping (Model) -> Void,
         onCancel: @escaping () -> Void,
-        initialSearchInput: String? = nil
+        initialSearchInput: String? = nil,
+        onSelectAsDefault: ((Model) -> Void)? = nil
     ) {
+        self.isScoped = !scopedModels.isEmpty
         self.tui = tui
         self.currentModel = currentModel
-        self.settingsManager = settingsManager
+        self.defaultModel = defaultModel
+        self.onSelectAsDefaultCallback = onSelectAsDefault
         self.modelRegistry = modelRegistry
         self.scopedModels = scopedModels.map { ScopedModelItem(model: $0.model, thinkingLevel: ($0.thinkingLevel ?? .off).rawValue) }
         self.onSelectCallback = onSelect
@@ -75,6 +93,11 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
             : "Showing models from --models scope"
         addChild(Text(theme.fg(.warning, hintText), paddingX: 0, paddingY: 0))
         addChild(Spacer(1))
+        if !scopedModels.isEmpty {
+            addChild(scopeText)
+            addChild(Text(theme.fg(.muted, "Tab scope (all/scoped)"), paddingX: 0, paddingY: 0))
+            addChild(Spacer(1))
+        }
 
         searchInput.onSubmit = { [weak self] _ in
             guard let self else { return }
@@ -87,6 +110,9 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
 
         addChild(listContainer)
         addChild(Spacer(1))
+        if onSelectAsDefault != nil {
+            addChild(Text(theme.fg(.dim, "  Enter to select · Ctrl+S to set as default · Esc to cancel"), paddingX: 0, paddingY: 0))
+        }
         addChild(DynamicBorder())
 
         loadModels()
@@ -95,50 +121,41 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
     /// Renders whatever is already cached, then — for the unscoped picker — refreshes the
     /// catalogs in the background (#7443, #7153). Opening the picker never blocks on the network.
     private func loadModels() {
-        Task { @MainActor in
+        scopedModelItems = scopedModels.map { ModelItem(provider: $0.model.provider, id: $0.model.id, model: $0.model) }
+        selectedIndex = activeModels.firstIndex { modelsAreEqual(currentModel, $0.model) } ?? 0
+        filterModels(searchInput.getValue())
+        updateScopeText()
+        Task { @MainActor [weak self] in
+            guard let self, !closed else { return }
             await loadModelsFromSnapshot()
-            guard scopedModels.isEmpty else { return }
+            guard !closed else { return }
             await refreshModels()
         }
     }
 
-    /// Reads the current (cached) model snapshot into the list without touching the network.
-    /// `adoptRegistryError` is false once a refresh has produced its own status message.
     private func loadModelsFromSnapshot(adoptRegistryError: Bool = true) async {
-        var items: [ModelItem] = []
-
-        if !scopedModels.isEmpty {
-            items = scopedModels.map { scoped in
-                ModelItem(provider: scoped.model.provider, id: scoped.model.id, model: scoped.model)
-            }
-        } else {
-            if adoptRegistryError {
-                errorMessage = modelRegistry.getError()
-            }
-            let available = await modelRegistry.getAvailable()
-            items = available.map { model in
-                ModelItem(provider: model.provider, id: model.id, model: model)
-            }
+        if adoptRegistryError { errorMessage = modelRegistry.getError() }
+        var items = await modelRegistry.getAvailable().map { ModelItem(provider: $0.provider, id: $0.id, model: $0) }
+        scopedModelItems = scopedModels.map { scoped in
+            let model = modelRegistry.find(scoped.model.provider, scoped.model.id) ?? scoped.model
+            return ModelItem(provider: model.provider, id: model.id, model: model)
         }
-
         items.sort { lhs, rhs in
             let lhsCurrent = modelsAreEqual(currentModel, lhs.model)
             let rhsCurrent = modelsAreEqual(currentModel, rhs.model)
             if lhsCurrent != rhsCurrent {
                 return lhsCurrent
             }
+            let lhsDefault = isDefaultModel(lhs.model)
+            let rhsDefault = isDefaultModel(rhs.model)
+            if lhsDefault != rhsDefault { return lhsDefault }
             return lhs.provider.localizedCaseInsensitiveCompare(rhs.provider) == .orderedAscending
         }
 
         allModels = items
-        selectedIndex = min(selectedIndex, max(0, items.count - 1))
-        let query = searchInput.getValue()
-        if query.isEmpty {
-            filteredModels = items
-            updateList()
-        } else {
-            filterModels(query)
-        }
+        selectedIndex = activeModels.firstIndex { modelsAreEqual(currentModel, $0.model) } ?? min(selectedIndex, max(0, activeModels.count - 1))
+        filterModels(searchInput.getValue())
+        updateScopeText()
         tui.requestRender()
     }
 
@@ -169,8 +186,12 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
     }
 
     private func filterModels(_ query: String) {
-        filteredModels = fuzzyFilter(allModels, query) { "\($0.id) \($0.provider)" }
-        selectedIndex = min(selectedIndex, max(0, filteredModels.count - 1))
+        filteredModels = query.isEmpty ? activeModels : fuzzyFilter(activeModels, query) { "\($0.id) \($0.provider) \($0.model.name)\(isDefaultModel($0.model) ? " default" : "")" }
+        let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !normalized.isEmpty && "default".hasPrefix(normalized) {
+            filteredModels = activeModels.filter { isDefaultModel($0.model) } + filteredModels.filter { !isDefaultModel($0.model) }
+        }
+        selectedIndex = query.isEmpty ? min(selectedIndex, max(0, filteredModels.count - 1)) : 0
         updateList()
     }
 
@@ -188,15 +209,10 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
 
             let modelText = item.id
             let providerBadge = theme.fg(.muted, "[\(item.provider)]")
-            let checkmark = isCurrent ? theme.fg(.success, " ✓") : ""
-
-            let line: String
-            if isSelected {
-                let prefix = theme.fg(.accent, "→ ")
-                line = "\(prefix)\(theme.fg(.accent, modelText)) \(providerBadge)\(checkmark)"
-            } else {
-                line = "  \(modelText) \(providerBadge)\(checkmark)"
-            }
+            let checkmark = isCurrent ? theme.fg(.accent, "✓ ") : "  "
+            let prefix = isSelected ? theme.fg(.accent, "→ ") : "  "
+            let badge = isDefaultModel(item.model) ? theme.fg(.muted, " · default") : ""
+            let line = "\(prefix)\(checkmark)\(isSelected ? theme.fg(.accent, modelText) : modelText) \(providerBadge)\(badge)"
 
             listContainer.addChild(Text(line, paddingX: 0, paddingY: 0))
         }
@@ -218,7 +234,20 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
     }
 
     public override func handleInput(_ keyData: String) {
+        if matchesKey(keyData, Key.ctrl("s")), let onSelectAsDefaultCallback {
+            if let selected = filteredModels[safe: selectedIndex] { closeSelector(); onSelectAsDefaultCallback(selected.model) }
+            return
+        }
         let kb = getKeybindings()
+        if kb.matches(keyData, TUIKeybinding.inputTab) {
+            if !scopedModelItems.isEmpty {
+                isScoped.toggle()
+                selectedIndex = activeModels.firstIndex { modelsAreEqual(currentModel, $0.model) } ?? 0
+                filterModels(searchInput.getValue())
+                updateScopeText()
+            }
+            return
+        }
         if kb.matches(keyData, TUIKeybinding.selectUp) {
             guard !filteredModels.isEmpty else { return }
             selectedIndex = selectedIndex == 0 ? filteredModels.count - 1 : selectedIndex - 1
@@ -238,6 +267,7 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
             return
         }
         if kb.matches(keyData, TUIKeybinding.selectCancel) {
+            closeSelector()
             onCancelCallback()
             return
         }
@@ -246,8 +276,16 @@ public final class ModelSelectorComponent: Container, SystemCursorAware, Selecto
         filterModels(searchInput.getValue())
     }
 
+    private func updateScopeText() {
+        scopeText.setText(theme.fg(.muted, "Scope: ") + theme.fg(isScoped ? .muted : .accent, "all") + theme.fg(.muted, " | ") + theme.fg(isScoped ? .accent : .muted, "scoped"))
+    }
+
+    private func isDefaultModel(_ model: Model) -> Bool {
+        defaultModel?.provider == model.provider && defaultModel?.id == model.id
+    }
+
     private func handleSelect(_ model: Model) {
-        settingsManager.setDefaultModelAndProvider(model.provider, model.id)
+        closeSelector()
         onSelectCallback(model)
     }
 
