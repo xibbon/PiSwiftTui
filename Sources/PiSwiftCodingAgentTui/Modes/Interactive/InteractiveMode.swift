@@ -1917,7 +1917,6 @@ public final class InteractiveMode {
         case .turnStart:
             if session.settingsManager.getShowTerminalProgress() { tui.terminal.setProgress(true) }
             guard loadingAnimation == nil else { return }
-            loadingAnimation?.stop()
             statusContainer.clear()
             loadingAnimation = makeWorkingIndicator()
             if workingVisible { mountWorkingIndicator() }

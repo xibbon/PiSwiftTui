@@ -214,17 +214,13 @@ final class InteractiveCatalogRefreshCoordinator {
             }
         }
         let id = UUID()
-        // CancellationToken exposes polling, but its observer registration is library-internal.
-        let observer = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                if signal.isCancelled {
-                    self?.cancelWaiter(key: key, entry: entry, id: id)
-                    return
-                }
-                try? await Task.sleep(for: .milliseconds(10))
+        // The handler runs on the cancelling thread. Hop to the main actor before touching state.
+        let removeObserver = signal.onCancel { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.cancelWaiter(key: key, entry: entry, id: id)
             }
         }
-        defer { observer.cancel() }
+        defer { removeObserver() }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 entry.waiters[id] = continuation
