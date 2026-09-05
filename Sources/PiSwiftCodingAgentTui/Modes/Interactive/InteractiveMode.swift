@@ -72,6 +72,10 @@ private struct InteractiveHookUIContext: HookUIContext {
     private let notifyHandler: (String, HookNotificationType?) -> Void
     private let setStatusHandler: (String, String?) -> Void
     private let setWorkingMessageHandler: (String?) -> Void
+    private let setWorkingVisibleHandler: (Bool) -> Void
+    private let setWorkingIndicatorHandler: (WorkingIndicatorOptions?) -> Void
+    private let setHiddenThinkingLabelHandler: (String?) -> Void
+    private let addAutocompleteProviderHandler: (@escaping HookAutocompleteProviderFactory) -> Void
     private let setWidgetHandler: (String, HookWidgetContent?) -> Void
     private let setFooterHandler: (HookFooterFactory?) -> Void
     private let setTitleHandler: (String) -> Void
@@ -95,6 +99,10 @@ private struct InteractiveHookUIContext: HookUIContext {
         notify: @escaping (String, HookNotificationType?) -> Void,
         setStatus: @escaping (String, String?) -> Void,
         setWorkingMessage: @escaping (String?) -> Void,
+        setWorkingVisible: @escaping (Bool) -> Void,
+        setWorkingIndicator: @escaping (WorkingIndicatorOptions?) -> Void,
+        setHiddenThinkingLabel: @escaping (String?) -> Void,
+        addAutocompleteProvider: @escaping (@escaping HookAutocompleteProviderFactory) -> Void,
         setWidget: @escaping (String, HookWidgetContent?) -> Void,
         setFooter: @escaping (HookFooterFactory?) -> Void,
         setTitle: @escaping (String) -> Void,
@@ -117,6 +125,10 @@ private struct InteractiveHookUIContext: HookUIContext {
         self.notifyHandler = notify
         self.setStatusHandler = setStatus
         self.setWorkingMessageHandler = setWorkingMessage
+        self.setWorkingVisibleHandler = setWorkingVisible
+        self.setWorkingIndicatorHandler = setWorkingIndicator
+        self.setHiddenThinkingLabelHandler = setHiddenThinkingLabel
+        self.addAutocompleteProviderHandler = addAutocompleteProvider
         self.setWidgetHandler = setWidget
         self.setFooterHandler = setFooter
         self.setTitleHandler = setTitle
@@ -156,6 +168,22 @@ private struct InteractiveHookUIContext: HookUIContext {
 
     func setWorkingMessage(_ message: String?) {
         setWorkingMessageHandler(message)
+    }
+
+    func setWorkingVisible(_ visible: Bool) {
+        setWorkingVisibleHandler(visible)
+    }
+
+    func setWorkingIndicator(_ options: WorkingIndicatorOptions?) {
+        setWorkingIndicatorHandler(options)
+    }
+
+    func setHiddenThinkingLabel(_ label: String?) {
+        setHiddenThinkingLabelHandler(label)
+    }
+
+    func addAutocompleteProvider(_ factory: @escaping HookAutocompleteProviderFactory) {
+        addAutocompleteProviderHandler(factory)
     }
 
     func setWidget(_ key: String, _ content: HookWidgetContent?) {
@@ -255,7 +283,7 @@ public final class InteractiveMode {
     private var pendingResourceDisplayOptions: ResourceDisplayOptions?
 
     private var pendingMessagesContainer: Container?
-    private var statusContainer: Container?
+    private(set) var statusContainer: Container?
     private var widgetContainer: Container?
     private var defaultEditor: CustomEditor?
     private var editor: EditorComponentView?
@@ -265,7 +293,7 @@ public final class InteractiveMode {
     private var autocompleteProviderWrappers: [@MainActor @Sendable (AutocompleteProvider) -> AutocompleteProvider] = []
     /// Final stacked provider applied to the editor (the base CombinedAutocompleteProvider
     /// possibly wrapped one or more times).
-    private var stackedAutocompleteProvider: AutocompleteProvider?
+    private(set) var stackedAutocompleteProvider: AutocompleteProvider?
     private var editorContainer: Container?
     private var footer: FooterComponent?
     private var footerContainer: Container?
@@ -306,6 +334,9 @@ public final class InteractiveMode {
     private var hideThinkingBlock = false
     private let defaultWorkingMessage = "Working"
     private var workingMessage: String?
+    private(set) var workingVisible = true
+    private(set) var workingIndicatorOptions: WorkingIndicatorOptions?
+    private(set) var hiddenThinkingLabel: String?
 
     private var isBashMode = false
     private var bashComponent: BashExecutionComponent?
@@ -320,6 +351,9 @@ public final class InteractiveMode {
 
     private var exitContinuation: CheckedContinuation<Void, Never>?
     private var unsubscribe: (() -> Void)?
+    private var unsubscribeHookEvents: (@Sendable () -> Void)?
+    private var hookEventContinuation: AsyncStream<any HookEvent>.Continuation?
+    private var hookEventTask: Task<Void, Never>?
     private var sigcontSource: DispatchSourceSignal?
     private var isShuttingDown = false
     /// v0.70.5: signal sources for SIGHUP/SIGTERM that drive a clean shutdown so extensions
@@ -377,6 +411,8 @@ public final class InteractiveMode {
         self.editor = editor
         self.defaultEditor = editor as? CustomEditor
         self.statusContainer = Container()
+        self.editorContainer = Container()
+        self.editorContainer?.addChild(editor)
         self.altScreenRenderer = renderer
     }
 
@@ -652,9 +688,9 @@ public final class InteractiveMode {
         fdPath = fd
         drainManagedToolStatuses(statuses)
         rebuildAutocomplete()
+        subscribeToAgent()
         await initializeHooksAndCustomTools()
         configureKeyHandlers()
-        subscribeToAgent()
 
         onThemeChange { [weak self] in
             Task { @MainActor in
@@ -837,7 +873,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func initializeHooksAndCustomTools() async {
+    func initializeHooksAndCustomTools() async {
         guard let session else { return }
 
         let uiContext = InteractiveHookUIContext(
@@ -866,6 +902,24 @@ public final class InteractiveMode {
             setWorkingMessage: { [weak self] message in
                 Task { @MainActor in
                     self?.setWorkingMessage(message)
+                }
+            },
+            setWorkingVisible: { [weak self] visible in
+                self?.setWorkingVisible(visible)
+            },
+            setWorkingIndicator: { [weak self] options in
+                self?.setWorkingIndicator(options)
+            },
+            setHiddenThinkingLabel: { [weak self] label in
+                self?.setHiddenThinkingLabel(label)
+            },
+            addAutocompleteProvider: { [weak self] factory in
+                self?.addAutocompleteProvider { [weak self] provider in
+                    guard let wrapped = factory(provider) as? any AutocompleteProvider else {
+                        self?.showWarning("Autocomplete factory must return an AutocompleteProvider.")
+                        return provider
+                    }
+                    return wrapped
                 }
             },
             setWidget: { [weak self] key, content in
@@ -1369,6 +1423,57 @@ public final class InteractiveMode {
     }
 
     @MainActor
+    func setWorkingVisible(_ visible: Bool) {
+        workingVisible = visible
+        if !visible {
+            clearWorkingIndicator()
+        } else if session?.isStreaming == true, loadingAnimation != nil {
+            mountWorkingIndicator()
+        }
+        ui.requestRender()
+    }
+
+    @MainActor
+    func setWorkingIndicator(_ options: WorkingIndicatorOptions?) {
+        workingIndicatorOptions = options
+        if let loadingAnimation {
+            if let options {
+                loadingAnimation.setIndicator(LoaderIndicatorOptions(frames: options.frames, intervalMs: options.intervalMs))
+            } else {
+                // MiniTui retains omitted options. Replace the loader to restore its defaults.
+                loadingAnimation.stop()
+                clearWorkingIndicator()
+                self.loadingAnimation = makeWorkingIndicator()
+                mountWorkingIndicator()
+            }
+        }
+        ui.requestRender()
+    }
+
+    @MainActor
+    func setHiddenThinkingLabel(_ label: String?) {
+        hiddenThinkingLabel = label
+        for case let component as AssistantMessageComponent in chatContainer.children {
+            component.setHiddenThinkingLabel(label)
+        }
+        streamingComponent?.setHiddenThinkingLabel(label)
+        ui.requestRender()
+    }
+
+    private func makeWorkingIndicator() -> WorkingStatusIndicator? {
+        guard let tui else { return nil }
+        let embedded = (editor as? any WorkingStatusEditor)?.embedWorkingStatus == true
+        let color: ((String) -> String)? = embedded ? { [weak self] text in
+            self?.editor?.borderColor(text) ?? theme.fg(.muted, text)
+        } : nil
+        let indicator = workingIndicatorOptions.map {
+            LoaderIndicatorOptions(frames: $0.frames, intervalMs: $0.intervalMs)
+        }
+        return WorkingStatusIndicator(ui: tui, message: workingMessage ?? defaultWorkingMessage,
+                                      indicator: indicator, colorFn: color)
+    }
+
+    @MainActor
     private func setHookStatus(_ key: String, _ text: String?) {
         footerDataProvider?.setExtensionStatus(key, text)
         scheduleRender()
@@ -1688,7 +1793,7 @@ public final class InteractiveMode {
         defaultEditor?.setWorkingStatusIndicator(nil)
         statusContainer?.clear()
         activeWorkingIndicatorEmbedded = false
-        guard let loadingAnimation else { return }
+        guard workingVisible, let loadingAnimation else { return }
         if let workingEditor = editor as? any WorkingStatusEditor, workingEditor.embedWorkingStatus {
             workingEditor.setWorkingStatusIndicator(loadingAnimation)
             activeWorkingIndicatorEmbedded = true
@@ -1708,13 +1813,57 @@ public final class InteractiveMode {
         activeWorkingIndicatorEmbedded = false
     }
 
-    private func subscribeToAgent() {
+    func subscribeToAgent() {
         guard let session else { return }
+        unsubscribeFromAgent()
         unsubscribe = session.subscribe { [weak self] event in
             Task { @MainActor in
                 self?.handleSessionEvent(event)
             }
         }
+        let (events, continuation) = AsyncStream<any HookEvent>.makeStream()
+        hookEventContinuation = continuation
+        unsubscribeHookEvents = session.subscribeToHookEvents { event in
+            continuation.yield(event)
+        }
+        hookEventTask = Task { @MainActor [weak self] in
+            for await event in events {
+                guard !Task.isCancelled else { return }
+                self?.handleHookEvent(event)
+            }
+        }
+    }
+
+    func unsubscribeFromAgent() {
+        unsubscribe?()
+        unsubscribe = nil
+        unsubscribeHookEvents?()
+        unsubscribeHookEvents = nil
+        hookEventContinuation?.finish()
+        hookEventContinuation = nil
+        hookEventTask?.cancel()
+        hookEventTask = nil
+    }
+
+    func handleHookEvent(_ event: any HookEvent) {
+        guard let failure = event as? SessionCompactFailedEvent,
+              !failure.aborted,
+              let errorMessage = failure.errorMessage else { return }
+
+        switch failure.reason {
+        case .manual:
+            guard failure.fromExtension else { return }
+            showError(errorMessage)
+        case .threshold, .overflow:
+            if failure.willRetry {
+                showStatus("\(errorMessage) (retrying)")
+            } else {
+                chatContainer.addChild(Spacer(1))
+                chatContainer.addChild(Text(theme.fg(.error, errorMessage), paddingX: 1, paddingY: 0))
+            }
+        }
+        footer?.invalidate()
+        ui.requestRender()
     }
 
     @MainActor
@@ -1770,13 +1919,8 @@ public final class InteractiveMode {
             guard loadingAnimation == nil else { return }
             loadingAnimation?.stop()
             statusContainer.clear()
-            let embedded = (editor as? any WorkingStatusEditor)?.embedWorkingStatus == true
-            let color: ((String) -> String)? = embedded ? { [weak self] text in
-                self?.editor?.borderColor(text) ?? theme.fg(.muted, text)
-            } : nil
-            let loader = WorkingStatusIndicator(ui: tui, message: workingMessage ?? defaultWorkingMessage, colorFn: color)
-            loadingAnimation = loader
-            mountWorkingIndicator()
+            loadingAnimation = makeWorkingIndicator()
+            if workingVisible { mountWorkingIndicator() }
             scheduleRender()
 
         case .messageStart(let message):
@@ -1794,6 +1938,7 @@ public final class InteractiveMode {
             } else if case .assistant(let assistant) = message {
                 streamingComponent = AssistantMessageComponent(
                     hideThinkingBlock: hideThinkingBlock,
+                    hiddenThinkingLabel: hiddenThinkingLabel,
                     markdownConfiguration: tuiConfiguration,
                     isStreaming: true
                 )
@@ -2031,6 +2176,7 @@ public final class InteractiveMode {
             let component = AssistantMessageComponent(
                 message: assistant,
                 hideThinkingBlock: hideThinkingBlock,
+                hiddenThinkingLabel: hiddenThinkingLabel,
                 markdownConfiguration: tuiConfiguration
             )
             chatContainer.addChild(component)
@@ -2623,8 +2769,7 @@ public final class InteractiveMode {
             await emitSessionShutdownEvents()
         }
 
-        unsubscribe?()
-        unsubscribe = nil
+        unsubscribeFromAgent()
         footerBranchUnsubscribe?()
         footerBranchUnsubscribe = nil
         footerDataProvider?.dispose()
@@ -4458,7 +4603,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleReloadCommand() async {
+    func handleReloadCommand() async {
         guard let session, let tui, let editorContainer, let currentEditor = editor else { return }
         if session.isStreaming {
             showWarning("Wait for the current response to finish before reloading.")
@@ -4491,6 +4636,11 @@ public final class InteractiveMode {
         altScreenRenderer?.setCopyOnSelect(session.settingsManager.getFullscreenCopyOnSelect())
         await themeController?.applyFromSettings()
         let extensionResult = await session.reloadExtensions()
+        setWorkingMessage(nil)
+        workingVisible = true
+        setWorkingIndicator(nil)
+        setHiddenThinkingLabel(nil)
+        autocompleteProviderWrappers.removeAll()
         keybindings = KeybindingsManager.create()
         skills = session.resourceLoader.getSkills().skills
         setRegisteredThemes(session.resourceLoader.getThemes().themes)
@@ -4578,7 +4728,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleCompactCommand(_ customInstructions: String?) {
+    func handleCompactCommand(_ customInstructions: String?) {
         guard let session else { return }
         loadingAnimation?.stop()
         loadingAnimation = nil

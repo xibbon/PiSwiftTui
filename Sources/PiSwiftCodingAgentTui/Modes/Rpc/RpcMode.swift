@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Synchronization
 import PiSwiftAI
 import PiSwiftAgent
 import PiSwiftCodingAgent
@@ -278,9 +279,32 @@ private func makeErrorResponse(_ id: Any?, _ command: String, _ message: String)
     return response
 }
 
+/// In-flight manual compactions. Each task removes itself when it finishes, so the set stays
+/// bounded for long-lived drivers. EOF joins whatever is still running.
+final class PendingCompactionTasks: Sendable {
+    private let tasks = Mutex<[UUID: Task<Void, Never>]>([:])
+
+    var count: Int { tasks.withLock { $0.count } }
+
+    func run(_ operation: @escaping @Sendable () async -> Void) {
+        let id = UUID()
+        tasks.withLock { entries in
+            entries[id] = Task { [self] in
+                await operation()
+                self.tasks.withLock { $0[id] = nil }
+            }
+        }
+    }
+
+    func waitForAll() async {
+        let running = tasks.withLock { Array($0.values) }
+        for task in running { await task.value }
+    }
+}
+
 public func runRpcMode(_ session: AgentSession) async {
     let output = RpcOutput.takeOverStdout()
-    var pendingCompactions: [Task<Void, Never>] = []
+    let pendingCompactions = PendingCompactionTasks()
 
     // Upstream refreshes the catalogs here in the background (interactive mode starts its own
     // refresh after TUI initialization). RPC startup must not wait on the network.
@@ -376,7 +400,7 @@ public func runRpcMode(_ session: AgentSession) async {
         // Manual compaction must not block the input loop: abort can cancel it.
         if commandType == "compact" {
             let request = mapToAnyCodable(dict)
-            let task = Task {
+            pendingCompactions.run {
                 let command = request.mapValues(\.jsonValue)
                 do {
                     output.send(try await handleRpcCommand("compact", command, session, output))
@@ -384,7 +408,6 @@ public func runRpcMode(_ session: AgentSession) async {
                     output.send(makeErrorResponse(command["id"], "compact", error.localizedDescription))
                 }
             }
-            pendingCompactions.append(task)
             continue
         }
         let response: [String: Any]
@@ -395,7 +418,7 @@ public func runRpcMode(_ session: AgentSession) async {
         }
         output.send(response)
     }
-    for task in pendingCompactions { await task.value }
+    await pendingCompactions.waitForAll()
 }
 
 func handleRpcCommand(

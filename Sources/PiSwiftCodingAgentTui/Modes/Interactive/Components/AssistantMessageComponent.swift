@@ -10,6 +10,7 @@ private let OSC133_ZONE_FINAL = "\u{001B}]133;C\u{0007}"
 public final class AssistantMessageComponent: Container {
     private let contentContainer: Container
     private var hideThinkingBlock: Bool
+    private var hiddenThinkingLabel: String?
     private var lastMessage: AssistantMessage?
     private var thinkingVisibilityOverrides: [Int: Bool] = [:]
     private var hasToolCalls: Bool = false
@@ -19,11 +20,13 @@ public final class AssistantMessageComponent: Container {
     public init(
         message: AssistantMessage? = nil,
         hideThinkingBlock: Bool = false,
+        hiddenThinkingLabel: String? = nil,
         markdownConfiguration: InteractiveTuiConfiguration = InteractiveTuiConfiguration(),
         isStreaming: Bool = false
     ) {
         self.contentContainer = Container()
         self.hideThinkingBlock = hideThinkingBlock
+        self.hiddenThinkingLabel = hiddenThinkingLabel
         self.markdownConfiguration = markdownConfiguration
         self.isStreaming = isStreaming
         super.init()
@@ -53,6 +56,11 @@ public final class AssistantMessageComponent: Container {
     public func setHideThinkingBlock(_ hide: Bool) {
         hideThinkingBlock = hide
         thinkingVisibilityOverrides.removeAll()
+        if let lastMessage { updateContent(lastMessage) }
+    }
+
+    public func setHiddenThinkingLabel(_ label: String?) {
+        hiddenThinkingLabel = label
         if let lastMessage { updateContent(lastMessage) }
     }
 
@@ -153,7 +161,7 @@ public final class AssistantMessageComponent: Container {
                 let thinkingComponent: Component
                 if hidden {
                     thinkingComponent = Text(
-                        theme.italic(theme.fg(.thinkingText, "Thinking...")),
+                        theme.italic(theme.fg(.thinkingText, hiddenThinkingLabel ?? "Thinking...")),
                         paddingX: markdownConfiguration.outputPad, paddingY: 0)
                 } else {
                     thinkingComponent = Markdown(
