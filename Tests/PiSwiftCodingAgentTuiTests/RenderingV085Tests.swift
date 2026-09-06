@@ -105,10 +105,11 @@ private final class RenderingTerminal: Terminal {
     }
 
     @Test func selfRenderedEmptyToolTakesNoRows() {
-        let definition = CustomTool(name: "empty", label: "Empty", description: "", parameters: [:], execute: { _, _, _, _, _ in
+        var definition = CustomTool(name: "empty", label: "Empty", description: "", parameters: [:], execute: { _, _, _, _, _ in
             AgentToolResult(content: [], details: nil)
         }, renderCall: { _, _ in nil }, renderResult: { _, _, _ in nil })
-        let component = ToolExecutionComponent(toolName: "empty", args: [:], options: ToolExecutionOptions(renderShell: .self), customTool: definition, ui: TUI(terminal: RenderingTerminal()))
+        definition.renderShell = .self
+        let component = ToolExecutionComponent(toolName: "empty", args: [:], customTool: definition, ui: TUI(terminal: RenderingTerminal()))
         #expect(component.render(width: 80).isEmpty)
     }
 
@@ -198,17 +199,17 @@ private final class RenderingTerminal: Terminal {
         definition.renderCall = { _, _ in MainActor.assumeIsolated { Text("custom call", paddingX: 0, paddingY: 0) } }
         let first = try #require(withBuiltInRenderers("read", definition))
         let callRenderer = try #require(first.renderCall)
-        let call = try callRenderer([:], theme)
-        #expect(call?.render(width: 80).joined().contains("custom call") == true)
+        let call = try callRenderer([:], theme, ToolRenderContext())
+        #expect(call.render(width: 80).joined().contains("custom call") == true)
         let resultRenderer = try #require(first.renderResult)
-        let result = try resultRenderer(AgentToolResult(content: [.text(TextContent(text: "body"))], details: nil), RenderResultOptions(expanded: true, isPartial: false), theme)
-        #expect(result?.render(width: 80).joined().contains("body") == true)
+        let result = try resultRenderer(AgentToolResult(content: [.text(TextContent(text: "body"))], details: nil), RenderResultOptions(expanded: true, isPartial: false), theme, ToolRenderContext(expanded: true))
+        #expect(result.render(width: 80).joined().contains("body") == true)
         definition.renderCall = nil
         definition.renderResult = { _, _, _ in MainActor.assumeIsolated { Text("custom result", paddingX: 0, paddingY: 0) } }
         let second = try #require(withBuiltInRenderers("read", definition))
         let inheritedRenderer = try #require(second.renderCall)
-        let inherited = try inheritedRenderer(["file_path": AnyCodable("README.md")], theme)
-        #expect(inherited?.render(width: 80).joined().contains("README.md") == true)
+        let inherited = try inheritedRenderer(["file_path": AnyCodable("README.md")], theme, ToolRenderContext())
+        #expect(inherited.render(width: 80).joined().contains("README.md") == true)
         #expect(withBuiltInRenderers("unknown", nil) == nil)
         #expect(withBuiltInRenderers("bash", nil)?.renderResult != nil)
     }

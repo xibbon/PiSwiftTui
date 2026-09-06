@@ -4,140 +4,114 @@ import PiSwiftAI
 import PiSwiftAgent
 import PiSwiftCodingAgent
 
-private let bashPreviewLines = 5
-
-@MainActor
-public struct ToolRendererDefinition {
-    public var renderCall: (([String: AnyCodable], Theme) throws -> Component?)?
-    public var renderResult: ((AgentToolResult, RenderResultOptions, Theme) throws -> Component?)?
-}
-
-/// Keep renderer lookup in the presentation package. Each custom slot wins independently.
-@MainActor
-public func withBuiltInRenderers(_ toolName: String, _ definition: CustomTool?) -> ToolRendererDefinition? {
-    let builtIn = ["read", "bash", "edit", "write", "grep", "find", "ls"].contains(toolName)
-    guard builtIn || definition != nil else { return nil }
-    var merged = ToolRendererDefinition()
-    if let call = definition?.renderCall {
-        merged.renderCall = { args, theme in try call(args, theme) as? Component }
-    } else if builtIn {
-        merged.renderCall = { args, theme in
-            let path = args["path"]?.value as? String ?? args["file_path"]?.value as? String ?? ""
-            let title = toolName == "bash" ? "$ " + (args["command"]?.value as? String ?? "") : toolName + (path.isEmpty ? "" : " " + path)
-            return Text(theme.fg(.toolTitle, theme.bold(title)), paddingX: 0, paddingY: 0)
-        }
-    }
-    if let result = definition?.renderResult {
-        merged.renderResult = { value, options, theme in try result(value, options, theme) as? Component }
-    } else if toolName == "bash" {
-        merged.renderResult = { result, options, theme in
-            let output = result.content.compactMap { block -> String? in
-                if case .text(let value) = block { return value.text }; return nil
-            }.joined(separator: "\n")
-            return output.isEmpty ? nil : BashResultPreview(output: output, expanded: options.expanded)
-        }
-    } else if builtIn {
-        merged.renderResult = { result, options, theme in
-            var text = result.content.compactMap { block -> String? in
-                if case .text(let value) = block { return value.text }; return nil
-            }.joined(separator: "\n")
-            if toolName == "edit", let details = result.details?.value as? [String: Any], let diff = details["diff"] as? String {
-                text += (text.isEmpty ? "" : "\n") + diff
-            }
-            guard !text.isEmpty else { return nil }
-            let lines = text.components(separatedBy: "\n")
-            let visible = options.expanded ? lines : Array(lines.prefix(10))
-            var output = visible.map { theme.fg(.toolOutput, $0) }.joined(separator: "\n")
-            if visible.count < lines.count { output += theme.fg(.muted, "\n... (\(lines.count - visible.count) more lines, ctrl+o to expand)") }
-            return Text(output, paddingX: 0, paddingY: 0)
-        }
-    }
-    return merged
-}
-
-
-private final class BashResultPreview: Component {
-    let output: String
-    let expanded: Bool
-    init(output: String, expanded: Bool) { self.output = output; self.expanded = expanded }
-    func render(width: Int) -> [String] {
-        let styled = output.components(separatedBy: "\n").map { theme.fg(.toolOutput, $0) }.joined(separator: "\n")
-        if expanded { return Text("\n" + styled, paddingX: 0, paddingY: 0).render(width: width) }
-        let preview = truncateToVisualLines("\n" + styled, maxVisualLines: bashPreviewLines, width: max(1, width), paddingX: 0)
-        var lines = preview.visualLines
-        if preview.skippedCount > 0 {
-            lines += Text("\n" + theme.fg(.dim, "... \(preview.skippedCount) more lines (ctrl+o to expand)"), paddingX: 0, paddingY: 0).render(width: width)
-        }
-        return lines
-    }
-}
-
-
 public struct ToolExecutionOptions: Sendable {
-    public var renderShell: ToolRenderShell
     public var showImages: Bool
+    public var imageWidthCells: Int
 
-    public init(showImages: Bool = true, renderShell: ToolRenderShell = .default) {
-        self.renderShell = renderShell
+    public init(showImages: Bool = true, imageWidthCells: Int = 60) {
         self.showImages = showImages
+        self.imageWidthCells = max(1, imageWidthCells)
     }
 }
 
 @MainActor
 public final class ToolExecutionComponent: Container {
     private let contentBox: Box
-    private let renderShell: ToolRenderShell
     private let contentText: Text
+    private let selfRenderContainer = Container()
+    private var selfRenderHeight = 0
+    private var callRendererComponent: Component?
+    private var resultRendererComponent: Component?
+    private let rendererState = ToolRenderState()
     private var imageComponents: [Image] = []
     private var imageSpacers: [Spacer] = []
     private var convertedImages: [Int: ImageContent] = [:]
     private let toolName: String
+    private let toolCallId: String
     private var args: [String: AnyCodable]
     private var expanded = false
     private var showImages: Bool
+    private var imageWidthCells: Int
     private var isPartial = true
-    private let renderers: ToolRendererDefinition?
+    private var executionStarted = false
+    private var argsComplete = false
+    private let renderers: ToolRenderers?
     private let ui: TUI
     private let cwd: String
     private var result: ToolResultMessage?
-    private var editDiffPreview: String?
-    private var editDiffArgsKey: String?
+    private var hideComponent = false
+    private var updatingDisplay = false
+    private var displayInvalidated = false
+    private var renderShell: ToolRenderShell { renderers?.renderShell ?? .default }
 
     public init(
         toolName: String,
+        toolCallId: String = "",
         args: [String: AnyCodable],
         options: ToolExecutionOptions = ToolExecutionOptions(),
         customTool: CustomTool? = nil,
+        renderers: ToolRenderers? = nil,
         ui: TUI,
         cwd: String = FileManager.default.currentDirectoryPath
     ) {
-        self.renderShell = options.renderShell
         self.toolName = toolName
+        self.toolCallId = toolCallId
         self.args = args
         self.showImages = options.showImages
-        self.renderers = withBuiltInRenderers(toolName, customTool)
+        self.imageWidthCells = options.imageWidthCells
+        self.renderers = renderers ?? withBuiltInRenderers(toolName, customTool)
         self.ui = ui
         self.cwd = cwd
-
-        self.contentBox = Box(paddingX: options.renderShell == .self ? 0 : 1, paddingY: options.renderShell == .self ? 0 : 1, bgFn: { theme.bg(.toolPendingBg, $0) })
+        self.contentBox = Box(paddingX: 1, paddingY: 1, bgFn: { theme.bg(.toolPendingBg, $0) })
         self.contentText = Text("", paddingX: 1, paddingY: 1, customBgFn: { theme.bg(.toolPendingBg, $0) })
-
         super.init()
-
         addChild(Spacer(1))
-        if renderers != nil {
-            addChild(contentBox)
+        if self.renderers != nil {
+            addChild(renderShell == .self ? selfRenderContainer : contentBox)
         } else {
             addChild(createResultRegion(contentText))
         }
-
         updateDisplay()
     }
 
+    private func getRenderContext(_ lastComponent: Component?) -> ToolRenderContext {
+        ToolRenderContext(
+            args: args, toolCallId: toolCallId,
+            invalidate: { [weak self] in
+                guard let self else { return }
+                self.invalidate()
+                self.ui.requestRender()
+            },
+            lastComponent: lastComponent, state: rendererState, cwd: cwd,
+            executionStarted: executionStarted, argsComplete: argsComplete,
+            isPartial: isPartial, expanded: expanded, showImages: showImages,
+            isError: result?.isError ?? false
+        )
+    }
+
     public override func render(width: Int) -> [String] {
-        let lines = super.render(width: width)
-        if renderShell == .self && lines.allSatisfy({ visibleWidth($0.replacingOccurrences(of: " ", with: "")) == 0 }) { return [] }
-        return lines
+        if hideComponent { return [] }
+        if renderers != nil, renderShell == .self {
+            let contentLines = selfRenderContainer.render(width: width)
+            selfRenderHeight = contentLines.count
+            if contentLines.isEmpty && imageComponents.isEmpty { return [] }
+            var lines = contentLines.isEmpty ? [] : [""] + contentLines
+            for (index, image) in imageComponents.enumerated() {
+                lines += imageSpacers[index].render(width: width)
+                lines += image.render(width: width)
+            }
+            return lines
+        }
+        return super.render(width: width)
+    }
+
+    public override func handleMouse(_ event: TuiMouseEvent) -> TuiMouseEventResult? {
+        guard renderers != nil, renderShell == .self else { return super.handleMouse(event) }
+        guard event.y > 0, event.y <= selfRenderHeight else { return nil }
+        var local = event
+        local.y -= 1
+        local.height = selfRenderHeight
+        return selfRenderContainer.handleMouse(local)
     }
 
     public func updateArgs(_ args: [String: AnyCodable]) {
@@ -145,14 +119,27 @@ public final class ToolExecutionComponent: Container {
         updateDisplay()
     }
 
+    public func markExecutionStarted() {
+        executionStarted = true
+        // The Swift bash tool sends partial results only when output arrives.
+        // Start the result slot now so a silent command still shows elapsed time.
+        if toolName == "bash", result == nil {
+            result = ToolResultMessage(toolCallId: toolCallId, toolName: toolName, content: [], isError: false)
+        }
+        updateDisplay()
+        ui.requestRender()
+    }
+
     public func setArgsComplete() {
-        maybeComputeEditDiff()
+        argsComplete = true
+        updateDisplay()
+        ui.requestRender()
     }
 
     public func updateResult(_ result: ToolResultMessage, isPartial: Bool = false) {
         self.result = result
         self.isPartial = isPartial
-        self.convertedImages = [:]
+        convertedImages.removeAll()
         updateDisplay()
         maybeConvertImagesForKitty()
     }
@@ -163,11 +150,21 @@ public final class ToolExecutionComponent: Container {
     }
 
     public func setShowImages(_ show: Bool) {
-        self.showImages = show
+        showImages = show
+        updateDisplay()
+        maybeConvertImagesForKitty()
+    }
+
+    public func setImageWidthCells(_ width: Int) {
+        imageWidthCells = max(1, width)
         updateDisplay()
     }
 
     public override func invalidate() {
+        if updatingDisplay {
+            displayInvalidated = true
+            return
+        }
         super.invalidate()
         updateDisplay()
     }
@@ -180,284 +177,156 @@ public final class ToolExecutionComponent: Container {
         }
     }
 
+    private func createCallFallback() -> Component {
+        Text(theme.fg(.toolTitle, theme.bold(toolName)), paddingX: 0, paddingY: 0)
+    }
+
     private func fallbackOutput(_ output: String) -> String {
         let lines = output.components(separatedBy: "\n")
         let visible = expanded ? lines : Array(lines.prefix(10))
-        let remaining = lines.count - visible.count
         var text = visible.map { theme.fg(.toolOutput, $0) }.joined(separator: "\n")
+        let remaining = lines.count - visible.count
         if remaining > 0 {
-            text += theme.fg(.muted, "\n... (\(remaining) more lines, ctrl+o to expand)")
+            text += theme.fg(.muted, "\n... (\(remaining) more lines,") + " "
+                + keyHint(.expandTools, "to expand") + theme.fg(.muted, ")")
         }
         return text
     }
 
+    private func textOutput() -> String {
+        guard let result else { return "" }
+        return getTextOutput(AgentToolResult(content: result.content, details: result.details), showImages: showImages)
+    }
+
+    private func createResultFallback() -> Component? {
+        let output = textOutput()
+        return output.isEmpty ? nil : Text(fallbackOutput(output), paddingX: 0, paddingY: 0)
+    }
+
     private func updateDisplay() {
-        let bgFn: (String) -> String
-        if renderShell == .self {
-            bgFn = { $0 }
-        } else if isPartial {
-            bgFn = { theme.bg(.toolPendingBg, $0) }
-        } else if result?.isError == true {
-            bgFn = { theme.bg(.toolErrorBg, $0) }
-        } else {
-            bgFn = { theme.bg(.toolSuccessBg, $0) }
+        guard !updatingDisplay else { displayInvalidated = true; return }
+        updatingDisplay = true
+        defer {
+            updatingDisplay = false
+            if displayInvalidated {
+                displayInvalidated = false
+                // A synchronous renderer can change shared state while the slots render.
+                // Defer its next pass to avoid re-entering the container mutation.
+                Task { @MainActor [weak self] in self?.invalidate() }
+            }
         }
-
+        let bgFn: (String) -> String = isPartial
+            ? { theme.bg(.toolPendingBg, $0) }
+            : result?.isError == true
+                ? { theme.bg(.toolErrorBg, $0) }
+                : { theme.bg(.toolSuccessBg, $0) }
+        var hasContent = false
+        hideComponent = false
         if let renderers {
-            contentBox.setBgFn(bgFn)
-            contentBox.clear()
-
-            if let renderCall = renderers.renderCall {
+            let addRenderedChild: (Component) -> Void
+            if renderShell == .self {
+                selfRenderContainer.clear()
+                addRenderedChild = selfRenderContainer.addChild
+            } else {
+                contentBox.setBgFn(bgFn)
+                contentBox.clear()
+                addRenderedChild = contentBox.addChild
+            }
+            let call: Component
+            if let renderer = renderers.renderCall {
                 do {
-                    if let component = try renderCall(args, theme) {
-                        contentBox.addChild(component)
-                    }
+                    call = try renderer(args, theme, getRenderContext(callRendererComponent))
+                    callRendererComponent = call
                 } catch {
-                    contentBox.addChild(Text(theme.fg(.toolTitle, theme.bold(toolName)), paddingX: 0, paddingY: 0))
+                    callRendererComponent = nil
+                    call = createCallFallback()
                 }
             } else {
-                contentBox.addChild(Text(theme.fg(.toolTitle, theme.bold(toolName)), paddingX: 0, paddingY: 0))
+                call = createCallFallback()
             }
-
-            if result == nil, let editDiffPreview { contentBox.addChild(Text(renderDiff(editDiffPreview), paddingX: 0, paddingY: 0)) }
+            addRenderedChild(createResultRegion(call))
+            hasContent = true
             if let result {
-                if let renderResult = renderers.renderResult {
+                var renderedResult: Component?
+                if let renderer = renderers.renderResult {
                     do {
-                        let options = RenderResultOptions(expanded: expanded, isPartial: isPartial)
-                        let toolResult = AgentToolResult(content: result.content, details: result.details)
-                        if let component = try renderResult(toolResult, options, theme) {
-                            contentBox.addChild(createResultRegion(component))
-                        }
+                        renderedResult = try renderer(
+                            AgentToolResult(content: result.content, details: result.details),
+                            RenderResultOptions(expanded: expanded, isPartial: isPartial), theme,
+                            getRenderContext(resultRendererComponent)
+                        )
+                        resultRendererComponent = renderedResult
                     } catch {
-                        let output = getTextOutput()
-                        if !output.isEmpty {
-                            contentBox.addChild(createResultRegion(Text(fallbackOutput(output), paddingX: 0, paddingY: 0)))
-                        }
+                        resultRendererComponent = nil
+                        renderedResult = createResultFallback()
                     }
-                } else if toolName == "bash" {
-                    renderBashContent(includeCall: false)
                 } else {
-                    let output = getTextOutput()
-                    if !output.isEmpty {
-                        contentBox.addChild(createResultRegion(Text(fallbackOutput(output), paddingX: 0, paddingY: 0)))
-                    }
+                    renderedResult = createResultFallback()
+                }
+                if let renderedResult {
+                    addRenderedChild(createResultRegion(renderedResult))
+                    hasContent = true
                 }
             }
-        } else if toolName == "bash" {
-            contentBox.setBgFn(bgFn)
-            contentBox.clear()
-            renderBashContent()
         } else {
             contentText.setCustomBgFn(bgFn)
             contentText.setText(formatToolExecution())
+            hasContent = true
         }
-
-        for component in imageComponents {
-            removeChild(component)
-        }
-        for spacer in imageSpacers {
-            removeChild(spacer)
-        }
+        for image in imageComponents { removeChild(image) }
+        for spacer in imageSpacers { removeChild(spacer) }
         imageComponents.removeAll()
         imageSpacers.removeAll()
-
-        if let result {
-            let imageBlocks = result.content.compactMap { block -> ImageContent? in
-                if case let .image(image) = block {
-                    return image
-                }
+        if let result, getCapabilities().images != nil, showImages {
+            let caps = getCapabilities()
+            let images = result.content.compactMap { block -> ImageContent? in
+                if case .image(let image) = block { return image }
                 return nil
             }
-
-            let caps = getCapabilities()
-            for (index, image) in imageBlocks.enumerated() {
-                if caps.images != nil, showImages {
-                    let resolvedImage = convertedImages[index] ?? image
-                    if caps.images == .kitty, resolvedImage.mimeType != "image/png" {
-                        continue
-                    }
-                    let spacer = Spacer(1)
-                    addChild(spacer)
-                    imageSpacers.append(spacer)
-                    let imageComponent = Image(
-                        base64Data: resolvedImage.data,
-                        mimeType: resolvedImage.mimeType,
-                        theme: ImageTheme(fallbackColor: { theme.fg(.toolOutput, $0) }),
-                        options: ImageOptions(filename: nil)
-                    )
-                    addChild(imageComponent)
-                    imageComponents.append(imageComponent)
-                } else {
-                    let spacer = Spacer(1)
-                    addChild(spacer)
-                    imageSpacers.append(spacer)
-                    let dimensions = getImageDimensions(image.data, mimeType: image.mimeType)
-                    let label = imageFallback(image.mimeType, dimensions: dimensions, filename: nil)
-                    let fallback = Text(theme.fg(.toolOutput, label), paddingX: 1, paddingY: 0)
-                    addChild(fallback)
-                }
-            }
-        }
-    }
-
-    private func renderBashContent(includeCall: Bool = true) {
-        let command = args["command"]?.value as? String ?? ""
-        if includeCall { contentBox.addChild(Text(theme.fg(.toolTitle, theme.bold("$ \(command)")), paddingX: 0, paddingY: 0)) }
-
-        let output = getTextOutput()
-        if !output.isEmpty {
-            let styled = output.split(separator: "\n", omittingEmptySubsequences: false).map {
-                theme.fg(.toolOutput, String($0))
-            }.joined(separator: "\n")
-
-            if expanded {
-                contentBox.addChild(createResultRegion(Text("\n" + styled, paddingX: 0, paddingY: 0)))
-            } else {
-                let contentWidth = max(1, ui.terminal.columns - 2)
-                let truncation = truncateToVisualLines(
-                    "\n" + styled,
-                    maxVisualLines: bashPreviewLines,
-                    width: contentWidth,
-                    paddingX: 0
+            for (index, image) in images.enumerated() {
+                let resolved = convertedImages[index] ?? image
+                guard caps.images != .kitty || resolved.mimeType == "image/png" else { continue }
+                let spacer = Spacer(1)
+                let component = Image(
+                    base64Data: resolved.data, mimeType: resolved.mimeType,
+                    theme: ImageTheme(fallbackColor: { theme.fg(.toolOutput, $0) }),
+                    options: ImageOptions(maxWidthCells: imageWidthCells)
                 )
-                contentBox.addChild(createResultRegion(StaticLines(truncation.visualLines)))
-                if truncation.skippedCount > 0 {
-                    let hint = theme.fg(.dim, "... \(truncation.skippedCount) more lines (ctrl+o to expand)")
-                    contentBox.addChild(createResultRegion(Text("\n" + hint, paddingX: 0, paddingY: 0)))
-                }
+                addChild(spacer)
+                addChild(component)
+                imageSpacers.append(spacer)
+                imageComponents.append(component)
             }
         }
+        hideComponent = renderers != nil && !hasContent && imageComponents.isEmpty
     }
 
     private func formatToolExecution() -> String {
-        var lines: [String] = []
-        lines.append(theme.fg(.toolTitle, theme.bold(toolName)))
-
-        if let argsText = formatArgs(args), !argsText.isEmpty {
-            lines.append(theme.fg(.toolOutput, argsText))
+        var text = theme.fg(.toolTitle, theme.bold(toolName))
+        let object = args.mapValues { $0.jsonValue }
+        if JSONSerialization.isValidJSONObject(object),
+           let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
+           let json = String(data: data, encoding: .utf8) {
+            text += "\n\n" + json
         }
-
-        if let editDiffPreview, result == nil {
-            lines.append(renderDiff(editDiffPreview))
-        }
-
-        if let result {
-            let output = getTextOutput(from: result)
-            if !output.isEmpty {
-                lines.append(fallbackOutput(output))
-            }
-
-            if let diff = extractDiff(from: result.details) {
-                lines.append(renderDiff(diff))
-            }
-        }
-
-        return lines.joined(separator: "\n")
-    }
-
-    private func formatArgs(_ args: [String: AnyCodable]) -> String? {
-        guard !args.isEmpty else { return nil }
-        let jsonObject = args.mapValues { $0.jsonValue }
-        guard JSONSerialization.isValidJSONObject(jsonObject) else {
-            return String(describing: jsonObject)
-        }
-        let options: JSONSerialization.WritingOptions = [.prettyPrinted, .sortedKeys]
-        if let data = try? JSONSerialization.data(withJSONObject: jsonObject, options: options),
-           let text = String(data: data, encoding: .utf8) {
-            return text
-        }
-        return String(describing: jsonObject)
-    }
-
-    private func getTextOutput() -> String {
-        guard let result else { return "" }
-        return getTextOutput(from: result)
-    }
-
-    private func getTextOutput(from result: ToolResultMessage) -> String {
-        let textBlocks = result.content.compactMap { block -> String? in
-            if case let .text(text) = block {
-                return text.text
-            }
-            return nil
-        }
-        let imageBlocks = result.content.compactMap { block -> ImageContent? in
-            if case let .image(image) = block {
-                return image
-            }
-            return nil
-        }
-        var output = textBlocks.joined(separator: "\n")
-        let caps = getCapabilities()
-        if !imageBlocks.isEmpty && (caps.images == nil || !showImages) {
-            let labels = imageBlocks.map { image in
-                let dimensions = getImageDimensions(image.data, mimeType: image.mimeType)
-                return imageFallback(image.mimeType, dimensions: dimensions, filename: nil)
-            }
-            let combined = labels.joined(separator: "\n")
-            output = output.isEmpty ? combined : "\(output)\n\(combined)"
-        }
-        return output
+        let output = textOutput()
+        if !output.isEmpty { text += "\n" + fallbackOutput(output) }
+        return text
     }
 
     private func maybeConvertImagesForKitty() {
-        let caps = getCapabilities()
-        guard caps.images == .kitty, let result else { return }
-
-        let imageBlocks = result.content.compactMap { block -> ImageContent? in
-            if case let .image(image) = block {
-                return image
-            }
+        guard getCapabilities().images == .kitty, let result else { return }
+        let images = result.content.compactMap { block -> ImageContent? in
+            if case .image(let image) = block { return image }
             return nil
         }
-
-        for (index, image) in imageBlocks.enumerated() {
-            if image.mimeType == "image/png" { continue }
-            if convertedImages[index] != nil { continue }
+        for (index, image) in images.enumerated() {
+            guard image.mimeType != "image/png", convertedImages[index] == nil else { continue }
             if let converted = convertToPng(image.data, image.mimeType) {
                 convertedImages[index] = converted
                 updateDisplay()
                 ui.requestRender()
             }
         }
-    }
-
-    private func extractDiff(from details: AnyCodable?) -> String? {
-        guard let details, let dict = details.value as? [String: Any] else {
-            return nil
-        }
-        if let diff = dict["diff"] as? String {
-            return diff
-        }
-        return nil
-    }
-
-    private func maybeComputeEditDiff() {
-        guard toolName == "edit" else { return }
-        guard let path = args["path"]?.value as? String else { return }
-        guard let oldText = args["oldText"]?.value as? String else { return }
-        guard let newText = args["newText"]?.value as? String else { return }
-
-        let argsKey = "\(path)::\(oldText)::\(newText)"
-        if editDiffArgsKey == argsKey {
-            return
-        }
-        editDiffArgsKey = argsKey
-
-        let diffResult = generateDiffString(oldText, newText)
-        editDiffPreview = diffResult.diff
-    }
-}
-
-private final class StaticLines: Component {
-    private let lines: [String]
-
-    init(_ lines: [String]) {
-        self.lines = lines
-    }
-
-    func render(width: Int) -> [String] {
-        _ = width
-        return lines
     }
 }

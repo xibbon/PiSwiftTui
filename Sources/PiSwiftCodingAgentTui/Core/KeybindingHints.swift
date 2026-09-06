@@ -53,3 +53,13 @@ public func appKeyHint(_ keybindings: KeybindingsManager, _ action: AppAction, _
 public func rawKeyHint(_ key: String, _ description: String) -> String {
     return theme.fg(.dim, key) + theme.fg(.muted, " \(description)")
 }
+
+/// Get the configured display keys for an application action.
+public func keyText(_ action: AppAction) -> String {
+    formatKeys(currentAppHintKeys(action))
+}
+
+/// Format an application hint using the active keybindings.
+public func keyHint(_ action: AppAction, _ description: String) -> String {
+    theme.fg(.dim, keyText(action)) + theme.fg(.muted, " \(description)")
+}

@@ -1,10 +1,6 @@
 import Foundation
 import PiSwiftCodingAgent
 
-private func replaceTabs(_ text: String) -> String {
-    text.replacingOccurrences(of: "\t", with: "   ")
-}
-
 public struct RenderDiffOptions: Sendable {
     public var filePath: String?
 

@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import MiniTui
 import PiSwiftCodingAgent
 
@@ -22,6 +23,13 @@ public let DEFAULT_APP_KEYBINDINGS: [AppAction: [KeyId]] = [
     .copyMessage: [Key.ctrl("x")],
 ]
 
+// Keep an immutable snapshot for hints without changing manager isolation.
+private let activeAppHintKeys = Mutex<[AppAction: [KeyId]]>(DEFAULT_APP_KEYBINDINGS)
+
+func currentAppHintKeys(_ action: AppAction) -> [KeyId] {
+    activeAppHintKeys.withLock { $0[action] ?? [] }
+}
+
 public final class KeybindingsManager {
     private let config: KeybindingsConfig
     private let appActionToKeys: [AppAction: [KeyId]]
@@ -35,6 +43,7 @@ public final class KeybindingsManager {
         let configPath = URL(fileURLWithPath: agentDir).appendingPathComponent("keybindings.json").path
         let config = loadFromFile(configPath)
         let manager = KeybindingsManager(config: config)
+        activeAppHintKeys.withLock { $0 = manager.appActionToKeys }
 
         var tuiBindings: [String: [KeyId]?] = [:]
         let definitions = TUIKeybindingsManager()

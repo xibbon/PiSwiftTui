@@ -1961,8 +1961,9 @@ public final class InteractiveMode {
                         if pendingTools[call.id] == nil {
                             let component = ToolExecutionComponent(
                                 toolName: call.name,
+                                toolCallId: call.id,
                                 args: call.arguments,
-                                options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), renderShell: getRegisteredToolDefinition(call.name)?.renderShell ?? .default),
+                                options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
                                 customTool: getRegisteredToolDefinition(call.name),
                                 ui: tui
                             )
@@ -2003,19 +2004,22 @@ public final class InteractiveMode {
             if pendingTools[toolCallId] == nil {
                 let component = ToolExecutionComponent(
                     toolName: toolName,
+                    toolCallId: toolCallId,
                     args: args,
-                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), renderShell: getRegisteredToolDefinition(toolName)?.renderShell ?? .default),
+                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
                     customTool: getRegisteredToolDefinition(toolName),
                     ui: tui
                 )
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 pendingTools[toolCallId] = component
-                if toolName == "bash" {
-                    footer?.setBashToolRunning(true)
-                }
-                scheduleRender()
             }
+
+            pendingTools[toolCallId]?.updateArgs(args)
+            pendingTools[toolCallId]?.markExecutionStarted()
+            pendingTools[toolCallId]?.setArgsComplete()
+            if toolName == "bash" { footer?.setBashToolRunning(true) }
+            scheduleRender()
 
         case .toolExecutionUpdate(let toolCallId, let toolName, _, let partialResult):
             if let component = pendingTools[toolCallId] {
@@ -2099,8 +2103,9 @@ public final class InteractiveMode {
                 let toolInfo = toolCalls[toolResult.toolCallId]
                 let component = ToolExecutionComponent(
                     toolName: toolInfo?.name ?? toolResult.toolName,
+                    toolCallId: toolResult.toolCallId,
                     args: toolInfo?.args ?? [:],
-                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), renderShell: getRegisteredToolDefinition(toolInfo?.name ?? toolResult.toolName)?.renderShell ?? .default),
+                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
                     customTool: getRegisteredToolDefinition(toolInfo?.name ?? toolResult.toolName),
                     ui: tui
                 )
