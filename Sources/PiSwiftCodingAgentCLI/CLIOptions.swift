@@ -129,6 +129,9 @@ struct CLIOptions: ParsableArguments {
     var rawMessages: [String] = []
 
     mutating func validate() throws {
+        if let mode, Mode(rawValue: mode) == nil {
+            throw ValidationError("Invalid mode \"\(mode)\". Valid values: text, json, rpc")
+        }
         if let useTheme, useTheme.hasPrefix("-") {
             throw ValidationError("--use-theme requires a theme name")
         }

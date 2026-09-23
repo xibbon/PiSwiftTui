@@ -14,28 +14,25 @@ func summaryCostNotice(usage: Usage, branch: Bool = false) -> String {
     return "\(branch ? "Branch summary" : "Compaction"): \(count) tokens billed\(cost)"
 }
 
-func assistantDiagnosticNotices(_ message: AssistantMessage) -> [String] {
-    (message.diagnostics ?? []).compactMap { diagnostic in
-        guard diagnostic.type == "anthropic_input_transformations",
-              let transformations = diagnostic.details["transformations"]?.value as? [[String: Any]] else { return nil }
-        let dropped = transformations.compactMap { item -> String? in
-            guard item["type"] as? String == "thinking_dropped" else { return nil }
-            let reason = item["reason"] as? String ?? "unknown reason"
-            let path = (item["path"] as? String).map { " at \($0)" } ?? ""
-            return reason + path
-        }
-        guard !dropped.isEmpty else { return nil }
-        let noun = dropped.count == 1 ? "thinking block" : "\(dropped.count) thinking blocks"
-        return "Anthropic dropped \(noun): \(dropped.joined(separator: "; "))"
-    }
+func thinkingDropNoticeText(_ notice: ThinkingDropNotice) -> String {
+    let noun = notice.count == 1 ? "thinking block" : "thinking blocks"
+    return "Anthropic dropped \(notice.count) \(noun) (details in session)"
 }
 
-/// Swift's session manager exposes messages, not context entries. Retain the entry metadata
-/// needed by the transcript while using the same compaction boundary as buildSessionContext.
 func interactiveContextEntries(_ sessionManager: SessionManager) -> [SessionEntry] {
-    let branch = sessionManager.getBranch()
-    guard let index = branch.lastIndex(where: { if case .compaction = $0 { return true }; return false }),
-          case .compaction(let compaction) = branch[index] else { return branch }
-    let kept = branch[..<index].firstIndex { $0.id == compaction.firstKeptEntryId }
-    return [branch[index]] + (kept.map { Array(branch[$0..<index]) } ?? []) + Array(branch.dropFirst(index + 1))
+    sessionManager.buildContextEntries()
+}
+
+func thinkingDropNoticesByEntryID(_ branch: [SessionEntry]) -> [String: ThinkingDropNotice] {
+    var previous: AssistantMessage?
+    var notices: [String: ThinkingDropNotice] = [:]
+    for entry in branch {
+        guard case .message(let messageEntry) = entry,
+              case .assistant(let current) = messageEntry.message else { continue }
+        if let notice = newThinkingDropNotice(current: current, previous: previous) {
+            notices[entry.id] = notice
+        }
+        previous = current
+    }
+    return notices
 }

@@ -21,8 +21,8 @@ public func runPrintMode(
 
     _ = session.subscribe { event in
         guard outputJson else { return }
-        let payload = encodeSessionEvent(event)
-        machineOutput.writeJSONLine(payload)
+        // Ordered encoding keeps system-prompt section order in the JSON event stream.
+        machineOutput.writeString(encodeSessionEventJSON(event) + "\n")
     }
 
     if let hookRunner = session.hookRunner {

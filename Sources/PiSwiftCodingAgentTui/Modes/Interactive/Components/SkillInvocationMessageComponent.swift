@@ -43,23 +43,29 @@ public final class SkillInvocationMessageComponent: Container {
 
     private func updateDisplay() {
         box.clear()
+        let content = Container()
 
         if expanded {
             // Expanded: label + skill name header + full content
             let label = theme.fg(.customMessageLabel, "\u{001B}[1m[skill]\u{001B}[22m")
-            box.addChild(Text(label, paddingX: 0, paddingY: 0))
-            box.addChild(Spacer(1))
+            content.addChild(Text(label, paddingX: 0, paddingY: 0))
+            content.addChild(Spacer(1))
 
             let header = "**\(skillBlock.name)**\n\n"
             let style = DefaultTextStyle(color: { theme.fg(.customMessageText, $0) })
-            box.addChild(Markdown(header + skillBlock.content, paddingX: 0, paddingY: 0, theme: getMarkdownTheme(), defaultTextStyle: style))
+            content.addChild(Markdown(header + skillBlock.content, paddingX: 0, paddingY: 0, theme: getMarkdownTheme(), defaultTextStyle: style))
         } else {
             // Collapsed: single line - [skill] name (hint to expand)
             let line =
                 theme.fg(.customMessageLabel, "\u{001B}[1m[skill]\u{001B}[22m ") +
                 theme.fg(.customMessageText, skillBlock.name) +
                 theme.fg(.dim, " (\(expandHint) to expand)")
-            box.addChild(Text(line, paddingX: 0, paddingY: 0))
+            content.addChild(Text(line, paddingX: 0, paddingY: 0))
         }
+        box.addChild(MouseRegion(child: content) { [weak self] event in
+            guard let self, event.type == .click, event.button == .left else { return nil }
+            self.setExpanded(!self.expanded)
+            return TuiMouseEventResult(handled: true)
+        })
     }
 }

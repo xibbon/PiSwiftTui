@@ -23,6 +23,7 @@ public struct SettingsConfig: Sendable {
     public var steeringMode: String
     public var followUpMode: String
     public var transport: Transport
+    public var cacheWarmingMode: CacheWarmingMode
     public var thinkingLevel: ThinkingLevel
     public var availableThinkingLevels: [ThinkingLevel]
     public var currentTheme: String
@@ -59,6 +60,7 @@ public struct SettingsConfig: Sendable {
         steeringMode: String,
         followUpMode: String,
         transport: Transport,
+        cacheWarmingMode: CacheWarmingMode = .off,
         thinkingLevel: ThinkingLevel,
         availableThinkingLevels: [ThinkingLevel],
         currentTheme: String,
@@ -94,6 +96,7 @@ public struct SettingsConfig: Sendable {
         self.steeringMode = steeringMode
         self.followUpMode = followUpMode
         self.transport = transport
+        self.cacheWarmingMode = cacheWarmingMode
         self.thinkingLevel = thinkingLevel
         self.availableThinkingLevels = availableThinkingLevels
         self.currentTheme = currentTheme
@@ -132,6 +135,7 @@ public struct SettingsCallbacks {
     public var onSteeringModeChange: (String) -> Void
     public var onFollowUpModeChange: (String) -> Void
     public var onTransportChange: (Transport) -> Void
+    public var onCacheWarmingModeChange: (CacheWarmingMode) -> Void
     public var onThinkingLevelChange: (ThinkingLevel) -> Void
     public var onThemeChange: (String) -> Void
     public var onThemePreview: ((String) -> Void)?
@@ -164,6 +168,7 @@ public struct SettingsCallbacks {
         onSteeringModeChange: @escaping (String) -> Void,
         onFollowUpModeChange: @escaping (String) -> Void,
         onTransportChange: @escaping (Transport) -> Void,
+        onCacheWarmingModeChange: @escaping (CacheWarmingMode) -> Void = { _ in },
         onThinkingLevelChange: @escaping (ThinkingLevel) -> Void,
         onThemeChange: @escaping (String) -> Void,
         onThemePreview: ((String) -> Void)? = nil,
@@ -195,6 +200,7 @@ public struct SettingsCallbacks {
         self.onSteeringModeChange = onSteeringModeChange
         self.onFollowUpModeChange = onFollowUpModeChange
         self.onTransportChange = onTransportChange
+        self.onCacheWarmingModeChange = onCacheWarmingModeChange
         self.onThinkingLevelChange = onThinkingLevelChange
         self.onThemeChange = onThemeChange
         self.onThemePreview = onThemePreview
@@ -264,6 +270,13 @@ public final class SettingsSelectorComponent: Container, MouseFocusOwner, System
                 description: "Preferred transport for providers that support multiple transports",
                 currentValue: config.transport.rawValue,
                 values: ["sse", "websocket", "auto"]
+            ),
+            SettingItem(
+                id: "cache-warming-mode",
+                label: "Cache warming",
+                description: "Off; while the agent runs; or also between runs when continuation remains worthwhile",
+                currentValue: config.cacheWarmingMode.rawValue,
+                values: CacheWarmingMode.allCases.map(\.rawValue)
             ),
             SettingItem(
                 id: "hide-thinking",
@@ -479,6 +492,10 @@ public final class SettingsSelectorComponent: Container, MouseFocusOwner, System
                 case "transport":
                     if let transport = Transport(rawValue: newValue) {
                         callbacks.onTransportChange(transport)
+                    }
+                case "cache-warming-mode":
+                    if let mode = CacheWarmingMode(rawValue: newValue) {
+                        callbacks.onCacheWarmingModeChange(mode)
                     }
                 case "hide-thinking":
                     callbacks.onHideThinkingBlockChange(newValue == "true")

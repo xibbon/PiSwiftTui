@@ -1,4 +1,7 @@
 import Testing
+import AppKit
+import Foundation
+import PiSwiftAI
 import PiSwiftCodingAgent
 @testable import PiSwiftCodingAgentCLI
 
@@ -48,6 +51,66 @@ private func parseCLI(_ args: [String]) throws -> Args {
 
     let models = try parseCLI(["--models", "gpt-4o,claude-sonnet,gemini-pro"]).models
     #expect(models == ["gpt-4o", "claude-sonnet", "gemini-pro"])
+}
+
+@Test func invalidModeReportsUpstreamDiagnostic() {
+    #expect(PiCodingAgentCLI.modeArgumentError(["--mode"]) == "--mode requires text, json, or rpc")
+    #expect(PiCodingAgentCLI.modeArgumentError(["--mode", "--print"]) == "--mode requires text, json, or rpc")
+    #expect(PiCodingAgentCLI.modeArgumentError(["--mode=not-a-mode"]) == "Invalid mode \"not-a-mode\". Valid values: text, json, rpc")
+    #expect(PiCodingAgentCLI.modeArgumentError(["--mode", "json", "--mode", "bad"]) == "Invalid mode \"bad\". Valid values: text, json, rpc")
+    #expect(PiCodingAgentCLI.modeArgumentError(["--mode", "rpc"]) == nil)
+    #expect(throws: Error.self) { try parseCLI(["--mode", "bad"]) }
+}
+
+@Test func invalidModeExitsNonzeroBeforeStartup() throws {
+    let testDirectory = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).deletingLastPathComponent()
+    let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let candidates = [
+        testDirectory.appendingPathComponent("pi-coding-agent"),
+        cwd.appendingPathComponent(".build/out/Products/Debug/pi-coding-agent"),
+        cwd.appendingPathComponent(".build/arm64-apple-macosx/debug/pi-coding-agent"),
+    ]
+    let executable = try #require(candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) })
+    for (arguments, expected) in [
+        (["--mode"], "--mode requires text, json, or rpc"),
+        (["--mode", "bogus"], "Invalid mode \"bogus\". Valid values: text, json, rpc"),
+    ] {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        let stderr = Pipe()
+        process.standardError = stderr
+        process.standardOutput = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        #expect(process.terminationStatus != 0)
+        let message = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        #expect(message.contains(expected))
+    }
+}
+
+@Test func fileAttachmentUsesSelectedImageResizeProfile() throws {
+    let bitmap = try #require(NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: 16, pixelsHigh: 16,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+        isPlanar: false, colorSpaceName: .deviceRGB,
+        bytesPerRow: 0, bitsPerPixel: 0
+    ))
+    let data = try #require(bitmap.representation(using: .png, properties: [:]))
+    let path = FileManager.default.temporaryDirectory.appendingPathComponent("t2-image-\(UUID().uuidString).png")
+    try data.write(to: path)
+    defer { try? FileManager.default.removeItem(at: path) }
+    var args = Args()
+    args.fileArgs = [path.path]
+    let prepared = try prepareInitialMessage(
+        &args, autoResizeImages: true, blockImages: false,
+        resizeOptions: ModelImageResizeOptions(maxWidth: 4, maxHeight: 4)
+    )
+    let attachment = try #require(prepared.images?.first)
+    let resizedData = try #require(Data(base64Encoded: attachment.data))
+    let resized = try #require(NSBitmapImageRep(data: resizedData))
+    #expect(resized.pixelsWide <= 4)
+    #expect(resized.pixelsHigh <= 4)
 }
 
 @Test func parseConfigLocalFlag() throws {

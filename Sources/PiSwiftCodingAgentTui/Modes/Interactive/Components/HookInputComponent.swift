@@ -14,6 +14,8 @@ public final class HookInputComponent: Container, SystemCursorAware {
     public init(
         title: String,
         placeholder: String? = nil,
+        description: String? = nil,
+        initialValue: String? = nil,
         onSubmit: @escaping (String) -> Void,
         onCancel: @escaping () -> Void
     ) {
@@ -26,9 +28,13 @@ public final class HookInputComponent: Container, SystemCursorAware {
         addChild(Spacer(1))
         addChild(Text(theme.fg(.accent, title), paddingX: 1, paddingY: 0))
         addChild(Spacer(1))
+        if let description, !description.isEmpty {
+            addChild(Text(theme.fg(.dim, description), paddingX: 1, paddingY: 0))
+            addChild(Spacer(1))
+        }
 
-        if let placeholder {
-            input.setValue(placeholder)
+        if let value = initialValue ?? placeholder {
+            input.setValue(value)
         }
         addChild(input)
 

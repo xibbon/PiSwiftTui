@@ -7,7 +7,7 @@ private enum SessionScope: String {
     case all
 }
 
-public typealias SessionsLoader = @Sendable (_ onProgress: SessionListProgress?) async -> [SessionInfo]
+public typealias SessionsLoader = @Sendable (_ onPartial: @escaping SessionListSnapshotProgress) async throws -> [SessionInfo]
 
 /// Formats a session date as a relative time string
 func formatSessionDate(_ date: Date) -> String {
@@ -79,10 +79,11 @@ private final class SessionSelectorHeader: Component {
     }
 }
 
-private final class SessionList: Component, SystemCursorAware {
+final class SessionList: Component, SystemCursorAware {
     private var allSessions: [SessionInfo]
     private var filteredSessions: [SessionInfo]
     private var selectedIndex: Int = 0
+    private var selectedPath: String?
     private let searchInput: Input
     private var showCwd = false
     var onSelect: ((String) -> Void)?
@@ -112,6 +113,11 @@ private final class SessionList: Component, SystemCursorAware {
         allSessions = sessions
         self.showCwd = showCwd
         filterSessions(searchInput.getValue())
+    }
+
+    func resetNavigation() {
+        selectedPath = nil
+        selectedIndex = 0
     }
 
     func invalidate() {
@@ -185,18 +191,22 @@ private final class SessionList: Component, SystemCursorAware {
         }
         if kb.matches(keyData, TUIKeybinding.selectUp) {
             selectedIndex = max(0, selectedIndex - 1)
+            selectedPath = filteredSessions[safe: selectedIndex]?.path
             return
         }
         if kb.matches(keyData, TUIKeybinding.selectDown) {
             selectedIndex = min(filteredSessions.count - 1, selectedIndex + 1)
+            selectedPath = filteredSessions[safe: selectedIndex]?.path
             return
         }
         if kb.matches(keyData, TUIKeybinding.selectPageUp) {
             selectedIndex = max(0, selectedIndex - maxVisible)
+            selectedPath = filteredSessions[safe: selectedIndex]?.path
             return
         }
         if kb.matches(keyData, TUIKeybinding.selectPageDown) {
             selectedIndex = min(filteredSessions.count - 1, selectedIndex + maxVisible)
+            selectedPath = filteredSessions[safe: selectedIndex]?.path
             return
         }
         if kb.matches(keyData, TUIKeybinding.selectConfirm) {
@@ -218,20 +228,33 @@ private final class SessionList: Component, SystemCursorAware {
         filteredSessions = fuzzyFilter(allSessions, query: query) { session in
             "\(session.id) \(session.name ?? "") \(session.allMessagesText) \(session.cwd)"
         }
-        selectedIndex = min(selectedIndex, max(0, filteredSessions.count - 1))
+        if let selectedPath, let index = filteredSessions.firstIndex(where: { $0.path == selectedPath }) {
+            selectedIndex = index
+        } else {
+            selectedIndex = selectedPath == nil ? 0 : min(selectedIndex, max(0, filteredSessions.count - 1))
+        }
     }
 }
 
-public final class SessionSelectorComponent: Container {
+public final class SessionSelectorComponent: Container, SelectorClosable {
     private let sessionList: SessionList
     private let header: SessionSelectorHeader
     private var scope: SessionScope = .current
     private var currentSessions: [SessionInfo]?
     private var allSessions: [SessionInfo]?
+    private var currentLoading = false
+    private var allLoading = false
+    private var currentLoadedCount = 0
+    private var allLoadedCount = 0
     private let currentSessionsLoader: SessionsLoader
     private let allSessionsLoader: SessionsLoader
     private let onCancel: () -> Void
     private let requestRender: () -> Void
+    private var currentLoadTask: Task<Void, Never>?
+    private var allLoadTask: Task<Void, Never>?
+    private var currentGeneration = 0
+    private var allGeneration = 0
+    private var closed = false
 
     public init(
         currentSessionsLoader: @escaping SessionsLoader,
@@ -255,9 +278,9 @@ public final class SessionSelectorComponent: Container {
         addChild(DynamicBorder())
         addChild(Spacer(1))
 
-        sessionList.onSelect = onSelect
-        sessionList.onCancel = onCancel
-        sessionList.onExit = onExit
+        sessionList.onSelect = { [weak self] path in self?.closeSelector(); onSelect(path) }
+        sessionList.onCancel = { [weak self] in self?.closeSelector(); onCancel() }
+        sessionList.onExit = { [weak self] in self?.closeSelector(); onExit() }
         sessionList.onToggleScope = { [weak self] in
             self?.toggleScope()
         }
@@ -270,57 +293,111 @@ public final class SessionSelectorComponent: Container {
     }
 
     private func loadCurrentSessions() {
+        currentGeneration += 1
+        let generation = currentGeneration
+        currentLoading = true
+        currentLoadedCount = 0
         header.setLoading(true)
         requestRender()
-        Task { @MainActor [weak self] in
+        currentLoadTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let sessions = await currentSessionsLoader { [weak self] loaded, total in
-                Task { @MainActor [weak self] in
-                    self?.header.setProgress(loaded: loaded, total: total)
-                    self?.requestRender()
+            do {
+                let sessions = try await currentSessionsLoader { [weak self] loaded, total, sessions in
+                    Task { @MainActor [weak self] in
+                        guard let self, !self.closed, generation == self.currentGeneration else { return }
+                        guard loaded >= self.currentLoadedCount else { return }
+                        self.currentLoadedCount = loaded
+                        if self.scope == .current { self.header.setProgress(loaded: loaded, total: total) }
+                        self.currentSessions = sessions
+                        if self.scope == .current { self.sessionList.setSessions(sessions, showCwd: false) }
+                        self.requestRender()
+                    }
                 }
+                guard !closed, generation == currentGeneration else { return }
+                self.currentSessions = sessions
+                currentLoadedCount = .max
+                currentLoading = false
+                if scope == .current {
+                    self.header.setLoading(false)
+                    self.sessionList.setSessions(sessions, showCwd: false)
+                }
+                self.requestRender()
+            } catch is CancellationError { } catch {
+                guard !closed, generation == currentGeneration else { return }
+                currentLoading = false
+                if scope == .current { header.setLoading(false); requestRender() }
             }
-            self.currentSessions = sessions
-            self.header.setLoading(false)
-            self.sessionList.setSessions(sessions, showCwd: false)
-            self.requestRender()
         }
     }
 
     private func toggleScope() {
         if scope == .current {
+            scope = .all
             if allSessions == nil {
+                allLoadTask?.cancel()
+                allLoading = true
+                allLoadedCount = 0
                 header.setLoading(true)
                 header.setScope(.all)
                 sessionList.setSessions([], showCwd: true)
                 requestRender()
-                Task { @MainActor [weak self] in
+                allGeneration += 1
+                let generation = allGeneration
+                allLoadTask = Task { @MainActor [weak self] in
                     guard let self else { return }
-                    let sessions = await allSessionsLoader { [weak self] loaded, total in
-                        Task { @MainActor [weak self] in
-                            self?.header.setProgress(loaded: loaded, total: total)
-                            self?.requestRender()
+                    do {
+                        let sessions = try await allSessionsLoader { [weak self] loaded, total, sessions in
+                            Task { @MainActor [weak self] in
+                                guard let self, !self.closed, generation == self.allGeneration else { return }
+                                guard loaded >= self.allLoadedCount else { return }
+                                self.allLoadedCount = loaded
+                                if self.scope == .all { self.header.setProgress(loaded: loaded, total: total) }
+                                self.allSessions = sessions
+                                if self.scope == .all { self.sessionList.setSessions(sessions, showCwd: true) }
+                                self.requestRender()
+                            }
                         }
-                    }
-                    self.allSessions = sessions
-                    self.header.setLoading(false)
-                    self.scope = .all
-                    self.sessionList.setSessions(sessions, showCwd: true)
-                    self.requestRender()
-                    if (self.allSessions?.isEmpty ?? true) && (self.currentSessions?.isEmpty ?? true) {
-                        self.onCancel()
+                        guard !closed, generation == allGeneration else { return }
+                        self.allSessions = sessions
+                        allLoadedCount = .max
+                        allLoading = false
+                        if scope == .all {
+                            self.header.setLoading(false)
+                            self.sessionList.setSessions(sessions, showCwd: true)
+                        }
+                        self.requestRender()
+                        if !currentLoading && (self.allSessions?.isEmpty ?? true) && (self.currentSessions?.isEmpty ?? true) {
+                            self.closeSelector()
+                            self.onCancel()
+                        }
+                    } catch is CancellationError { } catch {
+                        guard !closed, generation == allGeneration else { return }
+                        allLoading = false
+                        if scope == .all { header.setLoading(false); requestRender() }
                     }
                 }
             } else {
-                scope = .all
                 sessionList.setSessions(allSessions ?? [], showCwd: true)
                 header.setScope(scope)
+                header.setLoading(allLoading)
             }
         } else {
             scope = .current
             sessionList.setSessions(currentSessions ?? [], showCwd: false)
             header.setScope(scope)
+            header.setLoading(currentLoading)
         }
+        sessionList.resetNavigation()
+        requestRender()
+    }
+
+    public func closeSelector() {
+        guard !closed else { return }
+        closed = true
+        currentGeneration += 1
+        allGeneration += 1
+        currentLoadTask?.cancel()
+        allLoadTask?.cancel()
     }
 
     public func getSessionList() -> Component {

@@ -17,6 +17,7 @@ public final class HookEditorComponent: Container, SystemCursorAware {
         tui: TUI,
         title: String,
         prefill: String? = nil,
+        description: String? = nil,
         onSubmit: @escaping (String) -> Void,
         onCancel: @escaping () -> Void
     ) {
@@ -31,6 +32,10 @@ public final class HookEditorComponent: Container, SystemCursorAware {
         addChild(Spacer(1))
         addChild(Text(theme.fg(.accent, title), paddingX: 1, paddingY: 0))
         addChild(Spacer(1))
+        if let description, !description.isEmpty {
+            addChild(Text(theme.fg(.dim, description), paddingX: 1, paddingY: 0))
+            addChild(Spacer(1))
+        }
 
         if let prefill {
             editor.setText(prefill)

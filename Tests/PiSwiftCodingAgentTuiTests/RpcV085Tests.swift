@@ -100,6 +100,26 @@ import PiSwiftCodingAgent
         #expect(session.clearQueue().steering.isEmpty)
     }
 
+    @Test func rpcSteerAndFollowUpRunInputHooksWithRpcSource() async throws {
+        let sources = LockedState<[String]>([])
+        let handler: HookHandler = { event, _ in
+            guard let input = event as? InputEvent else { return nil }
+            sources.withLock { $0.append(input.source.rawValue) }
+            return InputEventResult.transform(text: "hooked: \(input.text)")
+        }
+        let session = makeRpcV085Session(handler: handler, eventName: "input")
+        defer { session.dispose() }
+        let output = RpcOutput(write: { _ in })
+        let steer = try await handleRpcCommand("steer", ["message": "first"], session, output)
+        let follow = try await handleRpcCommand("follow_up", ["message": "second"], session, output)
+        #expect(steer["success"] as? Bool == true)
+        #expect(follow["success"] as? Bool == true)
+        #expect(sources.withLock { $0 } == ["rpc", "rpc"])
+        let queued = session.clearQueue()
+        #expect(queued.steering == ["hooked: first"])
+        #expect(queued.followUp == ["hooked: second"])
+    }
+
     @Test func abortRequestCancelsManualCompaction() async throws {
         let started = LockedState(false)
         let handler: HookHandler = { event, _ in
@@ -131,7 +151,7 @@ import PiSwiftCodingAgent
     }
 }
 
-private func makeRpcV085Session(handler: HookHandler? = nil) -> AgentSession {
+private func makeRpcV085Session(handler: HookHandler? = nil, eventName: String = "session_before_compact") -> AgentSession {
     let model = getModel(provider: .openai, modelId: "gpt-4o-mini")
     let manager = SessionManager.inMemory()
     for text in ["first", "second"] {
@@ -152,7 +172,7 @@ private func makeRpcV085Session(handler: HookHandler? = nil) -> AgentSession {
     auth.setRuntimeApiKey(model.provider, "test-key")
     let registry = ModelRegistry(auth)
     let runner = handler.map { handler in
-        let runner = HookRunner([LoadedHook(path: "<rpc-test>", resolvedPath: "<rpc-test>", handlers: ["session_before_compact": [handler]])], "/tmp", manager, registry)
+        let runner = HookRunner([LoadedHook(path: "<rpc-test>", resolvedPath: "<rpc-test>", handlers: [eventName: [handler]], isExtension: eventName == "input")], "/tmp", manager, registry)
         runner.initialize(getModel: { model }, hasUI: false)
         return runner
     }

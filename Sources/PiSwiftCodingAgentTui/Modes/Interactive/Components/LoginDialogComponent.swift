@@ -14,6 +14,17 @@ public enum LoginDialogError: Error, LocalizedError {
     }
 }
 
+func loginClipboardNotice(for result: PiSwiftCodingAgent.ClipboardCopyResult) -> String {
+    switch result {
+    case .success:
+        return "URL copied to clipboard"
+    case .osc52SentUnverified:
+        return "Sent a copy request to the terminal; copy the URL above if needed"
+    case .failure:
+        return "Copy the URL above into your browser"
+    }
+}
+
 public final class LoginDialogComponent: Container, SystemCursorAware {
     private let contentContainer: Container
     private let input: Input
@@ -67,11 +78,8 @@ public final class LoginDialogComponent: Container, SystemCursorAware {
         let hyperlink = "\u{001B}]8;;\(url)\u{0007}Click here to Login\u{001B}]8;;\u{0007}"
         contentContainer.addChild(TruncatedText(theme.fg(.dim, hyperlink), paddingX: 1, paddingY: 0))
 
-        if (try? copyToClipboard(url)) != nil {
-            contentContainer.addChild(TruncatedText(theme.fg(.dim, "URL copied to clipboard"), paddingX: 1, paddingY: 0))
-        } else {
-            contentContainer.addChild(TruncatedText(theme.fg(.dim, "Copy the URL above into your browser"), paddingX: 1, paddingY: 0))
-        }
+        let copyNotice = loginClipboardNotice(for: copyToClipboard(url))
+        contentContainer.addChild(TruncatedText(theme.fg(.dim, copyNotice), paddingX: 1, paddingY: 0))
 
         if let instructions {
             contentContainer.addChild(Spacer(1))

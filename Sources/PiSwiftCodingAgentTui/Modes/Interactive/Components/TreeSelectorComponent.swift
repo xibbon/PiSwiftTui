@@ -157,9 +157,11 @@ private final class TreeList: Component {
     }
 
     private func passesFilterMode(_ entry: SessionEntry, node: SessionTreeNode) -> Bool {
+        // Usage entries are bookkeeping: they stay in the raw tree but are never listed.
+        if case .usage = entry { return false }
         let isSettingsEntry: Bool = {
             switch entry {
-            case .label, .custom, .modelChange, .thinkingLevel:
+            case .label, .contextEdit, .custom, .modelChange, .thinkingLevel:
                 return true
             default:
                 return false
@@ -220,6 +222,10 @@ private final class TreeList: Component {
         case .custom(let entry):
             return entry.parentId
         case .customMessage(let entry):
+            return entry.parentId
+        case .usage(let entry):
+            return entry.parentId
+        case .contextEdit(let entry):
             return entry.parentId
         case .label(let entry):
             return entry.parentId
@@ -385,6 +391,8 @@ private func describeEntry(_ entry: SessionEntry) -> String {
     switch entry {
     case .message(let messageEntry):
         switch messageEntry.message {
+        case .system:
+            return theme.fg(.dim, "[system]")
         case .user(let user):
             return theme.fg(.accent, "user: ") + normalizeMessageText(extractUserText(user))
         case .assistant(let assistant):
@@ -416,6 +424,10 @@ private func describeEntry(_ entry: SessionEntry) -> String {
         return theme.fg(.dim, "[thinking: \(entry.thinkingLevel)]")
     case .custom(let entry):
         return theme.fg(.dim, "[custom: \(entry.customType)]")
+    case .contextEdit(let entry):
+        return theme.fg(.dim, "[context \(entry.replacement == nil ? "omit" : "replace"): \(entry.targetId)]")
+    case .usage(let entry):
+        return theme.fg(.dim, "[usage: \(entry.kind)]")
     case .customMessage(let entry):
         return theme.fg(.customMessageLabel, "[\(entry.customType)]: ") + normalizeMessageText(extractHookMessageText(entry.content))
     case .label(let entry):

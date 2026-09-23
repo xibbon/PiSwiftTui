@@ -111,7 +111,7 @@ public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCur
         addChild(listContainer)
         addChild(Spacer(1))
         if onSelectAsDefault != nil {
-            addChild(Text(theme.fg(.dim, "  Enter to select · Ctrl+S to set as default · Esc to cancel"), paddingX: 0, paddingY: 0))
+            addChild(Text(theme.fg(.dim, "  \(formatKeys(getKeybindings().getKeys(TUIKeybinding.selectConfirm))) to select · \(selectorKeyText("app.models.save")) to set as default · \(formatKeys(getKeybindings().getKeys(TUIKeybinding.selectCancel))) to cancel"), paddingX: 0, paddingY: 0))
         }
         addChild(DynamicBorder())
 
@@ -234,7 +234,7 @@ public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCur
     }
 
     public override func handleInput(_ keyData: String) {
-        if matchesKey(keyData, Key.ctrl("s")), let onSelectAsDefaultCallback {
+        if selectorKeyMatches(keyData, "app.models.save"), let onSelectAsDefaultCallback {
             if let selected = filteredModels[safe: selectedIndex] { closeSelector(); onSelectAsDefaultCallback(selected.model) }
             return
         }

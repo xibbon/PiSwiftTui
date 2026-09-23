@@ -45,9 +45,12 @@ private func portSession() -> AgentSession {
     return AgentSession(config: AgentSessionConfig(agent: agent, sessionManager: .inMemory("/tmp"), settingsManager: settings, resourceLoader: PortResourceLoader(), modelRegistry: ModelRegistry(AuthStorage.inMemory(), nil, modelsStore: InMemoryModelsStore(), networkEnabled: false)))
 }
 
-private func diagnosticMessage() -> AssistantMessage {
-    AssistantMessage(content: [.text(TextContent(text: "survived"))], api: .anthropicMessages, provider: "anthropic", model: "test", usage: Usage(input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0), stopReason: .stop,
-                     diagnostics: [AssistantMessageDiagnostic(type: "anthropic_input_transformations", details: ["transformations": AnyCodable([["type": "thinking_dropped", "reason": "prefix_binding_mismatch", "path": "messages.2.content.0"]])])])
+private func diagnosticMessage(count: Int = 1) -> AssistantMessage {
+    let drops = (0..<count).map { index in
+        ["type": "thinking_dropped", "reason": "prefix_binding_mismatch", "path": "messages.2.content.\(index)"]
+    }
+    return AssistantMessage(content: [.text(TextContent(text: "survived"))], api: .anthropicMessages, provider: "anthropic", model: "test", usage: Usage(input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0), stopReason: .stop,
+                     diagnostics: [AssistantMessageDiagnostic(type: "anthropic_input_transformations", details: ["transformations": AnyCodable(drops)])])
 }
 
 @MainActor
@@ -122,7 +125,7 @@ private func diagnosticMessage() -> AssistantMessage {
         #expect(mode.chatContainer.children.isEmpty)
         session.settingsManager.setShowCacheMissNotices(true)
         mode.maybeShowAssistantDiagnostics(message)
-        let expected = "Anthropic dropped thinking block: prefix_binding_mismatch at messages.2.content.0"
+        let expected = "Anthropic dropped 1 thinking block (details in session)"
         #expect(mode.chatContainer.render(width: 160).joined().contains(expected))
         _ = session.sessionManager.appendMessage(.assistant(message))
         mode.renderInitialMessages()
@@ -159,6 +162,60 @@ private func diagnosticMessage() -> AssistantMessage {
         #expect(entries.count == 3)
         guard case .compaction = entries.first else { Issue.record("Compaction must lead context"); return }
         #expect(entries[1].id == keep)
+    }
+
+    @Test func thinkingDropNoticeSuppressesCumulativeRepeat() {
+        let session = portSession(); defer { session.dispose() }
+        session.settingsManager.setShowCacheMissNotices(true)
+        let mode = InteractiveMode(session: session, version: "test")
+        let first = diagnosticMessage()
+        mode.maybeShowAssistantDiagnostics(first)
+        _ = session.sessionManager.appendMessage(.assistant(first))
+        mode.maybeShowAssistantDiagnostics(first)
+        let increased = diagnosticMessage(count: 2)
+        mode.maybeShowAssistantDiagnostics(increased)
+        let output = mode.chatContainer.render(width: 160).joined(separator: "\n")
+        #expect(output.components(separatedBy: "Anthropic dropped").count == 3)
+        #expect(output.contains("Anthropic dropped 2 thinking blocks"))
+        #expect(!output.contains("prefix_binding_mismatch"))
+    }
+
+    @Test func boundaryCompactionReplaysInOrderAndSuppressesDuplicateEntryEvent() throws {
+        let session = portSession(); defer { session.dispose() }
+        let manager = session.sessionManager
+        _ = manager.appendMessage(.user(UserMessage(content: .text("DISCARDED_SENTINEL"))))
+        let kept = manager.appendMessage(.user(UserMessage(content: .text("KEPT_SENTINEL"))))
+        let compactionID = manager.appendCompaction("SUMMARY_SENTINEL", kept, 100)
+        let afterID = manager.appendCustomMessage("notice", .text("AFTER_SENTINEL"), true)
+        let branch = manager.getBranch()
+        let compaction = try #require(branch.first { $0.id == compactionID })
+        let after = try #require(branch.first { $0.id == afterID })
+        let tui = TUI(terminal: PortTerminal())
+        let editor = CustomEditor(ui: tui, theme: getEditorTheme(), keybindings: .inMemory())
+        let mode = InteractiveMode(session: session, tui: tui, editor: editor)
+        mode.handleSessionEvent(.entryAppended(compaction))
+        mode.handleSessionEvent(.entryAppended(after))
+        let output = mode.chatContainer.render(width: 160).joined(separator: "\n")
+        #expect(!output.contains("DISCARDED_SENTINEL"))
+        let keptRange = try #require(output.range(of: "KEPT_SENTINEL"))
+        let summaryRange = try #require(output.range(of: "[compaction]"))
+        let afterRange = try #require(output.range(of: "AFTER_SENTINEL"))
+        #expect(keptRange.lowerBound < summaryRange.lowerBound)
+        #expect(summaryRange.lowerBound < afterRange.lowerBound)
+        #expect(output.components(separatedBy: "AFTER_SENTINEL").count == 2)
+    }
+
+    @Test func replayRendersPersistedCacheWarmingUsageOnce() {
+        let session = portSession(); defer { session.dispose() }
+        session.settingsManager.setShowCacheMissNotices(true)
+        let usage = Usage(input: 1, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 1, cost: UsageCost(total: 0.002))
+        _ = session.sessionManager.appendUsage("cache_warm", "anthropic", "test", usage, note: "test")
+        let tui = TUI(terminal: PortTerminal())
+        let editor = CustomEditor(ui: tui, theme: getEditorTheme(), keybindings: .inMemory())
+        let mode = InteractiveMode(session: session, tui: tui, editor: editor)
+        mode.renderInitialMessages()
+        let output = mode.chatContainer.render(width: 160).joined(separator: "\n")
+        #expect(output.components(separatedBy: "Cache warmed (test): $0.002").count == 2)
     }
 
     @Test func copyCommandPrefersExplicitFullscreenSelection() async {

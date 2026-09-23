@@ -23,6 +23,26 @@ public let DEFAULT_APP_KEYBINDINGS: [AppAction: [KeyId]] = [
     .copyMessage: [Key.ctrl("x")],
 ]
 
+public let DEFAULT_SELECTOR_KEYBINDINGS: KeybindingsConfig = [
+    "app.models.save": [Key.ctrl("s")],
+    "app.thinking.save": [Key.ctrl("s")],
+    "app.models.enableAll": [Key.ctrl("a")],
+    "app.models.clearAll": [Key.ctrl("x")],
+    "app.models.toggleProvider": [Key.ctrl("p")],
+    "app.models.reorderUp": [Key.alt("up")],
+    "app.models.reorderDown": [Key.alt("down")],
+]
+
+private let activeSelectorHintKeys = Mutex<KeybindingsConfig>(DEFAULT_SELECTOR_KEYBINDINGS)
+
+public func selectorKeyText(_ action: String) -> String {
+    formatKeys(activeSelectorHintKeys.withLock { $0[action] ?? [] })
+}
+
+public func selectorKeyMatches(_ data: String, _ action: String) -> Bool {
+    activeSelectorHintKeys.withLock { $0[action] ?? [] }.contains { matchesKey(data, $0) }
+}
+
 // Keep an immutable snapshot for hints without changing manager isolation.
 private let activeAppHintKeys = Mutex<[AppAction: [KeyId]]>(DEFAULT_APP_KEYBINDINGS)
 
@@ -44,6 +64,7 @@ public final class KeybindingsManager {
         let config = loadFromFile(configPath)
         let manager = KeybindingsManager(config: config)
         activeAppHintKeys.withLock { $0 = manager.appActionToKeys }
+        activeSelectorHintKeys.withLock { $0 = DEFAULT_SELECTOR_KEYBINDINGS.merging(config) { _, configured in configured } }
 
         var tuiBindings: [String: [KeyId]?] = [:]
         let definitions = TUIKeybindingsManager()
@@ -64,7 +85,9 @@ public final class KeybindingsManager {
     }
 
     public static func inMemory(config: KeybindingsConfig = [:]) -> KeybindingsManager {
-        return KeybindingsManager(config: config)
+        let manager = KeybindingsManager(config: config)
+        activeSelectorHintKeys.withLock { $0 = DEFAULT_SELECTOR_KEYBINDINGS.merging(config) { _, configured in configured } }
+        return manager
     }
 
     private static func loadFromFile(_ path: String) -> KeybindingsConfig {

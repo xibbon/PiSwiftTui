@@ -24,17 +24,23 @@ public final class CompactionSummaryMessageComponent: Box {
 
     private func updateDisplay() {
         clear()
+        let content = Container()
         let tokenStr = NumberFormatter.localizedString(from: NSNumber(value: message.tokensBefore), number: .decimal)
         let label = theme.fg(.customMessageLabel, "\u{001B}[1m[compaction]\u{001B}[22m")
-        addChild(Text(label, paddingX: 0, paddingY: 0))
-        addChild(Spacer(1))
+        content.addChild(Text(label, paddingX: 0, paddingY: 0))
+        content.addChild(Spacer(1))
 
         if expanded {
             let header = "**Compacted from \(tokenStr) tokens**\n\n"
             let style = DefaultTextStyle(color: { theme.fg(.customMessageText, $0) })
-            addChild(Markdown(header + message.summary, paddingX: 0, paddingY: 0, theme: getMarkdownTheme(), defaultTextStyle: style))
+            content.addChild(Markdown(header + message.summary, paddingX: 0, paddingY: 0, theme: getMarkdownTheme(), defaultTextStyle: style))
         } else {
-            addChild(Text(theme.fg(.customMessageText, "Compacted from \(tokenStr) tokens (ctrl+o to expand)"), paddingX: 0, paddingY: 0))
+            content.addChild(Text(theme.fg(.customMessageText, "Compacted from \(tokenStr) tokens (ctrl+o to expand)"), paddingX: 0, paddingY: 0))
         }
+        addChild(MouseRegion(child: content) { [weak self] event in
+            guard let self, event.type == .click, event.button == .left else { return nil }
+            self.setExpanded(!self.expanded)
+            return TuiMouseEventResult(handled: true)
+        })
     }
 }

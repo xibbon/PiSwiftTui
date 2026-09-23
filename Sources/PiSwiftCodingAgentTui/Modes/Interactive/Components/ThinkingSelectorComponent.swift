@@ -44,7 +44,7 @@ public final class ThinkingSelectorComponent: Container, MouseFocusOwner, Focusa
         addChild(Spacer(1))
         addChild(listContainer)
         addChild(Spacer(1))
-        addChild(Text(theme.fg(.dim, "  Enter to select · Ctrl+S to set as default · Esc to cancel"), paddingX: 0, paddingY: 0))
+        addChild(Text(theme.fg(.dim, "  \(formatKeys(getKeybindings().getKeys(TUIKeybinding.selectConfirm))) to select · \(selectorKeyText("app.thinking.save")) to set as default · \(formatKeys(getKeybindings().getKeys(TUIKeybinding.selectCancel))) to cancel"), paddingX: 0, paddingY: 0))
         addChild(DynamicBorder())
         rebuild(allItems, preselect: currentLevel.rawValue)
     }
@@ -62,7 +62,7 @@ public final class ThinkingSelectorComponent: Container, MouseFocusOwner, Focusa
     }
 
     public override func handleInput(_ data: String) {
-        if matchesKey(data, Key.ctrl("s")), let onSelectAsDefault {
+        if selectorKeyMatches(data, "app.thinking.save"), let onSelectAsDefault {
             if let item = selectList.getSelectedItem(), let level = ThinkingLevel(rawValue: item.value) { onSelectAsDefault(level) }
             return
         }

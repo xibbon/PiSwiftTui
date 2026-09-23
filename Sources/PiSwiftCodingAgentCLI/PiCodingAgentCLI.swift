@@ -132,13 +132,6 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             }
         }
 
-        let initialMessageResult = try prepareInitialMessage(
-            &parsed,
-            autoResizeImages: settingsManager.getAutoResizeImages(),
-            blockImages: settingsManager.getBlockImages()
-        )
-        time("prepareInitialMessage")
-
         var resumeSession: String? = nil
         if parsed.resume == true {
             _ = KeybindingsManager.create()
@@ -149,14 +142,14 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             resumeSession = await selectSession(
                 settingsManager: settingsManager,
                 projectTrusted: trust.trusted,
-                currentSessionsLoader: { onProgress in
-                    await SessionManager.list(cwdValue, sessionDir, onProgress)
+                currentSessionsLoader: { onPartial in
+                    try await SessionManager.list(cwdValue, sessionDir, onPartial: onPartial)
                 },
-                allSessionsLoader: { onProgress in
+                allSessionsLoader: { onPartial in
                     if let sessionDir, !sessionDir.isEmpty {
-                        await SessionManager.list(cwdValue, sessionDir, onProgress)
+                        try await SessionManager.list(cwdValue, sessionDir, onPartial: onPartial)
                     } else {
-                        await SessionManager.listAll(onProgress)
+                        try await SessionManager.listAll(onPartial: onPartial)
                     }
                 }
             )
@@ -223,6 +216,13 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             shouldPrintMessages
         )
         let initialModel = initialSelection.model
+        let initialMessageResult = try prepareInitialMessage(
+            &parsed,
+            autoResizeImages: settingsManager.getAutoResizeImages(),
+            blockImages: settingsManager.getBlockImages(),
+            resizeOptions: initialModel?.inputLimits?.images?.resize
+        )
+        time("prepareInitialMessage")
         var initialThinking = startupThinkingLevel(
             settingsManager: settingsManager,
             model: initialModel,
@@ -432,7 +432,12 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             )
         }
         let rebuildSystemPrompt: @Sendable ([String]) -> String = { toolNames in
-            buildSystemPrompt(makeSystemPromptOptions(toolNames))
+            do {
+                return try buildSystemPrompt(makeSystemPromptOptions(toolNames))
+            } catch {
+                // Only custom section names are validated, and the CLI passes none.
+                preconditionFailure("built-in system prompt sections are always valid: \(error)")
+            }
         }
 
         let systemPrompt = rebuildSystemPrompt(initialActiveToolNames)
@@ -628,8 +633,42 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
     }
 
     static func main() async {
-        let processed = Self.preprocessArguments(Array(CommandLine.arguments.dropFirst()))
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if let modeError = Self.modeArgumentError(arguments) {
+            fputs("Error: \(modeError)\n", stderr)
+            Darwin.exit(1)
+        }
+        let processed = Self.preprocessArguments(arguments)
         await self.main(processed)
+    }
+
+    static func modeArgumentError(_ arguments: [String]) -> String? {
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--" { break }
+            if argument == "--mode" {
+                guard index + 1 < arguments.count,
+                      !arguments[index + 1].hasPrefix("-") else {
+                    return "--mode requires text, json, or rpc"
+                }
+                let value = arguments[index + 1]
+                if Mode(rawValue: value) == nil {
+                    return "Invalid mode \"\(value)\". Valid values: text, json, rpc"
+                }
+                index += 2
+                continue
+            }
+            if argument.hasPrefix("--mode=") {
+                let value = String(argument.dropFirst("--mode=".count))
+                if value.isEmpty { return "--mode requires text, json, or rpc" }
+                if Mode(rawValue: value) == nil {
+                    return "Invalid mode \"\(value)\". Valid values: text, json, rpc"
+                }
+            }
+            index += 1
+        }
+        return nil
     }
 
     private static func helpDiscussion() -> String {
@@ -826,15 +865,16 @@ func reportStartupDiagnostics(_ diagnostics: [ResourceDiagnostic]) {
     }
 }
 
-private struct PreparedInitialMessage {
+struct PreparedInitialMessage {
     var message: String?
     var images: [ImageContent]?
 }
 
-private func prepareInitialMessage(
+func prepareInitialMessage(
     _ parsed: inout Args,
     autoResizeImages: Bool,
-    blockImages: Bool
+    blockImages: Bool,
+    resizeOptions: ModelImageResizeOptions?
 ) throws -> PreparedInitialMessage {
     guard !parsed.fileArgs.isEmpty else {
         return PreparedInitialMessage(message: nil, images: nil)
@@ -842,7 +882,7 @@ private func prepareInitialMessage(
 
     let processed = try processFileArguments(
         parsed.fileArgs,
-        options: ProcessFileOptions(autoResizeImages: autoResizeImages, blockImages: blockImages)
+        options: ProcessFileOptions(autoResizeImages: autoResizeImages, blockImages: blockImages, resizeOptions: resizeOptions)
     )
     let textContent = processed.textContent
     if parsed.messages.isEmpty {

@@ -60,6 +60,8 @@ private func buildTree(entries: [SessionEntry]) -> [SessionTreeNode] {
         case .branchSummary(let entry): return entry.parentId
         case .custom(let entry): return entry.parentId
         case .customMessage(let entry): return entry.parentId
+        case .usage(let entry): return entry.parentId
+        case .contextEdit(let entry): return entry.parentId
         case .label(let entry): return entry.parentId
         case .sessionInfo(let entry): return entry.parentId
         }

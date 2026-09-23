@@ -270,8 +270,10 @@ public final class InteractiveMode {
     public var lastStatusText: Text?
 
     private var session: AgentSession?
+    var crashLog = CrashLog()
     private var tui: TUI?
     private var altScreenRenderer: AltScreenRenderer?
+    var clipboardCopy: (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard
     private var composition: InteractiveComposition?
     private var tuiConfiguration: InteractiveTuiConfiguration
     private var tuiModeOverride: InteractiveTuiMode?
@@ -319,10 +321,23 @@ public final class InteractiveMode {
 
     private var isInitialized = false
     private(set) var loadingAnimation: WorkingStatusIndicator?
+    private var transientStatusAnimation: WorkingStatusIndicator?
+    private var transientStatusMessage: String?
+    private var modelSelectionRevision = 0
+
+    func recordUserModelSelection() { modelSelectionRevision += 1 }
+
+    func canApplyPostLoginSelection(_ candidateSession: AgentSession, previousModel: Model, revision: Int) -> Bool {
+        session === candidateSession && modelSelectionRevision == revision &&
+            candidateSession.agent.state.model.provider == previousModel.provider &&
+            candidateSession.agent.state.model.id == previousModel.id
+    }
     private(set) var activeWorkingIndicatorEmbedded = false
     private var startupDiagnostics: [ResourceDiagnostic] = []
     private var startupToolStatuses: [ToolStatus] = []
     private var initialThemeSetting: String?
+    private var injectedTerminal: Terminal?
+    var terminalForNewTui: Terminal { injectedTerminal ?? ProcessTerminal() }
     private var themeController: InteractiveThemeController?
     private var lastSigintTime: TimeInterval = 0
     private var lastEscapeTime: TimeInterval = 0
@@ -330,6 +345,8 @@ public final class InteractiveMode {
     private var streamingComponent: AssistantMessageComponent?
     private var streamingMessage: AssistantMessage?
     private var pendingTools: [String: ToolExecutionComponent] = [:]
+    private let bugReportHints = BugReportHintTracker()
+    private var entriesRenderedByBoundaryCompaction: Set<String> = []
     private var toolOutputExpanded = false
     private var hideThinkingBlock = false
     private let defaultWorkingMessage = "Working"
@@ -382,7 +399,8 @@ public final class InteractiveMode {
         verbose: Bool = false,
         tuiMode: InteractiveTuiMode? = nil,
         startupDiagnostics: [ResourceDiagnostic] = [],
-        initialThemeSetting: String? = nil
+        initialThemeSetting: String? = nil,
+        terminal: Terminal? = nil
     ) {
         self.init(
             chatContainer: Container(),
@@ -392,6 +410,7 @@ public final class InteractiveMode {
         self.tuiModeOverride = tuiMode
         self.startupDiagnostics = startupDiagnostics
         self.initialThemeSetting = initialThemeSetting
+        self.injectedTerminal = terminal
         self.session = session
         self.version = version
         self.changelogMarkdown = changelogMarkdown
@@ -432,6 +451,7 @@ public final class InteractiveMode {
             )
         }
         renderInitialMessages()
+        announceSavedCrashIfNeeded()
         renderStartupDiagnostics()
         tui?.requestRender(force: true)
         await tui?.waitForRender()
@@ -476,7 +496,7 @@ public final class InteractiveMode {
 
         if tui == nil {
             applyInteractiveTerminalCapabilities(session.settingsManager)
-            let created = TUI(terminal: ProcessTerminal(), showHardwareCursor: session.settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
+            let created = TUI(terminal: terminalForNewTui, showHardwareCursor: session.settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
             tui = created
             ui = TuiRenderAdapter(created)
         }
@@ -562,6 +582,7 @@ public final class InteractiveMode {
                 return fuzzyFilter(items, query: query) { $0.value }
             }),
             SlashCommand(name: "share", description: "Share session as a private gist"),
+            SlashCommand(name: "bug", description: "Export a local bug report", argumentHint: "[description]"),
             SlashCommand(name: "trust", description: "Manage project trust"),
             SlashCommand(name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling"),
             SlashCommand(name: "theme", description: "Select theme"),
@@ -579,7 +600,7 @@ public final class InteractiveMode {
             SlashCommand(name: "templates", description: "List prompt templates"),
             SlashCommand(name: "reload", description: "Reload skills, prompts, themes"),
             SlashCommand(name: "export", description: "Export session to HTML"),
-            SlashCommand(name: "copy", description: "Copy last assistant message"),
+            SlashCommand(name: "copy", description: "Copy selection or last assistant message"),
             SlashCommand(name: "name", description: "Set session display name"),
             SlashCommand(name: "session", description: "Show session info"),
             SlashCommand(name: "files", description: "Show file operations in this session"),
@@ -1143,11 +1164,12 @@ public final class InteractiveMode {
         clearWorkingIndicator()
 
         _ = session.sessionManager.newSession(NewSessionOptions(parentSession: options?.parentSession))
-        session.agent.messages = []
 
         if let setup = options?.setup {
             await setup(session.sessionManager)
         }
+        // v0.87.1: the session is canonical; rebuild agent state from it (includes setup entries).
+        session.refreshContext()
 
         chatContainer.clear()
         pendingMessagesContainer?.clear()
@@ -1186,6 +1208,9 @@ public final class InteractiveMode {
     @MainActor
     private func handleHookNavigateTree(_ targetId: String, options: HookNavigateTreeOptions?) async -> HookCommandResult {
         guard let session else { return HookCommandResult(cancelled: true) }
+        guard !session.isCompacting else { return HookCommandResult(cancelled: true) }
+        if options?.summarize == true { setTransientStatus("Summarizing branch") }
+        defer { if transientStatusMessage == "Summarizing branch" { setTransientStatus(nil) } }
 
         let result = await session.navigateTree(
             targetId,
@@ -1194,6 +1219,7 @@ public final class InteractiveMode {
             replaceInstructions: options?.replaceInstructions,
             label: options?.label
         )
+        guard !session.isCompacting else { return HookCommandResult(cancelled: true) }
         if result.cancelled {
             return HookCommandResult(cancelled: true)
         }
@@ -1793,13 +1819,29 @@ public final class InteractiveMode {
         defaultEditor?.setWorkingStatusIndicator(nil)
         statusContainer?.clear()
         activeWorkingIndicatorEmbedded = false
-        guard workingVisible, let loadingAnimation else { return }
+        guard let indicator = transientStatusAnimation ?? (workingVisible ? loadingAnimation : nil) else { return }
         if let workingEditor = editor as? any WorkingStatusEditor, workingEditor.embedWorkingStatus {
-            workingEditor.setWorkingStatusIndicator(loadingAnimation)
+            workingEditor.setWorkingStatusIndicator(indicator)
             activeWorkingIndicatorEmbedded = true
         } else {
-            statusContainer?.addChild(loadingAnimation)
+            statusContainer?.addChild(indicator)
         }
+    }
+
+    private func setTransientStatus(_ message: String?) {
+        transientStatusMessage = message
+        transientStatusAnimation?.stop()
+        transientStatusAnimation = message.flatMap { text in
+            tui.map { tui in
+                let embedded = (editor as? any WorkingStatusEditor)?.embedWorkingStatus == true
+                let color: ((String) -> String)? = embedded ? { [weak self] value in
+                    self?.editor?.borderColor(value) ?? theme.fg(.muted, value)
+                } : nil
+                return WorkingStatusIndicator(ui: tui, message: text, colorFn: color)
+            }
+        }
+        mountWorkingIndicator()
+        ui.requestRender()
     }
 
     private func clearWorkingIndicator() {
@@ -1811,6 +1853,7 @@ public final class InteractiveMode {
             statusContainer?.addChild(Spacer(2))
         }
         activeWorkingIndicatorEmbedded = false
+        if transientStatusAnimation != nil { mountWorkingIndicator() }
     }
 
     func subscribeToAgent() {
@@ -1873,12 +1916,46 @@ public final class InteractiveMode {
         switch event {
         case .agent(let agentEvent):
             handleAgentEvent(agentEvent)
+        case .entryAppended(let entry):
+            // Entries committed by extension boundaries (turn_end / agent_before_settle).
+            if entriesRenderedByBoundaryCompaction.remove(entry.id) != nil { break }
+            switch entry {
+            case .usage(let usageEntry) where usageEntry.kind == "cache_warm":
+                addCacheWarmingUsage(usageEntry)
+                scheduleRender()
+            case .customMessage(let entry) where entry.display:
+                addMessageToChat(makeHookAgentMessage(HookMessage(customType: entry.customType, content: entry.content, display: entry.display, details: entry.details, timestamp: 0)))
+                scheduleRender()
+            case .custom(let entry):
+                if let renderer = session?.hookRunner?.getEntryRenderer(entry.customType) {
+                    let component = CustomEntryComponent(entry: entry, renderer: renderer)
+                    component.setExpanded(toolOutputExpanded)
+                    chatContainer.addChild(component)
+                    scheduleRender()
+                }
+            case .compaction(let compaction):
+                guard let session else { break }
+                let entries = session.sessionManager.buildContextEntries()
+                guard entries.first?.id == compaction.id else { break }
+                let branch = session.sessionManager.getBranch()
+                guard let compactionIndex = branch.firstIndex(where: { $0.id == compaction.id }) else { break }
+                let afterIDs = Set(branch.dropFirst(compactionIndex + 1).map(\.id))
+                let retained = Array(entries.dropFirst())
+                let before = retained.filter { !afterIDs.contains($0.id) }
+                let after = retained.filter { afterIDs.contains($0.id) }
+                renderInitialMessages(entries: before + [entry] + after)
+                entriesRenderedByBoundaryCompaction.formUnion(afterIDs)
+                footer?.invalidate()
+            default:
+                break
+            }
         case .agentSettled:
             // Hook follow-ups and persisted display-only entries settle after agent_end.
             renderInitialMessages()
         case .autoCompactionStart:
-            showStatus("Auto-compaction started")
+            setTransientStatus("Compacting")
         case .autoCompactionEnd(let result, let aborted, _):
+            setTransientStatus(nil)
             if aborted {
                 showStatus("Auto-compaction cancelled")
             } else if let result {
@@ -1898,11 +1975,23 @@ public final class InteractiveMode {
                 showStatus("Compaction completed")
             }
         case .autoRetryStart(let attempt, let maxAttempts, _, let errorMessage):
-            showStatus("Retrying (\(attempt)/\(maxAttempts)): \(errorMessage)")
+            setTransientStatus("Retrying (\(attempt)/\(maxAttempts)): \(errorMessage)")
         case .autoRetryEnd(let success, let attempt, let finalError):
+            setTransientStatus(nil)
             if !success {
                 showError("Retry failed after \(attempt) attempts: \(finalError ?? "Unknown error")")
             }
+        }
+    }
+
+    /// The `/bug` hint is shown at most once per session so error output stays readable.
+    @MainActor
+    private func maybeSuggestBugReport(_ message: AssistantMessage, sessionId: String) {
+        let tracker = bugReportHints
+        Task { @MainActor [weak self] in
+            guard await tracker.shouldSuggest(sessionId: sessionId, message: message), let self else { return }
+            self.chatContainer.addChild(Text(theme.fg(.muted, "If this looks like a pi bug, /bug sends a report to the developers."), paddingX: 1, paddingY: 0))
+            self.scheduleRender()
         }
     }
 
@@ -1989,6 +2078,7 @@ public final class InteractiveMode {
                         component.updateResult(result, isPartial: false)
                     }
                     pendingTools.removeAll()
+                    maybeSuggestBugReport(assistant, sessionId: session.sessionManager.getSessionId())
                 } else {
                     for component in pendingTools.values {
                         component.setArgsComplete()
@@ -2085,6 +2175,7 @@ public final class InteractiveMode {
         var toolCalls: [String: (name: String, args: [String: AnyCodable])] = [:]
 
         let entries = suppliedEntries ?? interactiveContextEntries(session.sessionManager)
+        let thinkingNotices = thinkingDropNoticesByEntryID(session.sessionManager.getBranch())
         let cacheMisses = settingsManagerCacheMisses(session, entries: entries)
         for entry in entries {
             switch entry {
@@ -2098,7 +2189,8 @@ public final class InteractiveMode {
                     }
                 }
                 addMessageToChat(message)
-                if assistant.stopReason != .aborted && assistant.stopReason != .error { maybeShowAssistantDiagnostics(assistant) }
+                if assistant.stopReason != .aborted && assistant.stopReason != .error,
+                   let notice = thinkingNotices[messageEntry.id] { addThinkingDropNotice(notice) }
             case .toolResult(let toolResult):
                 let toolInfo = toolCalls[toolResult.toolCallId]
                 let component = ToolExecutionComponent(
@@ -2136,6 +2228,8 @@ public final class InteractiveMode {
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
+            case .usage(let entry) where entry.kind == "cache_warm":
+                addCacheWarmingUsage(entry)
             default:
                 break
             }
@@ -2157,12 +2251,23 @@ public final class InteractiveMode {
         chatContainer.addChild(Text(theme.fg(.warning, summaryCostNotice(usage: usage, branch: branch)), paddingX: 1, paddingY: 0))
     }
 
+    @MainActor
+    func addCacheWarmingUsage(_ entry: UsageEntry) {
+        guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
+        chatContainer.addChild(Spacer(1))
+        chatContainer.addChild(Text(theme.fg(.dim, formatCacheWarmingUsage(entry)), paddingX: 1, paddingY: 0))
+    }
+
     func maybeShowAssistantDiagnostics(_ message: AssistantMessage) {
         guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
-        for notice in assistantDiagnosticNotices(message) {
-            chatContainer.addChild(Spacer(1))
-            chatContainer.addChild(Text(theme.fg(.warning, notice), paddingX: 1, paddingY: 0))
-        }
+        guard let notice = session?.sessionManager.newThinkingDropNotice(for: message) else { return }
+        addThinkingDropNotice(notice)
+    }
+
+    private func addThinkingDropNotice(_ notice: ThinkingDropNotice) {
+        guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
+        chatContainer.addChild(Spacer(1))
+        chatContainer.addChild(Text(theme.fg(.warning, thinkingDropNoticeText(notice)), paddingX: 1, paddingY: 0))
     }
 
     @MainActor
@@ -2173,6 +2278,9 @@ public final class InteractiveMode {
     @MainActor
     private func addMessageToChat(_ message: AgentMessage) {
         switch message {
+        case .system:
+            // System messages carry the prompt and tool state; they have no chat row.
+            break
         case .user(let user):
             let text = extractUserContentText(user.content)
             chatContainer.addChild(UserMessageComponent(text: text, markdownConfiguration: tuiConfiguration))
@@ -2920,6 +3028,7 @@ public final class InteractiveMode {
     @MainActor
     private func cycleModel(direction: ModelCycleDirection) async {
         guard let session else { return }
+        recordUserModelSelection()
         do {
             let result = try await session.cycleModel(direction: direction == .forward ? .forward : .backward, options: ModelMutationOptions(persist: false))
             if let result {
@@ -3040,9 +3149,14 @@ public final class InteractiveMode {
             return
         }
 
-        if let text = readClipboardText() {
+        switch readClipboardText() {
+        case .content(let text):
             editor.insertTextAtCursor(text)
             scheduleRender()
+        case .error(let message):
+            showStatus("Paste failed: \(message)")
+        case .empty, .unavailable:
+            break
         }
     }
 
@@ -3096,6 +3210,12 @@ public final class InteractiveMode {
             await handleShareCommand()
             return
         }
+        if trimmed == "/bug" || trimmed.hasPrefix("/bug ") || trimmed.hasPrefix("/bug\n") {
+            let hint = trimmed == "/bug" ? nil : String(trimmed.dropFirst(5))
+            editor.setText("")
+            await handleBugCommand(hint)
+            return
+        }
         if trimmed == "/theme" {
             showThemeSelector()
             editor.setText("")
@@ -3138,7 +3258,7 @@ public final class InteractiveMode {
             return
         }
         if trimmed == "/session" {
-            handleSessionCommand()
+            await handleSessionCommand()
             editor.setText("")
             return
         }
@@ -3303,11 +3423,18 @@ public final class InteractiveMode {
     private func handleBashCommand(_ command: String, excludeFromContext: Bool = false) async {
         guard let tui, let session else { return }
 
-        let eventResult = await session.hookRunner?.emitUserBash(UserBashEvent(
-            command: command,
-            excludeFromContext: excludeFromContext,
-            cwd: FileManager.default.currentDirectoryPath
-        ))
+        let eventResult: UserBashEventResult?
+        do {
+            eventResult = try await session.hookRunner?.emitUserBash(UserBashEvent(
+                command: command,
+                excludeFromContext: excludeFromContext,
+                cwd: FileManager.default.currentDirectoryPath
+            ))
+        } catch {
+            // user_bash fails closed (v0.86.0): the runner already reported the error;
+            // never fall back to local execution.
+            return
+        }
 
         if let result = eventResult?.result {
             let component = BashExecutionComponent(command: command, ui: tui)
@@ -3462,6 +3589,7 @@ public final class InteractiveMode {
             steeringMode: settingsManager.getSteeringMode(),
             followUpMode: settingsManager.getFollowUpMode(),
             transport: settingsManager.getTransport(),
+            cacheWarmingMode: settingsManager.getCacheWarmingMode(),
             thinkingLevel: ThinkingLevel(rawValue: settingsManager.getDefaultThinkingLevel() ?? "") ?? DEFAULT_THINKING_LEVEL,
             availableThinkingLevels: availableThinking,
             currentTheme: themeController?.getThemeSelection() ?? "dark",
@@ -3523,6 +3651,9 @@ public final class InteractiveMode {
                 onTransportChange: { transport in
                     settingsManager.setTransport(transport)
                     session.agent.transport = transport
+                },
+                onCacheWarmingModeChange: { mode in
+                    Task { @MainActor in await session.setCacheWarmingMode(mode) }
                 },
                 onThinkingLevelChange: { _ in },
                 onThemeChange: { [weak self] name in
@@ -3723,6 +3854,7 @@ public final class InteractiveMode {
             showModelSelector()
             return
         }
+        recordUserModelSelection()
 
         if let model = await findExactModelMatch(trimmed) {
             do {
@@ -3774,6 +3906,7 @@ public final class InteractiveMode {
         guard let session, let tui else { return }
         showSelector { done in
             let select: (Model, Bool) -> Void = { [weak self] model, persist in
+                self?.recordUserModelSelection()
                 Task { @MainActor in
                     do {
                         try await session.setModel(model, options: ModelMutationOptions(persist: persist))
@@ -3999,6 +4132,7 @@ public final class InteractiveMode {
     @MainActor
     private func showTreeSelector() {
         guard let session else { return }
+        if session.isCompacting { return }
         let tree = session.sessionManager.getTree()
         let leafId = session.sessionManager.getLeafId()
         let height = tui?.terminal.rows ?? 24
@@ -4009,11 +4143,13 @@ public final class InteractiveMode {
                 currentLeafId: leafId,
                 terminalHeight: height,
                 onSelect: { [weak self] entryId in
+                    done()
                     Task {
                         guard let self else { return }
+                        guard !session.isCompacting else { return }
                         let result = await session.navigateTree(entryId, summarize: false, customInstructions: nil)
+                        guard !session.isCompacting else { return }
                         if result.cancelled {
-                            done()
                             self.showStatus("Navigation cancelled")
                             return
                         }
@@ -4022,7 +4158,6 @@ public final class InteractiveMode {
                         if let editorText = result.editorText {
                             self.editor?.setText(editorText)
                         }
-                        done()
                         self.showStatus("Navigated to selected point")
                     }
                 },
@@ -4042,11 +4177,11 @@ public final class InteractiveMode {
         guard let session else { return }
         showSelector { done in
             let selector = SessionSelectorComponent(
-                currentSessionsLoader: { onProgress in
-                    await SessionManager.list(session.sessionManager.getCwd(), session.sessionManager.getSessionDir(), onProgress)
+                currentSessionsLoader: { onPartial in
+                    try await SessionManager.list(session.sessionManager.getCwd(), session.sessionManager.getSessionDir(), onPartial: onPartial)
                 },
-                allSessionsLoader: { onProgress in
-                    await SessionManager.listAll(onProgress)
+                allSessionsLoader: { onPartial in
+                    try await SessionManager.listAll(onPartial: onPartial)
                 },
                 onSelect: { [weak self] sessionPath in
                     guard let self else { return }
@@ -4290,22 +4425,33 @@ public final class InteractiveMode {
     @MainActor
     private func refreshProviderCatalogInBackground(providerId: String, actionLabel: String) {
         guard let session else { return }
+        let modelAtStart = session.agent.state.model
+        let selectionRevision = modelSelectionRevision
         Task { @MainActor [weak self] in
             let outcome = await runBoundedCatalogRefresh(
                 registry: session.modelRegistry,
+                providers: [providerId],
                 signal: CancellationToken()
             )
-            guard let self else { return }
+            guard let self, self.session === session else { return }
             if let warning = CatalogRefreshStatus.authMessage(outcome, actionLabel: actionLabel) {
                 self.showWarning(warning)
             }
-            if actionLabel.hasPrefix("Logged in"), !session.modelRegistry.hasConfiguredAuth(session.agent.state.model) {
+            if actionLabel.hasPrefix("Logged in"),
+               self.canApplyPostLoginSelection(session, previousModel: modelAtStart, revision: selectionRevision),
+               !session.modelRegistry.hasConfiguredAuth(session.agent.state.model) {
                 let available = await session.modelRegistry.getAvailable().filter { $0.provider == providerId }
                 if let model = await selectDefaultModel(available: available, registry: session.modelRegistry) {
+                    guard self.canApplyPostLoginSelection(session, previousModel: modelAtStart, revision: selectionRevision) else { return }
                     do {
                         try await session.setModel(model, options: ModelMutationOptions(persist: true))
                         self.updateEditorBorderColor()
                     } catch { self.showError(error.localizedDescription) }
+                } else if self.canApplyPostLoginSelection(session, previousModel: modelAtStart, revision: selectionRevision) {
+                    let detail = available.isEmpty
+                        ? "no models are available for that provider"
+                        : "its default model is not available"
+                    self.showError("\(actionLabel), but \(detail). Use /model to select a model.")
                 }
             } else {
                 await session.refreshActiveModel()
@@ -4321,6 +4467,29 @@ public final class InteractiveMode {
         await shareSession(session: session, tui: tui, editorContainer: editorContainer, editor: editor,
                            showStatus: { [weak self] in self?.showStatus($0) },
                            showError: { [weak self] in self?.showError($0) })
+    }
+
+    @MainActor
+    private func handleBugCommand(_ hint: String?) async {
+        guard let session, let tui, let editorContainer, let editor else { return }
+        let flow = BugReportUI(session: session, tui: tui, editorContainer: editorContainer, editor: editor,
+                               showStatus: { [weak self] in self?.showStatus($0) },
+                               showError: { [weak self] in self?.showError($0) })
+        await flow.run(initialHint: hint)
+    }
+
+    @MainActor
+    func announceSavedCrashIfNeeded() {
+        guard let crash = crashLog.takeUnannounced() else { return }
+        showWarning("Pi crashed during the previous session. Use /bug to export a report.")
+        let paths = session?.resourceLoader.getExtensions().paths ?? []
+        let extensions = paths.map { path in
+            CrashExtension(label: URL(fileURLWithPath: path).lastPathComponent, dylibPath: path)
+        }
+        let matches = findExtensionStackMatches(crash.stack, extensions: extensions)
+        if !matches.isEmpty {
+            showWarning("The crash stack mentions loaded extensions: \(matches.joined(separator: ", "))")
+        }
     }
 
     @MainActor
@@ -4352,21 +4521,32 @@ public final class InteractiveMode {
             return
         }
 
-        do {
-            try copyToClipboard(text)
+        switch clipboardCopy(text) {
+        case .success:
             if tui?.mode == .altScreen {
                 altScreenRenderer?.flash("Copied!")
             } else {
                 showStatus("Copied last agent message to clipboard")
             }
-        } catch {
-            showError(String(describing: error))
+        case .osc52SentUnverified:
+            let notice = "Sent a copy request to the terminal; clipboard not verified"
+            if tui?.mode == .altScreen {
+                altScreenRenderer?.flash(notice, durationMilliseconds: 5_000)
+            } else {
+                showStatus(notice)
+            }
+        case .failure(let message):
+            if tui?.mode == .altScreen {
+                altScreenRenderer?.flash(message, durationMilliseconds: 5_000)
+            }
+            showError(message)
         }
     }
 
     @MainActor
-    private func handleSessionCommand() {
+    func handleSessionCommand() async {
         guard let session else { return }
+        let cacheWarmingStatus = await session.cacheWarmingStatus()
         let stats = session.getSessionStats()
         let sessionName = session.sessionManager.getSessionName()
         let formatter = NumberFormatter()
@@ -4397,6 +4577,13 @@ public final class InteractiveMode {
             info += "\(theme.fg(.dim, "Cache Write:")) \(formatNumber(stats.tokens.cacheWrite))\n"
         }
         info += "\(theme.fg(.dim, "Total:")) \(formatNumber(stats.tokens.total))\n"
+        info += "\n\(theme.bold("Cache Warming"))\n"
+        info += "\(theme.fg(.dim, "Mode:")) \(session.settingsManager.getCacheWarmingMode().rawValue)\n"
+        info += "\(theme.fg(.dim, "Status:")) \(cacheWarmingStatus.map { formatCacheWarmingStatus($0) } ?? "Inactive (cache warming unavailable)")\n"
+        if let decision = cacheWarmingStatus?.decision, decision.economicsAvailable {
+            info += "\(theme.fg(.dim, "Cache miss penalty:")) $\(String(format: "%.3f", decision.missCost))\n"
+            info += "\(theme.fg(.dim, "Refresh cost:")) $\(String(format: "%.3f", decision.warmCost))\n"
+        }
         if stats.cost > 0 {
             info += "\n\(theme.bold("Cost"))\n"
             info += "\(theme.fg(.dim, "Total:")) \(String(format: "%.4f", stats.cost))"
@@ -4496,7 +4683,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleHotkeysCommand() {
+    func handleHotkeysCommand() {
         let cursorWordLeft = getEditorKeyDisplay(.cursorWordLeft)
         let cursorWordRight = getEditorKeyDisplay(.cursorWordRight)
         let cursorLineStart = getEditorKeyDisplay(.cursorLineStart)
@@ -4520,6 +4707,7 @@ public final class InteractiveMode {
         let externalEditor = getAppKeyDisplay(.externalEditor)
         let followUp = getAppKeyDisplay(.followUp)
         let dequeue = getAppKeyDisplay(.dequeue)
+        let copyMessage = getAppKeyDisplay(.copyMessage)
 
         var hotkeys = """
 **Navigation**
@@ -4554,6 +4742,7 @@ public final class InteractiveMode {
 | `\(externalEditor)` | Edit message in external editor |
 | `\(followUp)` | Queue follow-up message |
 | `\(dequeue)` | Restore queued messages |
+| `\(copyMessage)` | Copy selection or last assistant message |
 | `Ctrl+V` | Paste image from clipboard |
 | `/` | Slash commands |
 | `!` | Run bash command |
@@ -4705,7 +4894,7 @@ public final class InteractiveMode {
     private func handleNewSessionCommand() {
         guard let session else { return }
         _ = session.sessionManager.newSession()
-        session.agent.messages = []
+        session.refreshContext()
         chatContainer.clear()
         showStatus("New session started")
         scheduleRender()
@@ -4739,8 +4928,9 @@ public final class InteractiveMode {
         clearWorkingIndicator()
         if session.settingsManager.getShowTerminalProgress() { tui?.terminal.setProgress(true) }
         showStatus("Compacting...")
+        setTransientStatus("Compacting")
         Task { @MainActor in
-            defer { tui?.terminal.setProgress(false) }
+            defer { tui?.terminal.setProgress(false); setTransientStatus(nil) }
             do {
                 _ = try await session.compact(customInstructions: customInstructions)
                 var entries = interactiveContextEntries(session.sessionManager)

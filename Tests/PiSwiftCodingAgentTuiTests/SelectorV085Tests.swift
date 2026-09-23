@@ -233,7 +233,7 @@ struct SelectorV085Tests {
         selector.updateModels([selectorModel("a")])
         let output = selectorText(selector)
         #expect(output.contains("→   test/b [unavailable]"))
-        #expect(output.contains("1 unavailable"))
+        #expect(output.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).contains("1 unavailable"))
         #expect(selector.render(width: 120).joined().contains("\u{001B}[9m"))
         selector.closeSelector()
         #expect(selector.refreshSignal.isCancelled)

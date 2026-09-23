@@ -24,13 +24,21 @@ private final class PendingHookRequests: Sendable {
 
 final class RpcOutput: Sendable {
     private let write: @Sendable ([String: Any]) -> Void
+    private let writeLine: @Sendable (String) -> Void
 
     init(output: MachineReadableOutput) {
         self.write = { output.writeJSONLine($0) }
+        self.writeLine = { output.writeString($0 + "\n") }
     }
 
     init(write: @escaping @Sendable ([String: Any]) -> Void) {
         self.write = write
+        self.writeLine = { line in
+            if let data = line.data(using: .utf8),
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                write(object)
+            }
+        }
     }
 
     static func takeOverStdout() -> RpcOutput {
@@ -39,6 +47,11 @@ final class RpcOutput: Sendable {
 
     func send(_ object: [String: Any]) {
         write(object)
+    }
+
+    /// Send an already-serialized JSON line (keeps ordered system-prompt sections intact).
+    func sendLine(_ line: String) {
+        writeLine(line)
     }
 }
 
@@ -373,7 +386,7 @@ public func runRpcMode(_ session: AgentSession) async {
     await session.emitCustomToolSessionEvent(.start, previousSessionFile: nil)
 
     _ = session.subscribe { event in
-        output.send(encodeSessionEvent(event))
+        output.sendLine(encodeSessionEventJSON(event))
     }
 
     while let line = readLine() {
@@ -458,14 +471,14 @@ func handleRpcCommand(
         guard let message = dict["message"] as? String else {
             return makeErrorResponse(idValue, "steer", "Missing message")
         }
-        session.steer(message)
+        await session.steer(message, images: decodeImages(dict["images"]), source: .rpc)
         return makeSuccessResponse(idValue, "steer", nil)
 
     case "follow_up":
         guard let message = dict["message"] as? String else {
             return makeErrorResponse(idValue, "follow_up", "Missing message")
         }
-        session.followUp(message)
+        await session.followUp(message, images: decodeImages(dict["images"]), source: .rpc)
         return makeSuccessResponse(idValue, "follow_up", nil)
 
     case "clear_queue":

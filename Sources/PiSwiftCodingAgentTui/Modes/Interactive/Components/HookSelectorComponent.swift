@@ -12,6 +12,7 @@ public final class HookSelectorComponent: Container {
     public init(
         title: String,
         options: [String],
+        description: String? = nil,
         onSelect: @escaping (String) -> Void,
         onCancel: @escaping () -> Void
     ) {
@@ -25,6 +26,10 @@ public final class HookSelectorComponent: Container {
         addChild(Spacer(1))
         addChild(Text(theme.fg(.accent, title), paddingX: 1, paddingY: 0))
         addChild(Spacer(1))
+        if let description, !description.isEmpty {
+            addChild(Text(theme.fg(.dim, description), paddingX: 1, paddingY: 0))
+            addChild(Spacer(1))
+        }
 
         addChild(listContainer)
 

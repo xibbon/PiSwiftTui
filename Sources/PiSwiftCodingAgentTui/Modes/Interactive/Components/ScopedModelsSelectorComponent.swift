@@ -146,7 +146,7 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
         addChild(DynamicBorder())
         addChild(Spacer(1))
         addChild(Text(theme.fg(.accent, theme.bold("Model Configuration")), paddingX: 0, paddingY: 0))
-        addChild(Text(theme.fg(.muted, "Session-only. Ctrl+S to save to settings."), paddingX: 0, paddingY: 0))
+        addChild(Text(theme.fg(.muted, "Session-only. \(selectorKeyText("app.models.save")) to save to settings."), paddingX: 0, paddingY: 0))
         addChild(Spacer(1))
         addChild(searchInput)
         addChild(Spacer(1))
@@ -208,7 +208,7 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
         let allEnabled = enabledIds == nil
         let unavailable = enabledIds?.filter { modelsById[$0] == nil }.count ?? 0
         let countText = allEnabled ? "all enabled" : "\(enabledCount)/\(allIds.count) enabled\(unavailable > 0 ? " · \(unavailable) unavailable" : "")"
-        let parts = ["Enter toggle", "^A all", "^X clear", "^P provider", "Alt+Up/Down reorder", "^S save", countText]
+        let parts = ["\(formatKeys(getKeybindings().getKeys(TUIKeybinding.selectConfirm))) toggle", "\(selectorKeyText("app.models.enableAll")) all", "\(selectorKeyText("app.models.clearAll")) clear", "\(selectorKeyText("app.models.toggleProvider")) provider", "\(selectorKeyText("app.models.reorderUp"))/\(selectorKeyText("app.models.reorderDown")) reorder", "\(selectorKeyText("app.models.save")) save", countText]
         let hint = theme.fg(.dim, "  \(parts.joined(separator: " · "))")
         if isDirty {
             return hint + theme.fg(.warning, " (unsaved)")
@@ -272,9 +272,9 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
             return
         }
 
-        if matchesKey(data, Key.alt("up")) || matchesKey(data, Key.alt("down")) {
+        if selectorKeyMatches(data, "app.models.reorderUp") || selectorKeyMatches(data, "app.models.reorderDown") {
             guard enabledIds != nil, let item = filteredItems[safe: selectedIndex], isEnabled(enabledIds, item.fullId) else { return }
-            let delta = matchesKey(data, Key.alt("up")) ? -1 : 1
+            let delta = selectorKeyMatches(data, "app.models.reorderUp") ? -1 : 1
             let enabledList = enabledIds ?? allIds
             guard let currentIndex = enabledList.firstIndex(of: item.fullId) else { return }
             let newIndex = currentIndex + delta
@@ -296,7 +296,7 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
             return
         }
 
-        if matchesKey(data, Key.ctrl("a")) {
+        if selectorKeyMatches(data, "app.models.enableAll") {
             let targetIds = searchInput.getValue().isEmpty ? nil : filteredItems.map { $0.fullId }
             enabledIds = enableAll(enabledIds, allIds, targetIds: targetIds)
             isDirty = true
@@ -305,7 +305,7 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
             return
         }
 
-        if matchesKey(data, Key.ctrl("x")) {
+        if selectorKeyMatches(data, "app.models.clearAll") {
             let targetIds = searchInput.getValue().isEmpty ? nil : filteredItems.map { $0.fullId }
             enabledIds = clearAll(enabledIds, allIds, targetIds: targetIds)
             isDirty = true
@@ -314,7 +314,7 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
             return
         }
 
-        if matchesKey(data, Key.ctrl("p")) {
+        if selectorKeyMatches(data, "app.models.toggleProvider") {
             guard let item = filteredItems[safe: selectedIndex] else { return }
             guard let provider = item.model?.provider else { return }
             let providerIds = allIds.filter { modelsById[$0]?.provider == provider }
@@ -328,7 +328,7 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
             return
         }
 
-        if matchesKey(data, Key.ctrl("s")) {
+        if selectorKeyMatches(data, "app.models.save") {
             callbacks.onPersist(enabledIds)
             isDirty = false
             footerText.setText(getFooterText())

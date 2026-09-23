@@ -20,6 +20,22 @@ struct SessionShareDependencies: Sendable {
     }
 }
 
+/// Add presentation metadata to an exported branch without changing the saved session.
+func createShareTrailingEntries(session: AgentSession, parentId: String?, timestamp: String) -> [[String: AnyCodable]] {
+    let tools = session.agent.state.tools.map { tool in
+        ["name": AnyCodable(tool.name), "description": AnyCodable(tool.description),
+         "parameters": AnyCodable(tool.parameters.mapValues(\.jsonValue))]
+    }
+    return [[
+        "type": AnyCodable("custom"), "customType": AnyCodable("pi.share"),
+        "id": AnyCodable(String(UUID().uuidString.prefix(8)).lowercased()),
+        "parentId": AnyCodable(parentId ?? NSNull() as Any),
+        "timestamp": AnyCodable(timestamp),
+        "data": AnyCodable(["systemPrompt": session.agent.state.systemPrompt,
+                             "tools": tools.map { $0.mapValues(\.jsonValue) }] as [String: Any])
+    ]]
+}
+
 @MainActor
 func shareSession(
     session: AgentSession,

@@ -36,13 +36,25 @@ public final class FooterComponent: Component {
         var totalCost: Double = 0
 
         for entry in session.sessionManager.getEntries() {
-            if case let .message(messageEntry) = entry,
-               case let .assistant(message) = messageEntry.message {
-                totalInput += message.usage.input
-                totalOutput += message.usage.output
-                totalCacheRead += message.usage.cacheRead
-                totalCacheWrite += message.usage.cacheWrite
-                totalCost += message.usage.cost.total
+            let usage: Usage?
+            switch entry {
+            case .usage(let usageEntry): usage = usageEntry.usage
+            case .message(let messageEntry):
+                switch messageEntry.message {
+                case .assistant(let message): usage = message.usage
+                case .toolResult(let result): usage = result.usage
+                default: usage = nil
+                }
+            case .compaction(let summary): usage = summary.usage
+            case .branchSummary(let summary): usage = summary.usage
+            default: usage = nil
+            }
+            if let usage {
+                totalInput += usage.input
+                totalOutput += usage.output
+                totalCacheRead += usage.cacheRead
+                totalCacheWrite += usage.cacheWrite
+                totalCost += usage.cost.total
             }
         }
 

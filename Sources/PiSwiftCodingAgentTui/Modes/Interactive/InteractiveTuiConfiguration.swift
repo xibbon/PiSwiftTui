@@ -103,7 +103,7 @@ public struct InteractiveComposition {
             .entry(StackEntry(widgets, options: StackEntryOptions(shrink: 1, minSize: 0))),
             .entry(StackEntry(editorSpacer, options: StackEntryOptions(shrink: 1, minSize: 0))),
             .entry(StackEntry(editor, options: StackEntryOptions(shrink: 1, minSize: 3))),
-            .entry(StackEntry(footer, options: StackEntryOptions(shrink: 1, minSize: 1))),
+            .entry(StackEntry(footer, options: StackEntryOptions(shrink: 1, minSize: 0))),
         ])
         fullscreenRoot = VStack(children: [
             .entry(StackEntry(
@@ -122,6 +122,7 @@ public struct InteractiveComposition {
 public func interactiveAltScreenOptions(
     wheelScrollLines: Int = 1,
     copyOnSelect: Bool = true,
+    copySelection: @escaping @MainActor (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard,
     onRightClickPaste: (() -> Void)? = nil,
     openURL: ((String) -> Void)? = nil
 ) -> AltScreenRendererOptions {
@@ -147,7 +148,14 @@ public func interactiveAltScreenOptions(
         },
         copyOnSelect: copyOnSelect,
         copySelection: { text in
-            do { try copyToClipboard(text); return true } catch { return false }
+            switch copySelection(text) {
+            case .success:
+                return .copied
+            case .osc52SentUnverified:
+                return .failed("Sent a copy request to the terminal; clipboard not verified")
+            case .failure(let message):
+                return .failed(message)
+            }
         }
     )
 }

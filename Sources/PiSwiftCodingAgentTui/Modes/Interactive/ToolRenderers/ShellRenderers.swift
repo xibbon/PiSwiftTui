@@ -118,7 +118,7 @@ public func createShellRenderers(prompt: String) -> ToolRenderers {
                 component.addChild(Text("\n" + theme.fg(.warning, "[\(warnings.joined(separator: ". "))]"), paddingX: 0, paddingY: 0))
             }
             if let startedAt = state.startedAt {
-                let duration = String(format: "%.1fs", (state.endedAt ?? Date()).timeIntervalSince(startedAt))
+                let duration = formatShellDuration((state.endedAt ?? Date()).timeIntervalSince(startedAt))
                 let label = options.isPartial && !context.isError ? "Elapsed" : "Took"
                 component.addChild(Text("\n" + theme.fg(.muted, "\(label) \(duration)"), paddingX: 0, paddingY: 0))
             }
@@ -126,6 +126,15 @@ public func createShellRenderers(prompt: String) -> ToolRenderers {
             return component
         }
     )
+}
+
+func formatShellDuration(_ seconds: TimeInterval) -> String {
+    if seconds < 60 { return String(format: "%.1fs", seconds) }
+    let whole = Int(seconds)
+    let minutes = whole / 60
+    let remainingSeconds = whole % 60
+    if minutes < 60 { return "\(minutes)m \(remainingSeconds)s" }
+    return "\(minutes / 60)h \(minutes % 60)m \(remainingSeconds)s"
 }
 
 @MainActor
