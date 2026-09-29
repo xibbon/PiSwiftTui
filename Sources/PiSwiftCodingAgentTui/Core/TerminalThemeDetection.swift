@@ -3,8 +3,10 @@ import MiniTui
 
 @MainActor
 public protocol TerminalThemeProbing: AnyObject {
-    func queryTerminalColorScheme(timeoutMs: Int) async -> TerminalColorScheme?
-    func queryTerminalBackgroundColor(timeoutMs: Int) async -> RgbColor?
+    func queryTerminalColors(
+        timeoutMs: Int,
+        onLateReply: (@MainActor (TerminalColors) -> Void)?
+    ) async -> TerminalColors
 }
 
 extension TUI: TerminalThemeProbing {}
@@ -32,26 +34,21 @@ public func terminalTheme(for color: RgbColor) -> TerminalColorScheme {
     return luminance >= 0.5 ? .light : .dark
 }
 
+/// The reported background decides, then a light/dark report the terminal sent earlier, then
+/// `COLORFGBG`, then dark (upstream v0.99.1 `detectTerminalTheme`).
 @MainActor
 public func detectTerminalTheme(
     ui: any TerminalThemeProbing,
     timeoutMs: Int = 100,
+    reportedScheme: TerminalColorScheme? = nil,
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) async -> TerminalColorScheme {
-    let colorSchemeTask = Task { @MainActor in
-        await ui.queryTerminalColorScheme(timeoutMs: timeoutMs)
+    let colors = await ui.queryTerminalColors(timeoutMs: timeoutMs, onLateReply: nil)
+    if let background = colors.background {
+        return terminalTheme(for: background)
     }
-    let backgroundColorTask = Task { @MainActor in
-        await ui.queryTerminalBackgroundColor(timeoutMs: timeoutMs)
-    }
-    let reportedScheme = await colorSchemeTask.value
-    let reportedBackground = await backgroundColorTask.value
-
     if let reportedScheme {
         return reportedScheme
-    }
-    if let reportedBackground {
-        return terminalTheme(for: reportedBackground)
     }
     return terminalThemeFromEnvironment(environment)
 }

@@ -54,7 +54,7 @@ public final class InteractiveThemeController {
         } else {
             setAutoSync(false)
             // Persist only a terminal response or a valid COLORFGBG background hint.
-            if let background = await ui.queryTerminalBackgroundColor(timeoutMs: 100) {
+            if let background = await ui.queryTerminalColors(timeoutMs: 100, onLateReply: nil).background {
                 terminalTheme = PiSwiftCodingAgentTui.terminalTheme(for: background)
                 if applyThemeName(terminalTheme.rawValue).success {
                     getSettingsManager().setTheme(terminalTheme.rawValue)

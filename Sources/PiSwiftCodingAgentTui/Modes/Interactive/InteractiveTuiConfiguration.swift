@@ -127,7 +127,7 @@ public func interactiveAltScreenOptions(
     openURL: ((String) -> Void)? = nil
 ) -> AltScreenRendererOptions {
     AltScreenRendererOptions(
-        wheelScrollLines: wheelScrollLines,
+        wheelScrollLines: .lines(wheelScrollLines),
         openURL: openURL ?? { url in
             let process = Process()
             #if os(macOS)

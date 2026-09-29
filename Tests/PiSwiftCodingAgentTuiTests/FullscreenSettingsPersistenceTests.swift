@@ -116,10 +116,10 @@ private func withFullscreenSettingsTempDirectories(
 }
 
 private final class ThemeProbeTerminal: Terminal {
+    // pi-mono v0.99.0 replaced the `ESC[?996n` scheme query and the lone OSC 11 query with one
+    // OSC 10/11/4 + DA1 query (`queryTerminalColors`); these probes answer that query.
     enum Reply {
-        case both
-        case schemeOnly
-        case backgroundOnly
+        case lightBackground
         case neither
     }
 
@@ -128,8 +128,6 @@ private final class ThemeProbeTerminal: Terminal {
     let kittyProtocolActive = false
     private let reply: Reply
     private var onInput: ((String) -> Void)?
-    private var sawSchemeQuery = false
-    private var sawBackgroundQuery = false
     private var replied = false
     private(set) var writes: [String] = []
 
@@ -146,21 +144,12 @@ private final class ThemeProbeTerminal: Terminal {
 
     func write(_ data: String) {
         writes.append(data)
-        sawSchemeQuery = sawSchemeQuery || data.contains("\u{001B}[?996n")
-        sawBackgroundQuery = sawBackgroundQuery || data.contains("\u{001B}]11;?\u{0007}")
-        guard !replied else { return }
-
+        guard !replied, data.contains("\u{001B}]11;?\u{0007}") else { return }
         switch reply {
-        case .both where sawSchemeQuery && sawBackgroundQuery:
+        case .lightBackground:
             replied = true
-            onInput?("\u{001B}[?997;2n\u{001B}]11;rgb:0000/0000/0000\u{0007}")
-        case .schemeOnly where sawSchemeQuery:
-            replied = true
-            onInput?("\u{001B}[?997;2n")
-        case .backgroundOnly where sawBackgroundQuery:
-            replied = true
-            onInput?("\u{001B}]11;rgb:ffff/ffff/ffff\u{0007}")
-        default:
+            onInput?("\u{001B}]11;rgb:ffff/ffff/ffff\u{0007}\u{001B}[?1;2c")
+        case .neither:
             break
         }
     }
@@ -177,41 +166,38 @@ private final class ThemeProbeTerminal: Terminal {
 @MainActor
 private func detectedTheme(
     reply: ThemeProbeTerminal.Reply,
+    reportedScheme: TerminalColorScheme? = nil,
     environment: [String: String] = [:]
 ) async -> (TerminalColorScheme, [String]) {
     let terminal = ThemeProbeTerminal(reply: reply)
     let tui = TUI(terminal: terminal)
     tui.start()
-    let result = await detectTerminalTheme(ui: tui, timeoutMs: 10, environment: environment)
+    let result = await detectTerminalTheme(
+        ui: tui, timeoutMs: 10, reportedScheme: reportedScheme, environment: environment
+    )
     tui.stop()
     return (result, terminal.writes)
 }
 
 @MainActor
-@Test func concurrentThemeDetectionPrefersSchemeWhenBothRepliesArrive() async {
-    let (result, writes) = await detectedTheme(reply: .both)
+@Test func themeDetectionPrefersReportedBackground() async {
+    let (result, writes) = await detectedTheme(reply: .lightBackground, reportedScheme: .dark)
     #expect(result == .light)
-    #expect(writes.contains("\u{001B}[?996n"))
-    #expect(writes.contains("\u{001B}]11;?\u{0007}"))
+    #expect(writes.contains { $0.contains("\u{001B}]10;?\u{0007}") && $0.contains("\u{001B}]11;?\u{0007}") })
+    #expect(!writes.contains { $0.contains("\u{001B}[?996n") })
 }
 
 @MainActor
-@Test func concurrentThemeDetectionUsesTheOneAvailableReply() async {
-    let (schemeResult, schemeWrites) = await detectedTheme(reply: .schemeOnly)
-    #expect(schemeResult == .light)
-    #expect(schemeWrites.contains("\u{001B}]11;?\u{0007}"))
-
-    let (backgroundResult, backgroundWrites) = await detectedTheme(reply: .backgroundOnly)
-    #expect(backgroundResult == .light)
-    #expect(backgroundWrites.contains("\u{001B}[?996n"))
+@Test func themeDetectionUsesReportedSchemeWithoutBackground() async {
+    let (result, _) = await detectedTheme(reply: .neither, reportedScheme: .light, environment: ["COLORFGBG": "15;0"])
+    #expect(result == .light)
 }
 
 @MainActor
-@Test func concurrentThemeDetectionTimesOutToExistingEnvironmentFallback() async {
+@Test func themeDetectionTimesOutToExistingEnvironmentFallback() async {
     let (result, writes) = await detectedTheme(reply: .neither, environment: ["COLORFGBG": "15;0"])
     #expect(result == .dark)
-    #expect(writes.contains("\u{001B}[?996n"))
-    #expect(writes.contains("\u{001B}]11;?\u{0007}"))
+    #expect(writes.contains { $0.contains("\u{001B}]11;?\u{0007}") })
 }
 
 @MainActor
