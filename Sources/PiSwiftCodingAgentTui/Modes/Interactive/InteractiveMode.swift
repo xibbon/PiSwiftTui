@@ -1916,6 +1916,10 @@ public final class InteractiveMode {
         switch event {
         case .agent(let agentEvent):
             handleAgentEvent(agentEvent)
+        case .nestedToolExecution:
+            // v0.99.0: nested calls (codemode scripts, ctx.executeTool) are shown inside their
+            // parent's row, not as their own rows (upstream interactive-mode.ts tool_execution_start).
+            break
         case .entryAppended(let entry):
             // Entries committed by extension boundaries (turn_end / agent_before_settle).
             if entriesRenderedByBoundaryCompaction.remove(entry.id) != nil { break }

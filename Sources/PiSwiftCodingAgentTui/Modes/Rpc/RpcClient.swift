@@ -228,6 +228,8 @@ public struct RpcAgentEvent: Sendable {
     public var partialResult: AgentToolResult?
     public var result: AgentToolResult?
     public var isError: Bool?
+    /// v0.99.0: set on `tool_execution_*` events of nested calls made through `ctx.executeTool()`.
+    public var parentToolCallId: String?
 
     public init(
         type: String,
@@ -245,7 +247,8 @@ public struct RpcAgentEvent: Sendable {
         args: [String: AnyCodable]? = nil,
         partialResult: AgentToolResult? = nil,
         result: AgentToolResult? = nil,
-        isError: Bool? = nil
+        isError: Bool? = nil,
+        parentToolCallId: String? = nil
     ) {
         self.type = type
         self.message = message
@@ -263,6 +266,7 @@ public struct RpcAgentEvent: Sendable {
         self.partialResult = partialResult
         self.result = result
         self.isError = isError
+        self.parentToolCallId = parentToolCallId
     }
 }
 
@@ -958,19 +962,19 @@ func decodeAgentEvent(_ dict: [String: Any]) -> RpcAgentEvent? {
         let toolCallId = dict["toolCallId"] as? String ?? ""
         let toolName = dict["toolName"] as? String ?? ""
         let args = (dict["args"] as? [String: Any] ?? [:]).mapValues { AnyCodable($0) }
-        return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, args: args)
+        return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, args: args, parentToolCallId: dict["parentToolCallId"] as? String)
     case "tool_execution_update":
         let toolCallId = dict["toolCallId"] as? String ?? ""
         let toolName = dict["toolName"] as? String ?? ""
         let args = (dict["args"] as? [String: Any] ?? [:]).mapValues { AnyCodable($0) }
         let partial = (dict["partialResult"] as? [String: Any]).map { decodeAgentToolResult($0) }
-        return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, args: args, partialResult: partial)
+        return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, args: args, partialResult: partial, parentToolCallId: dict["parentToolCallId"] as? String)
     case "tool_execution_end":
         let toolCallId = dict["toolCallId"] as? String ?? ""
         let toolName = dict["toolName"] as? String ?? ""
         let result = (dict["result"] as? [String: Any]).map { decodeAgentToolResult($0) }
         let isError = dict["isError"] as? Bool ?? false
-        return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, result: result, isError: isError)
+        return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, result: result, isError: isError, parentToolCallId: dict["parentToolCallId"] as? String)
     default:
         return nil
     }
@@ -1073,7 +1077,11 @@ private func decodeAgentToolResult(_ dict: [String: Any]) -> AgentToolResult {
         guard let dict = block as? [String: Any] else { return nil }
         return contentBlockFromDict(dict)
     }
-    return AgentToolResult(content: contentBlocks, details: details)
+    var result = AgentToolResult(content: contentBlocks, details: details)
+    result.structuredContent = dict["structuredContent"].map { AnyCodable($0) }
+    result.isError = dict["isError"] as? Bool
+    result.usage = (dict["usage"] as? [String: Any]).map(decodeUsage)
+    return result
 }
 
 private func decodeUsage(_ dict: [String: Any]) -> Usage {
