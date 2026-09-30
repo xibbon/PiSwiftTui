@@ -29,6 +29,18 @@ private func stripPatternPrefix(_ pattern: String) -> String {
     return pattern
 }
 
+/// Resolve a built-in using the project override before the global setting.
+public func builtinExtensionSetting(path: String, global: [String], project: [String])
+    -> (enabled: Bool, projectOverride: Bool) {
+    let globalEnabled = !global.contains("-" + path)
+        && (!global.contains("!" + path) || global.contains("+" + path))
+    guard let entry = project.last(where: { stripPatternPrefix($0) == path
+        && ($0.hasPrefix("+") || $0.hasPrefix("-") || $0.hasPrefix("!")) }) else {
+        return (globalEnabled, false)
+    }
+    return (entry.hasPrefix("+"), true)
+}
+
 func updateResourcePatterns(current: [String], pattern: String, enabled: Bool) -> [String] {
     let updated = current.filter { stripPatternPrefix($0) != pattern }
     let entry = (enabled ? "+" : "-") + pattern
@@ -172,6 +184,7 @@ private func getGroupLabel(_ metadata: PathMetadata) -> String {
     if metadata.origin == "package" {
         return "\(metadata.source) (\(metadata.scope))"
     }
+    if metadata.source == "builtin" { return "Built-in extensions" }
     if metadata.source == "auto" {
         return metadata.scope == "user" ? "User (~/.pi/agent/)" : "Project (.pi/)"
     }
@@ -203,7 +216,9 @@ private func buildGroups(_ resolved: ResolvedPaths) -> [ResourceGroup] {
             let fileName = URL(fileURLWithPath: resource.path).lastPathComponent
             let parentFolder = URL(fileURLWithPath: resource.path).deletingLastPathComponent().lastPathComponent
             let displayName: String
-            if resourceType == .extensions, parentFolder != "extensions" {
+            if metadata.source == "builtin" {
+                displayName = String(resource.path.dropFirst(BUILTIN_PATH_PREFIX.count))
+            } else if resourceType == .extensions, parentFolder != "extensions" {
                 displayName = "\(parentFolder)/\(fileName)"
             } else if resourceType == .skills, fileName == "SKILL.md" {
                 displayName = parentFolder
@@ -336,15 +351,23 @@ private final class ResourceList: Component, SystemCursorAware {
         self.searchInput = Input()
         buildFlatList()
         self.filteredItems = flatItems
+        selectFirstItem()
     }
 
     private func buildFlatList() {
         flatItems = []
-        for group in groups where (projectMode ? group.scope == "project" : group.scope == "user") {
+        for group in groups where group.source == "builtin"
+            || (projectMode ? group.scope == "project" : group.scope == "user") {
             flatItems.append(.group(group))
             for subgroup in group.subgroups {
                 flatItems.append(.subgroup(subgroup))
                 for item in subgroup.items {
+                    if item.metadata.source == "builtin" {
+                        let global = settingsManager.getGlobalSettings().extensions ?? []
+                        let project = projectMode ? settingsManager.getProjectSettings().extensions ?? [] : []
+                        item.enabled = builtinExtensionSetting(path: item.path, global: global,
+                            project: project).enabled
+                    }
                     flatItems.append(.item(item))
                 }
             }
@@ -503,6 +526,24 @@ private final class ResourceList: Component, SystemCursorAware {
         if data == " " || kb.matches(data, TUIKeybinding.selectConfirm) {
             guard selectedIndex >= 0, selectedIndex < filteredItems.count else { return }
             guard case .item(let item) = filteredItems[selectedIndex] else { return }
+            if projectMode, item.metadata.source == "builtin" {
+                let global = settingsManager.getGlobalSettings().extensions ?? []
+                let project = settingsManager.getProjectSettings().extensions ?? []
+                let inheritedEnabled = builtinExtensionSetting(path: item.path, global: global,
+                    project: []).enabled
+                let current = project.last(where: { stripPatternPrefix($0) == item.path })
+                let next: String?
+                if current == nil { next = inheritedEnabled ? "-" : "+" }
+                else if current?.hasPrefix("-") == true { next = inheritedEnabled ? "+" : nil }
+                else { next = inheritedEnabled ? nil : "-" }
+                let updated = project.filter { stripPatternPrefix($0) != item.path }
+                    + (next.map { [$0 + item.path] } ?? [])
+                settingsManager.setProjectExtensionPaths(updated)
+                item.enabled = builtinExtensionSetting(path: item.path, global: global,
+                    project: updated).enabled
+                onToggle?(item, item.enabled)
+                return
+            }
             let newEnabled = !item.enabled
             toggleResource(item, enabled: newEnabled)
             item.enabled = newEnabled
@@ -523,7 +564,7 @@ private final class ResourceList: Component, SystemCursorAware {
     }
 
     private func toggleTopLevelResource(_ item: ResourceItem, enabled: Bool) {
-        let scope = item.metadata.scope == "project" ? "project" : "user"
+        let scope = projectMode ? "project" : "user"
         let settings = scope == "project"
             ? settingsManager.getProjectSettings()
             : settingsManager.getGlobalSettings()
@@ -599,6 +640,7 @@ private final class ResourceList: Component, SystemCursorAware {
     }
 
     private func getResourcePattern(_ item: ResourceItem) -> String {
+        if item.metadata.source == "builtin" { return item.path }
         let baseDir = getTopLevelBaseDir(item.metadata.scope)
         return relativePath(from: baseDir, to: item.path)
     }

@@ -94,7 +94,8 @@ private func runConfigSubcommand(_ cli: CLIOptions) async throws {
         agentDir: agentDir,
         settingsManager: settingsManager,
         projectTrusted: trustContext.trust.trusted,
-        offline: cli.offline || CLIOptions.isOfflineEnvironmentEnabled()
+        offline: cli.offline || CLIOptions.isOfflineEnvironmentEnabled(),
+        builtinExtensions: builtInExtensions.map(\.name)
     )
     let resolvedPaths = try await packageManager.resolve()
     await selectConfig(

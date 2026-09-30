@@ -88,7 +88,10 @@ struct CLIOptions: ParsableArguments {
     @Option(name: .customLong("tool"), help: "Load a custom tool file (can be used multiple times)")
     var customTools: [String] = []
 
-    @Flag(name: .customLong("no-extensions"), help: "Disable extension discovery")
+    @Option(name: [.customShort("e"), .customLong("extension")], help: "Load an extension file or builtin:<name> (can be used multiple times)")
+    var extensions: [String] = []
+
+    @Flag(name: .customLong("no-extensions"), help: "Disable extension discovery and built-in extensions (explicit -e paths still work)")
     var noExtensions: Bool = false
 
     @Flag(name: .customLong("offline"), help: "Disable package/update network operations")

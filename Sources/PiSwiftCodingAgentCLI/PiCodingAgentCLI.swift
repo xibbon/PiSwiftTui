@@ -7,6 +7,25 @@ import PiSwiftAgent
 import PiSwiftCodingAgent
 import PiSwiftCodingAgentTui
 
+func selectStartupInlineExtensions(
+    _ extensions: [InlineExtension],
+    disabledPaths: Set<String>,
+    explicitPaths: Set<String>,
+    noExtensions: Bool
+) -> [InlineExtension] {
+    extensions.filter { item in
+        if !item.builtin { return true }
+        let path = BUILTIN_PATH_PREFIX + item.name
+        return explicitPaths.contains(path) || (!noExtensions && !disabledPaths.contains("-" + path))
+    }
+}
+
+func activatesStartupTool(_ definition: CustomTool?) -> Bool {
+    guard let definition else { return true }
+    let exposure = definition.exposure ?? .direct
+    return (exposure == .direct || exposure == .modelOnly) && definition.defaultActive != false
+}
+
 @main
 struct PiCodingAgentCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -274,9 +293,11 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             cwd: cwd,
             agentDir: getAgentDir(),
             settingsManager: settingsManager,
+            additionalExtensionPaths: cli.extensions,
             additionalSkillPaths: parsed.skills ?? [],
             additionalThemePaths: parsed.themes ?? [],
             noExtensions: parsed.noExtensions ?? false,
+            builtinExtensions: builtInExtensions.map(\.name),
             noSkills: parsed.noSkills ?? false,
             noPromptTemplates: parsed.noPromptTemplates ?? false,
             noContextFiles: parsed.noContextFiles ?? false,
@@ -328,26 +349,41 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             ResourceDiagnostic(type: "error", message: "Failed to load custom tool \"\($0.path)\": \($0.error)")
         }
 
-        let extensionPaths = parsed.noExtensions == true ? [] : settingsManager.getExtensionPaths()
-        let extensionResult = parsed.noExtensions == true
-            ? LoadExtensionsResult()
-            : await discoverAndLoadExtensions(
+        let extensionPaths = resourceLoader.getExtensions().paths.filter { !$0.hasPrefix(BUILTIN_PATH_PREFIX) }
+        let discoverDefaultExtensions = parsed.noExtensions != true
+        let extensionResult = await discoverAndLoadExtensions(
                 extensionPaths,
                 cwd,
                 getAgentDir(),
                 eventBus,
-                includeProjectExtensions: trust.trusted
+                includeProjectExtensions: trust.trusted,
+                discoverDefaults: discoverDefaultExtensions
             )
         time("discoverAndLoadExtensions")
         runtimeDiagnostics += extensionResult.errors.map {
             ResourceDiagnostic(type: "error", message: "Failed to load extension: \($0.localizedDescription)")
         }
 
-        // Built-in in-process extensions (compiled into the binary, no dylib involved).
+        // Load built-ins after trust resolution, when project settings are available.
+        let globalExtensionSettings = settingsManager.getGlobalSettings().extensions ?? []
+        let projectExtensionSettings = trust.trusted ? settingsManager.getProjectSettings().extensions ?? [] : []
+        let disabledBuiltinPaths = Set(builtInExtensions.compactMap { item -> String? in
+            let path = BUILTIN_PATH_PREFIX + item.name
+            return builtinExtensionSetting(path: path, global: globalExtensionSettings,
+                project: projectExtensionSettings).enabled ? nil : "-" + path
+        })
+        let explicitBuiltinPaths = Set(cli.extensions.filter { $0.hasPrefix(BUILTIN_PATH_PREFIX) })
+        let knownBuiltinPaths = Set(builtInExtensions.map { BUILTIN_PATH_PREFIX + $0.name })
+        let inlineExtensions = selectStartupInlineExtensions(
+            builtInExtensions + [PiReview.inlineExtension], disabledPaths: disabledBuiltinPaths,
+            explicitPaths: explicitBuiltinPaths, noExtensions: parsed.noExtensions == true
+        )
         let loadInlineExtensions: @Sendable () -> LoadExtensionsResult = {
             var hooks: [LoadedHook] = []
-            var errors: [ExtensionLoadError] = []
-            for inlineExtension in [PiReview.inlineExtension] {
+            var errors: [ExtensionLoadError] = explicitBuiltinPaths.subtracting(knownBuiltinPaths).sorted().map {
+                .invalidExtension(path: $0, reason: "Unknown built-in extension: \($0)")
+            }
+            for inlineExtension in inlineExtensions {
                 let result = ExtensionLoader.load(inlineExtension, cwd: cwd, eventBus: eventBus)
                 if let hook = result.hook {
                     hooks.append(hook)
@@ -363,7 +399,9 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             ResourceDiagnostic(type: "error", message: "Failed to load inline extension: \($0.localizedDescription)")
         }
 
-        let allHooks = hookLoadResult.hooks + extensionResult.hooks + inlineExtensionResult.hooks
+        let replacementResult = omitReplacedExtensions(extensionResult.hooks + inlineExtensionResult.hooks)
+        runtimeDiagnostics += replacementResult.warnings
+        let allHooks = hookLoadResult.hooks + replacementResult.hooks
         let hookRunner: HookRunner? = allHooks.isEmpty ? nil : HookRunner(allHooks, cwd, sessionManager, modelRegistry)
 
         let agentBox = LockedState<Agent?>(nil)
@@ -389,10 +427,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         let wrappedCustomTools = wrapCustomTools(customToolsResult.tools, getCustomToolContext)
             .filter { !disableCustomTools && !excludedToolNames.contains($0.name) }
 
-        let extDefs = (hookRunner?.getExtensionTools() ?? []).map {
+        let extensionToolDefinitions = (hookRunner?.getExtensionTools() ?? []).map {
             LoadedCustomTool(path: "<extension>", resolvedPath: "<extension>", tool: $0)
         }
-        let wrappedExtensionTools = wrapCustomTools(extDefs, getCustomToolContext)
+        let wrappedExtensionTools = wrapCustomTools(extensionToolDefinitions, getCustomToolContext)
             .filter { !disableCustomTools && !excludedToolNames.contains($0.name) }
 
         let selectedToolNameSet = Set(filteredSelectedToolNames.map { $0.rawValue })
@@ -413,8 +451,17 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             toolRegistry.removeValue(forKey: name)
         }
 
-        let initialActiveToolNames = filteredSelectedToolNames.map { $0.rawValue } + extraCustomTools.map { $0.name } + wrappedExtensionTools.map { $0.name }
-        let allTools = selectedTools + extraCustomTools + wrappedExtensionTools
+        let toolDefinitions = Dictionary(
+            (customToolsResult.tools + extensionToolDefinitions).map { ($0.tool.name, $0.tool) },
+            uniquingKeysWith: { _, newer in newer }
+        ).filter { toolRegistry[$0.key] != nil }
+        var seenRegistryNames: Set<String> = []
+        let toolRegistryOrder = (ToolName.allCases.map(\.rawValue) +
+            (wrappedCustomTools + wrappedExtensionTools).map(\.name))
+            .filter { toolRegistry[$0] != nil && seenRegistryNames.insert($0).inserted }
+        let allTools = (selectedTools + extraCustomTools + wrappedExtensionTools)
+            .filter { activatesStartupTool(toolDefinitions[$0.name]) }
+        let initialActiveToolNames = allTools.map(\.name)
 
         let loaderSystemPrompt = resourceLoader.getSystemPrompt()
         let loaderAppend = resourceLoader.getAppendSystemPrompt()
@@ -522,12 +569,15 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 cwd,
                 getAgentDir(),
                 eventBus,
-                includeProjectExtensions: trust.trusted
+                includeProjectExtensions: trust.trusted,
+                discoverDefaults: discoverDefaultExtensions
             )
             let inlineExtensions = loadInlineExtensions()
+            let replaced = omitReplacedExtensions(fileExtensions.hooks + inlineExtensions.hooks)
             return LoadExtensionsResult(
-                hooks: fileExtensions.hooks + inlineExtensions.hooks,
-                errors: fileExtensions.errors + inlineExtensions.errors
+                hooks: replaced.hooks,
+                errors: fileExtensions.errors + inlineExtensions.errors,
+                warnings: fileExtensions.warnings + inlineExtensions.warnings + replaced.warnings
             )
         }
 
@@ -549,6 +599,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             skillsSettings: skillsSettings,
             eventBus: eventBus,
             toolRegistry: toolRegistry,
+            toolRegistryOrder: toolRegistryOrder,
+            toolDefinitions: toolDefinitions,
             rebuildSystemPrompt: rebuildSystemPrompt,
             reloadExtensionsHook: reloadExtensionsHook,
             wrapExtensionTools: { tools in

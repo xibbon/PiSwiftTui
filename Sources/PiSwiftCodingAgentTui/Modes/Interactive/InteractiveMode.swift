@@ -6,6 +6,10 @@ import PiSwiftAgent
 import Darwin
 import PiSwiftCodingAgent
 
+func visibleStartupExtensionPaths(_ paths: [String]) -> [String] {
+    paths.filter { !$0.hasPrefix(BUILTIN_PATH_PREFIX) }
+}
+
 // MARK: - OSC 133 semantic prompt markers
 
 /// Emit an OSC 133 marker to stdout for terminal shell integration.
@@ -446,7 +450,7 @@ public final class InteractiveMode {
         startBackgroundCatalogRefresh()
         if let session {
             pendingResourceDisplayOptions = ResourceDisplayOptions(
-                extensionPaths: session.resourceLoader.getExtensions().paths,
+                extensionPaths: visibleStartupExtensionPaths(session.resourceLoader.getExtensions().paths),
                 force: false
             )
         }
@@ -3782,7 +3786,8 @@ public final class InteractiveMode {
 
         let cwd = FileManager.default.currentDirectoryPath
         let agentDir = getAgentDir()
-        let packageManager = DefaultPackageManager(cwd: cwd, agentDir: agentDir, settingsManager: session.settingsManager)
+        let packageManager = DefaultPackageManager(cwd: cwd, agentDir: agentDir,
+            settingsManager: session.settingsManager, builtinExtensions: builtInExtensions.map(\.name))
 
         let resolvedPaths: ResolvedPaths
         do {
@@ -4854,7 +4859,7 @@ public final class InteractiveMode {
         }
 
         pendingResourceDisplayOptions = ResourceDisplayOptions(
-            extensionPaths: session.resourceLoader.getExtensions().paths,
+            extensionPaths: visibleStartupExtensionPaths(session.resourceLoader.getExtensions().paths),
             force: true
         )
         chatContainer.clear()
