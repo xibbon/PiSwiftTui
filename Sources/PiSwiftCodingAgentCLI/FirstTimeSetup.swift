@@ -60,18 +60,12 @@ func runFirstTimeSetupIfNeeded(
 func presentFirstTimeSetup(settingsManager: SettingsManager) async -> FirstTimeSetupResult? {
     await withCheckedContinuation { continuation in
         Task { @MainActor in
-            initTheme(settingsManager.getTheme(), enableWatcher: false)
-            applyStartupTerminalSettings(settingsManager)
+            await prepareStartupTheme(settingsManager)
             let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
             ui.setClearOnShrink(getClearOnShrink(cwd: FileManager.default.currentDirectoryPath, agentDir: getAgentDir(), loadProjectSettings: false))
             ui.start()
-            let initialTheme: String
-            if let configuredTheme = settingsManager.getTheme() {
-                initialTheme = configuredTheme
-            } else {
-                initialTheme = await detectTerminalTheme(ui: ui, timeoutMs: 100).rawValue
-            }
-            _ = setTheme(initialTheme, enableWatcher: false)
+            var previewTheme = "system"
+            _ = setTheme(previewTheme, enableWatcher: false)
             var resolved = false
 
             let finish: (FirstTimeSetupResult?) -> Void = { result in
@@ -83,9 +77,10 @@ func presentFirstTimeSetup(settingsManager: SettingsManager) async -> FirstTimeS
             }
 
             let component = FirstTimeSetupComponent(
-                detectedThemeName: initialTheme,
                 onThemePreview: { themeName in
+                    previewTheme = themeName
                     _ = setTheme(themeName, enableWatcher: false)
+                    ui.invalidate()
                     ui.requestRender()
                 },
                 onSubmit: { result in
@@ -99,6 +94,9 @@ func presentFirstTimeSetup(settingsManager: SettingsManager) async -> FirstTimeS
             ui.addChild(component)
             ui.setFocus(component)
             ui.requestRender()
+            queryStartupTerminalColors(ui) {
+                _ = setTheme(previewTheme, enableWatcher: false)
+            }
         }
     }
 }

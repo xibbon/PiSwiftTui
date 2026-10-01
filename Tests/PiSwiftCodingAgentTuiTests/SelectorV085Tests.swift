@@ -263,7 +263,8 @@ struct SelectorV085Tests {
     @Test func settingsFixedThemeKeepsActiveMarker() {
         let list = SettingsSelectorComponent(config: selectorConfig(), callbacks: selectorCallbacks()).getSettingsList()
         list.selectItem(id: "theme"); list.handleInput("\r")
-        #expect(selectorText(list).contains("    Automatic"))
+        // Upstream v0.99.1 uses lowercase "automatic" in the theme submenu (TH13).
+        #expect(selectorText(list).contains("    automatic"))
         #expect(selectorText(list).contains("→ ✓ dark"))
         list.handleInput("\u{001B}[B")
         #expect(selectorText(list).contains("  ✓ dark")); #expect(selectorText(list).contains("→   light"))

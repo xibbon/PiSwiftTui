@@ -63,7 +63,7 @@ public struct SettingsConfig: Sendable {
         cacheWarmingMode: CacheWarmingMode = .off,
         thinkingLevel: ThinkingLevel,
         availableThinkingLevels: [ThinkingLevel],
-        currentTheme: String,
+        currentTheme: String = "system",
         availableThemes: [String],
         hideThinkingBlock: Bool,
         showCacheMissNotices: Bool,
@@ -644,24 +644,29 @@ private final class ThemeSettingsSubmenu: Container, MouseFocusOwner {
         self.original = currentTheme; self.terminalTheme = terminalTheme
         self.availableThemes = availableThemes; self.callbacks = callbacks; self.done = done
         let pair = parseAutoThemeSetting(currentTheme)
-        let fixed = availableThemes.contains(currentTheme) ? currentTheme : (availableThemes.contains("dark") ? "dark" : availableThemes.first ?? "dark")
+        let fixed = availableThemes.contains(currentTheme) ? currentTheme : (availableThemes.contains("system") ? "system" : availableThemes.first ?? "system")
         light = pair?.light ?? fixed
         dark = pair?.dark ?? fixed
-        single = pair.map { terminalTheme == .light ? $0.light : $0.dark } ?? fixed
+        let activeTheme = pair.map { terminalTheme == .light ? $0.light : $0.dark } ?? fixed
+        single = availableThemes.contains(activeTheme) ? activeTheme : fixed
         super.init()
         if pair == nil { showSingle() } else { showAutomatic() }
     }
     private var automaticSetting: String { "\(light)/\(dark)" }
     private func items(current: String) -> [SelectItem] {
-        availableThemes.map { SelectItem(value: $0, label: ($0 == current ? "✓ " : "  ") + $0) }
+        availableThemes.map { SelectItem(value: $0, label: ($0 == current ? "✓ " : "  ") + $0,
+                                        description: $0 == "system" ? "Theme created from your terminal's colors" : nil) }
     }
     private func setContent(_ content: any Component, input: (any Component)? = nil) {
         clear(); addChild(content); active = input ?? content
     }
     private func cancel() { callbacks.onThemePreview?(original); done(nil) }
     private func showSingle() {
-        let options = [SelectItem(value: "/", label: "  Automatic", description: "Use separate themes for light and dark terminal appearance")] + items(current: single)
-        setContent(SelectSubmenu(title: "Theme", description: "Select a theme, or choose Automatic to follow terminal appearance.",
+        let themes = items(current: single)
+        let options = themes.filter { $0.value == "system" }
+            + [SelectItem(value: "/", label: "  automatic", description: "Use separate themes for light and dark terminal appearance")]
+            + themes.filter { $0.value != "system" }
+        setContent(SelectSubmenu(title: "Theme", description: "Select a theme, or choose automatic to follow terminal appearance.",
             options: options, currentValue: single, onSelect: { [weak self] value in
                 guard let self else { return }
                 if value == "/" { callbacks.onThemePreview?(automaticSetting); showAutomatic() }

@@ -5,6 +5,36 @@ import PiSwiftSyntaxHighlight
 
 extension EditorTheme: HookEditorTheme {}
 
+public extension MiniTui.RgbColor {
+    var codingAgentColor: PiSwiftCodingAgent.RgbColorValue {
+        // The terminal parser supplies validated 8-bit channels.
+        PiSwiftCodingAgent.colorToRgb(try! PiSwiftCodingAgent.rgbColor(Double(r), Double(g), Double(b)))
+    }
+}
+
+public extension MiniTui.TerminalColors {
+    var codingAgentColors: PiSwiftCodingAgent.TerminalColors {
+        PiSwiftCodingAgent.TerminalColors(
+            foreground: foreground?.codingAgentColor,
+            background: background?.codingAgentColor,
+            palette: palette?.map { $0.codingAgentColor }
+        )
+    }
+}
+
+public extension MiniTui.TerminalColorMode {
+    var codingAgentColorMode: PiSwiftCodingAgent.TerminalColorMode {
+        switch self {
+        case .truecolor: .truecolor
+        case .color256: .color256
+        }
+    }
+}
+
+public extension MiniTui.TerminalColorScheme {
+    var codingAgentAppearance: ThemeAppearance { self == .light ? .light : .dark }
+}
+
 public func highlightCode(_ code: String, lang: String? = nil) -> [String] {
     let adapter = ThemeSyntaxAdapter(theme: theme)
     return SyntaxHighlighter.highlight(code: code, lang: lang, theme: adapter)

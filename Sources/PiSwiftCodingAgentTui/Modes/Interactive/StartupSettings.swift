@@ -14,6 +14,7 @@ func applyInteractiveTerminalCapabilities(_ settings: SettingsManager) {
     case .auto, .none: images = nil
     }
     setCapabilityOverrides(MiniTui.TerminalCapabilityOverrides(images: images, trueColor: overrides.trueColor, hyperlinks: overrides.hyperlinks))
+    PiSwiftCodingAgent.setTerminalColorMode(MiniTui.getTerminalColorMode().codingAgentColorMode)
 }
 
 final class ManagedToolStatuses: Sendable {

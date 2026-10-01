@@ -62,6 +62,19 @@ let package = Package(
             swiftSettings: strictConcurrencySettings
         ),
         .testTarget(
+            // These tests change the process-wide theme and terminal colors.
+            // A separate test process keeps them out of live TUI and loader tests.
+            name: "PiSwiftCodingAgentTuiTestsSystemTheme",
+            dependencies: [
+                .product(name: "PiSwiftAI", package: "PiSwift"),
+                .product(name: "PiSwiftAgent", package: "PiSwift"),
+                .product(name: "PiSwiftCodingAgent", package: "PiSwift"),
+                "PiSwiftCodingAgentTui",
+                .product(name: "MiniTui", package: "MiniTui"),
+            ],
+            swiftSettings: strictConcurrencySettings
+        ),
+        .testTarget(
             name: "PiSwiftCodingAgentCLITests",
             dependencies: [
                 .product(name: "PiSwiftAI", package: "PiSwift"),

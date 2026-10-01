@@ -257,7 +257,7 @@ private struct InteractiveHookUIContext: HookUIContext {
 
 @MainActor
 public final class InteractiveMode {
-    private struct ResourceDisplayOptions: Sendable {
+    struct ResourceDisplayOptions: Sendable {
         var extensionPaths: [String]
         var force: Bool
     }
@@ -271,7 +271,10 @@ public final class InteractiveMode {
     public var chatContainer: Container
     public var ui: RenderRequesting
     public var lastStatusSpacer: Spacer?
-    public var lastStatusText: Text?
+    public var lastStatusText: ThemedText?
+    private var lastStatusMessage = ""
+    var builtInHeader: ExpandableText?
+    let loadedResourcesContainer = Container()
 
     private var session: AgentSession?
     var crashLog = CrashLog()
@@ -630,34 +633,9 @@ public final class InteractiveMode {
             transcriptChildren.append(component)
         }
 
-        let shouldShowHeader = verboseStartup || !settingsManager.getQuietStartup()
-        if shouldShowHeader {
-            let header = buildHeaderText()
-            addTranscriptChild(Spacer(1))
-            addTranscriptChild(Text(header, paddingX: 1, paddingY: 0))
-            addTranscriptChild(Spacer(1))
-
-            if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                addTranscriptChild(DynamicBorder())
-                if settingsManager.getCollapseChangelog() {
-                    let condensed = "Updated. Use /changelog to view details."
-                    addTranscriptChild(Text(condensed, paddingX: 1, paddingY: 0))
-                } else {
-                    addTranscriptChild(Text(theme.bold(theme.fg(.accent, "What's New")), paddingX: 1, paddingY: 0))
-                    addTranscriptChild(Spacer(1))
-                    addTranscriptChild(Markdown(changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines), paddingX: 1, paddingY: 0, theme: getMarkdownTheme()))
-                    addTranscriptChild(Spacer(1))
-                }
-                addTranscriptChild(DynamicBorder())
-            }
-        } else {
-            addTranscriptChild(Text("", paddingX: 0, paddingY: 0))
-            if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                addTranscriptChild(Spacer(1))
-                let condensed = "Updated. Use /changelog to view details."
-                addTranscriptChild(Text(condensed, paddingX: 1, paddingY: 0))
-            }
-        }
+        let headerContainer = Container()
+        addTranscriptChild(headerContainer)
+        addTranscriptChild(loadedResourcesContainer)
 
         tui.addChild(chatContainer)
         transcriptChildren.append(chatContainer)
@@ -697,7 +675,46 @@ public final class InteractiveMode {
         defaultEditor.onSubmit = { [weak self] text in self?.handleStartupSubmit(text) }
         tui.start()
 
-        await themeController?.applyFromSettings()
+        themeController?.applyFromSettings()
+        await themeController?.waitForTerminalColors()
+
+        let shouldShowHeader = verboseStartup || !settingsManager.getQuietStartup()
+        if shouldShowHeader {
+            let version = self.version
+            let keybindings = self.keybindings
+            let header = ExpandableText(
+                collapsed: { buildStartupHeader(version: version, keybindings: keybindings, expanded: false) },
+                expanded: { buildStartupHeader(version: version, keybindings: keybindings, expanded: true) },
+                isExpanded: verboseStartup || toolOutputExpanded, paddingX: 1, paddingY: 0
+            )
+            builtInHeader = header
+            headerContainer.addChild(Spacer(1))
+            headerContainer.addChild(header)
+            headerContainer.addChild(Spacer(1))
+
+            if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                headerContainer.addChild(DynamicBorder())
+                if settingsManager.getCollapseChangelog() {
+                    let condensed = "Updated. Use /changelog to view details."
+                    headerContainer.addChild(Text(condensed, paddingX: 1, paddingY: 0))
+                } else {
+                    headerContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "What's New")) }, paddingX: 1, paddingY: 0))
+                    headerContainer.addChild(Spacer(1))
+                    headerContainer.addChild(Markdown(changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines), paddingX: 1, paddingY: 0, theme: getMarkdownTheme()))
+                    headerContainer.addChild(Spacer(1))
+                }
+                headerContainer.addChild(DynamicBorder())
+            }
+        } else {
+            headerContainer.addChild(Text("", paddingX: 0, paddingY: 0))
+            if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                headerContainer.addChild(Spacer(1))
+                let condensed = "Updated. Use /changelog to view details."
+                headerContainer.addChild(Text(condensed, paddingX: 1, paddingY: 0))
+            }
+        }
+
+        tui.requestRender()
 
         let statuses = ManagedToolStatuses()
         async let installedFd = ensureTool("fd", onStatus: { [weak self] status in
@@ -1025,10 +1042,10 @@ public final class InteractiveMode {
         )
 
         if !customTools.isEmpty {
-            let list = customTools.values.map { tool in
-                theme.fg(.dim, "  \(tool.tool.name) (\(tool.path))")
-            }.joined(separator: "\n")
-            chatContainer.addChild(Text(theme.fg(.muted, "Loaded custom tools:\n") + list, paddingX: 0, paddingY: 0))
+            let labels = customTools.values.map { "  \($0.tool.name) (\($0.path))" }
+            chatContainer.addChild(ThemedText({
+                theme.fg(.muted, "Loaded custom tools:\n") + labels.map { theme.fg(.dim, $0) }.joined(separator: "\n")
+            }, paddingX: 0, paddingY: 0))
             chatContainer.addChild(Spacer(1))
             scheduleRender()
         }
@@ -1152,8 +1169,9 @@ public final class InteractiveMode {
 
         let hookPaths = hookRunner.getHookPaths()
         if !hookPaths.isEmpty {
-            let list = hookPaths.map { theme.fg(.dim, "  \($0)") }.joined(separator: "\n")
-            chatContainer.addChild(Text(theme.fg(.muted, "Loaded hooks:\n") + list, paddingX: 0, paddingY: 0))
+            chatContainer.addChild(ThemedText({
+                theme.fg(.muted, "Loaded hooks:\n") + hookPaths.map { theme.fg(.dim, "  \($0)") }.joined(separator: "\n")
+            }, paddingX: 0, paddingY: 0))
             chatContainer.addChild(Spacer(1))
             scheduleRender()
         }
@@ -1182,7 +1200,7 @@ public final class InteractiveMode {
         pendingTools.removeAll()
 
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(theme.fg(.accent, "✓ New session started"), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.fg(.accent, "✓ New session started") }, paddingX: 1, paddingY: 0))
         scheduleRender()
 
         return HookCommandResult(cancelled: false)
@@ -1561,7 +1579,7 @@ public final class InteractiveMode {
                 container.addChild(Text(line, paddingX: 1, paddingY: 0))
             }
             if lines.count > Self.maxWidgetLines {
-                container.addChild(Text(theme.fg(.muted, "... (widget truncated)"), paddingX: 1, paddingY: 0))
+                container.addChild(ThemedText({ theme.fg(.muted, "... (widget truncated)") }, paddingX: 1, paddingY: 0))
             }
             hookWidgets[key] = container
         case .component(let factory):
@@ -1673,8 +1691,8 @@ public final class InteractiveMode {
 
     @MainActor
     private func showHookError(_ hookPath: String, _ error: String, _ stack: String? = nil) {
-        let errorText = Text(
-            theme.fg(.error, "Hook \"\(hookPath)\" error: \(error)"),
+        let errorText = ThemedText({
+            theme.fg(.error, "Hook \"\(hookPath)\" error: \(error)") },
             paddingX: tuiConfiguration.outputPad,
             paddingY: 0
         )
@@ -1682,9 +1700,9 @@ public final class InteractiveMode {
         if let stack, !stack.isEmpty {
             let lines = stack.split(separator: "\n").dropFirst()
             if !lines.isEmpty {
-                let formatted = lines.map { theme.fg(.dim, "  \($0.trimmingCharacters(in: .whitespaces))") }.joined(separator: "\n")
-                chatContainer.addChild(Text(
-                    formatted,
+                let stackLines = lines.map { "  \($0.trimmingCharacters(in: .whitespaces))" }
+                chatContainer.addChild(ThemedText({
+                    stackLines.map { theme.fg(.dim, $0) }.joined(separator: "\n") },
                     paddingX: tuiConfiguration.outputPad,
                     paddingY: 0
                 ))
@@ -1802,7 +1820,7 @@ public final class InteractiveMode {
 
     func showManagedToolStatus(_ status: ToolStatus) {
         let message = status.type == .warning ? "Warning: \(status.message)" : status.message
-        chatContainer.addChild(Text(theme.fg(status.type == .warning ? .warning : .dim, message), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.fg(status.type == .warning ? .warning : .dim, message) }, paddingX: 1, paddingY: 0))
         scheduleRender()
     }
 
@@ -1906,7 +1924,7 @@ public final class InteractiveMode {
                 showStatus("\(errorMessage) (retrying)")
             } else {
                 chatContainer.addChild(Spacer(1))
-                chatContainer.addChild(Text(theme.fg(.error, errorMessage), paddingX: 1, paddingY: 0))
+                chatContainer.addChild(ThemedText({ theme.fg(.error, errorMessage) }, paddingX: 1, paddingY: 0))
             }
         }
         footer?.invalidate()
@@ -1998,7 +2016,7 @@ public final class InteractiveMode {
         let tracker = bugReportHints
         Task { @MainActor [weak self] in
             guard await tracker.shouldSuggest(sessionId: sessionId, message: message), let self else { return }
-            self.chatContainer.addChild(Text(theme.fg(.muted, "If this looks like a pi bug, /bug sends a report to the developers."), paddingX: 1, paddingY: 0))
+            self.chatContainer.addChild(ThemedText({ theme.fg(.muted, "If this looks like a pi bug, /bug sends a report to the developers.") }, paddingX: 1, paddingY: 0))
             self.scheduleRender()
         }
     }
@@ -2216,7 +2234,7 @@ public final class InteractiveMode {
                 addMessageToChat(message)
             }
                 if let miss = cacheMisses[messageEntry.id] {
-                    chatContainer.addChild(Text(theme.fg(.warning, formatCacheMissNotice(miss)), paddingX: 1, paddingY: 0))
+                    chatContainer.addChild(ThemedText({ theme.fg(.warning, formatCacheMissNotice(miss)) }, paddingX: 1, paddingY: 0))
                 }
             case .compaction(let entry):
                 let component = CompactionSummaryMessageComponent(message: CompactionSummaryMessage(summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: 0))
@@ -2256,14 +2274,14 @@ public final class InteractiveMode {
     func addSummaryCostNotice(_ usage: Usage, branch: Bool = false) {
         guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(theme.fg(.warning, summaryCostNotice(usage: usage, branch: branch)), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.fg(.warning, summaryCostNotice(usage: usage, branch: branch)) }, paddingX: 1, paddingY: 0))
     }
 
     @MainActor
     func addCacheWarmingUsage(_ entry: UsageEntry) {
         guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(theme.fg(.dim, formatCacheWarmingUsage(entry)), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.fg(.dim, formatCacheWarmingUsage(entry)) }, paddingX: 1, paddingY: 0))
     }
 
     func maybeShowAssistantDiagnostics(_ message: AssistantMessage) {
@@ -2275,7 +2293,7 @@ public final class InteractiveMode {
     private func addThinkingDropNotice(_ notice: ThinkingDropNotice) {
         guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(theme.fg(.warning, thinkingDropNoticeText(notice)), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.fg(.warning, thinkingDropNoticeText(notice)) }, paddingX: 1, paddingY: 0))
     }
 
     @MainActor
@@ -2346,45 +2364,6 @@ public final class InteractiveMode {
         } else {
             ui.requestRender()
         }
-    }
-
-    private func buildHeaderText() -> String {
-        let logo = theme.bold(theme.fg(.accent, APP_NAME)) + theme.fg(.dim, " v\(version)")
-        let deleteToLineEnd = formatKeyDisplay(getKeybindings().getKeys(TUIKeybinding.editorDeleteToLineEnd))
-        let interrupt = formatKeyDisplay(keybindings.getDisplayString(.interrupt))
-        let clear = formatKeyDisplay(keybindings.getDisplayString(.clear))
-        let exit = formatKeyDisplay(keybindings.getDisplayString(.exit))
-        let suspend = formatKeyDisplay(keybindings.getDisplayString(.suspend))
-        let cycleThinkingLevel = formatKeyDisplay(keybindings.getDisplayString(.cycleThinkingLevel))
-        let cycleModelForward = formatKeyDisplay(keybindings.getDisplayString(.cycleModelForward))
-        let cycleModelBackward = formatKeyDisplay(keybindings.getDisplayString(.cycleModelBackward))
-        let selectModel = formatKeyDisplay(keybindings.getDisplayString(.selectModel))
-        let expandTools = formatKeyDisplay(keybindings.getDisplayString(.expandTools))
-        let toggleThinking = formatKeyDisplay(keybindings.getDisplayString(.toggleThinking))
-        let externalEditor = formatKeyDisplay(keybindings.getDisplayString(.externalEditor))
-        let followUp = formatKeyDisplay(keybindings.getDisplayString(.followUp))
-        let dequeue = formatKeyDisplay(keybindings.getDisplayString(.dequeue))
-        let pasteImage = formatKeyDisplay(keybindings.getDisplayString(.pasteImage))
-        let instructions = [
-            theme.fg(.dim, interrupt) + theme.fg(.muted, " to interrupt"),
-            theme.fg(.dim, clear) + theme.fg(.muted, " to clear"),
-            theme.fg(.dim, "\(clear) twice") + theme.fg(.muted, " to exit"),
-            theme.fg(.dim, exit) + theme.fg(.muted, " to exit (empty)"),
-            theme.fg(.dim, suspend) + theme.fg(.muted, " to suspend"),
-            theme.fg(.dim, deleteToLineEnd) + theme.fg(.muted, " to delete line"),
-            theme.fg(.dim, cycleThinkingLevel) + theme.fg(.muted, " to cycle thinking"),
-            theme.fg(.dim, "\(cycleModelForward)/\(cycleModelBackward)") + theme.fg(.muted, " to cycle models"),
-            theme.fg(.dim, selectModel) + theme.fg(.muted, " to select model"),
-            theme.fg(.dim, expandTools) + theme.fg(.muted, " to expand tools"),
-            theme.fg(.dim, toggleThinking) + theme.fg(.muted, " to toggle thinking"),
-            theme.fg(.dim, externalEditor) + theme.fg(.muted, " for external editor"),
-            theme.fg(.dim, "/") + theme.fg(.muted, " for commands"),
-            theme.fg(.dim, "!") + theme.fg(.muted, " to run bash"),
-            theme.fg(.dim, followUp) + theme.fg(.muted, " to queue follow-up"),
-            theme.fg(.dim, dequeue) + theme.fg(.muted, " to restore queued messages"),
-            theme.fg(.dim, pasteImage) + theme.fg(.muted, " to paste image"),
-        ].joined(separator: "\n")
-        return "\(logo)\n\(instructions)"
     }
 
     private func formatDisplayPath(_ path: String) -> String {
@@ -2594,113 +2573,131 @@ public final class InteractiveMode {
         return lines.joined(separator: "\n")
     }
 
-    private func showLoadedResources(_ options: ResourceDisplayOptions) {
+    func showLoadedResources(_ options: ResourceDisplayOptions) {
+        loadedResourcesContainer.clear()
         guard let session else { return }
         let settingsManager = session.settingsManager
-        let shouldShow = options.force || verboseStartup || !settingsManager.getQuietStartup()
-        if !shouldShow { return }
+        guard options.force || verboseStartup || !settingsManager.getQuietStartup() else { return }
 
         let metadata = session.resourceLoader.getPathMetadata()
-        let sectionHeader: (String, ThemeColor) -> String = { name, color in
-            theme.fg(color, "[\(name)]")
+        let expanded = verboseStartup || toolOutputExpanded
+        func compactList(_ labels: [String], sort: Bool = true) -> String {
+            let labels = labels.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            return theme.fg(.dim, "  " + (sort ? labels.sorted() : labels).joined(separator: ", "))
+        }
+        func addSection(_ name: String, collapsed: @escaping () -> String, expandedBody: @escaping () -> String) {
+            loadedResourcesContainer.addChild(ExpandableText(
+                collapsed: { "\(theme.fg(.mdHeading, "[\(name)]"))\n\(collapsed())" },
+                expanded: { "\(theme.fg(.mdHeading, "[\(name)]"))\n\(expandedBody())" },
+                isExpanded: expanded
+            ))
+            loadedResourcesContainer.addChild(Spacer(1))
+        }
+        func addDiagnostics(_ name: String, _ diagnostics: [ResourceDiagnostic]) {
+            guard !diagnostics.isEmpty else { return }
+            loadedResourcesContainer.addChild(ThemedText({ [weak self] in
+                "\(theme.fg(.warning, "[\(name)]"))\n\(self?.formatDiagnostics(diagnostics, metadata) ?? "")"
+            }, paddingX: 0, paddingY: 0))
+            loadedResourcesContainer.addChild(Spacer(1))
         }
 
-        let contextFiles = session.resourceLoader.getAgentsFiles()
+        let contextPaths = session.resourceLoader.getSystemPromptSource().map { [$0.path] } ?? []
+        let contextFiles = contextPaths + session.resourceLoader.getAppendSystemPromptSources().map { $0.path }
+            + session.resourceLoader.getAgentsFiles().map { $0.path }
         if !contextFiles.isEmpty {
-            let contextList = contextFiles
-                .map { theme.fg(.dim, "  \(formatDisplayPath($0.path))") }
-                .joined(separator: "\n")
-            chatContainer.addChild(Text("\(sectionHeader("Context", .mdHeading))\n\(contextList)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
+            loadedResourcesContainer.addChild(Spacer(1))
+            let paths = contextFiles
+            let cwd = session.sessionManager.getCwd()
+            let labels = paths.map { path in
+                path.hasPrefix(cwd + "/") ? String(path.dropFirst(cwd.count + 1)) : formatDisplayPath(path)
+            }
+            addSection("Context", collapsed: { compactList(labels, sort: false) }, expandedBody: { [weak self] in
+                paths.map { theme.fg(.dim, "  \(self?.formatDisplayPath($0) ?? $0)") }.joined(separator: "\n")
+            })
         }
 
         let skillResult = session.resourceLoader.getSkills()
         if !skillResult.skills.isEmpty {
-            let skillPaths = skillResult.skills.map { $0.filePath }
-            let groups = buildScopeGroups(skillPaths, metadata)
-            let skillList = formatScopeGroups(
-                groups,
-                formatPath: { formatDisplayPath($0) },
-                formatPackagePath: { getShortPath($0, source: $1) }
-            )
-            chatContainer.addChild(Text("\(sectionHeader("Skills", .mdHeading))\n\(skillList)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
-        }
-
-        if !skillResult.diagnostics.isEmpty {
-            let warningLines = formatDiagnostics(skillResult.diagnostics, metadata)
-            chatContainer.addChild(Text("\(theme.fg(.warning, "[Skill conflicts]"))\n\(warningLines)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
+            let groups = buildScopeGroups(skillResult.skills.map { $0.filePath }, metadata)
+            let names = skillResult.skills.map { $0.name }
+            addSection("Skills", collapsed: { compactList(names) }, expandedBody: { [weak self] in
+                guard let self else { return "" }
+                return formatScopeGroups(groups, formatPath: { self.formatDisplayPath($0) },
+                                         formatPackagePath: { self.getShortPath($0, source: $1) })
+            })
         }
 
         let templates = session.promptTemplates
         if !templates.isEmpty {
-            let templatePaths = templates.map { $0.filePath }
-            let groups = buildScopeGroups(templatePaths, metadata)
+            let groups = buildScopeGroups(templates.map { $0.filePath }, metadata)
             let templateByPath = Dictionary(uniqueKeysWithValues: templates.map { ($0.filePath, $0) })
-            let templateList = formatScopeGroups(
-                groups,
-                formatPath: { path in
-                    if let template = templateByPath[path] {
-                        return "/\(template.name)"
-                    }
-                    return formatDisplayPath(path)
-                },
-                formatPackagePath: { path, _ in
-                    if let template = templateByPath[path] {
-                        return "/\(template.name)"
-                    }
-                    return formatDisplayPath(path)
-                }
-            )
-            chatContainer.addChild(Text("\(sectionHeader("Prompts", .mdHeading))\n\(templateList)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
-        }
-
-        let promptDiagnostics = session.resourceLoader.getPrompts().diagnostics
-        if !promptDiagnostics.isEmpty {
-            let warningLines = formatDiagnostics(promptDiagnostics, metadata)
-            chatContainer.addChild(Text("\(theme.fg(.warning, "[Prompt conflicts]"))\n\(warningLines)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
+            let names = templates.map { "/\($0.name)" }
+            addSection("Prompts", collapsed: { compactList(names) }, expandedBody: { [weak self] in
+                guard let self else { return "" }
+                return formatScopeGroups(groups, formatPath: { path in
+                    templateByPath[path].map { "/\($0.name)" } ?? self.formatDisplayPath(path)
+                }, formatPackagePath: { path, _ in
+                    templateByPath[path].map { "/\($0.name)" } ?? self.formatDisplayPath(path)
+                })
+            })
         }
 
         if !options.extensionPaths.isEmpty {
-            let groups = buildScopeGroups(options.extensionPaths, metadata)
-            let extensionList = formatScopeGroups(
-                groups,
-                formatPath: { formatDisplayPath($0) },
-                formatPackagePath: { getShortPath($0, source: $1) }
-            )
-            chatContainer.addChild(Text("\(sectionHeader("Extensions", .mdHeading))\n\(extensionList)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
+            let paths = options.extensionPaths
+            let groups = buildScopeGroups(paths, metadata)
+            let labels = compactExtensionLabels(paths, metadata)
+            addSection("Extensions", collapsed: { compactList(labels) }, expandedBody: { [weak self] in
+                guard let self else { return "" }
+                return formatScopeGroups(groups, formatPath: { self.formatExtensionDisplayPath($0) },
+                                         formatPackagePath: { self.formatExtensionDisplayPath(self.getShortPath($0, source: $1)) })
+            })
         }
 
-        let extensionDiagnostics = session.resourceLoader.getExtensions().diagnostics
-        if !extensionDiagnostics.isEmpty {
-            let warningLines = formatDiagnostics(extensionDiagnostics, metadata)
-            chatContainer.addChild(Text("\(theme.fg(.warning, "[Extension issues]"))\n\(warningLines)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
-        }
+        addDiagnostics("Skill conflicts", skillResult.diagnostics)
+        addDiagnostics("Prompt conflicts", session.resourceLoader.getPrompts().diagnostics)
+        addDiagnostics("Extension issues", session.resourceLoader.getExtensions().diagnostics)
+        // Upstream v0.99.1 removes the Themes list and retains theme diagnostics.
+        addDiagnostics("Theme conflicts", session.resourceLoader.getThemes().diagnostics)
+    }
 
-        let themes = session.resourceLoader.getThemes().themes
-        let customThemes = themes.filter { $0.path != nil }
-        if !customThemes.isEmpty {
-            let themePaths = customThemes.compactMap { $0.path }
-            let groups = buildScopeGroups(themePaths, metadata)
-            let themeList = formatScopeGroups(
-                groups,
-                formatPath: { formatDisplayPath($0) },
-                formatPackagePath: { getShortPath($0, source: $1) }
-            )
-            chatContainer.addChild(Text("\(sectionHeader("Themes", .mdHeading))\n\(themeList)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
+    private func formatExtensionDisplayPath(_ path: String) -> String {
+        let display = formatDisplayPath(path)
+        for suffix in ["/index.ts", "/index.js"] where display.hasSuffix(suffix) {
+            return String(display.dropLast(suffix.count))
         }
+        return display
+    }
 
-        let themeDiagnostics = session.resourceLoader.getThemes().diagnostics
-        if !themeDiagnostics.isEmpty {
-            let warningLines = formatDiagnostics(themeDiagnostics, metadata)
-            chatContainer.addChild(Text("\(theme.fg(.warning, "[Theme conflicts]"))\n\(warningLines)", paddingX: 0, paddingY: 0))
-            chatContainer.addChild(Spacer(1))
+    private func compactExtensionLabels(_ paths: [String], _ metadata: [String: PathMetadata]) -> [String] {
+        let localPaths = paths.filter { !isPackageSource(findMetadata($0, metadata)?.source ?? "local") }
+        let segments = localPaths.map {
+            formatExtensionDisplayPath($0).split(separator: "/").map(String.init).filter { $0 != "~" }
+        }
+        return paths.map { path in
+            if let meta = findMetadata(path, metadata), isPackageSource(meta.source) {
+                var source = meta.source
+                if source.hasPrefix("npm:") { source = String(source.dropFirst(4)) }
+                else if source.hasPrefix("git:") {
+                    source = String(source.dropFirst(4)).split(separator: "@", maxSplits: 1).first.map(String.init) ?? source
+                }
+                let short = getShortPath(path, source: meta.source)
+                let packagePath = short.hasPrefix("extensions/") ? String(short.dropFirst(11)) : short
+                if ["index.ts", "index.js"].contains(URL(fileURLWithPath: packagePath).lastPathComponent) {
+                    let directory = (packagePath as NSString).deletingLastPathComponent
+                    return directory.isEmpty || directory == "." ? source : "\(source):\(directory)"
+                }
+                return "\(source):\(packagePath)"
+            }
+            guard let index = localPaths.firstIndex(of: path), !segments[index].isEmpty else {
+                return URL(fileURLWithPath: path).lastPathComponent
+            }
+            for count in 1...segments[index].count {
+                let candidate = segments[index].suffix(count).joined(separator: "/")
+                if segments.enumerated().allSatisfy({ $0.offset == index || $0.element.suffix(count).joined(separator: "/") != candidate }) {
+                    return candidate
+                }
+            }
+            return segments[index].joined(separator: "/")
         }
     }
 
@@ -3060,10 +3057,17 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func setToolsExpanded(_ expanded: Bool) {
+    func setToolsExpanded(_ expanded: Bool) {
+        guard expanded != toolOutputExpanded else { return }
         toolOutputExpanded = expanded
+        builtInHeader?.setExpanded(expanded)
+        for child in loadedResourcesContainer.children {
+            (child as? ExpandableText)?.setExpanded(expanded)
+        }
         for child in chatContainer.children {
-            if let tool = child as? ToolExecutionComponent {
+            if let text = child as? ExpandableText {
+                text.setExpanded(expanded)
+            } else if let tool = child as? ToolExecutionComponent {
                 tool.setExpanded(toolOutputExpanded)
             } else if let bash = child as? BashExecutionComponent {
                 bash.setExpanded(toolOutputExpanded)
@@ -3077,7 +3081,7 @@ public final class InteractiveMode {
                 customEntry.setExpanded(toolOutputExpanded)
             }
         }
-        scheduleRender()
+        showStatus("Tool output: \(expanded ? "expanded" : "collapsed")")
     }
 
     @MainActor
@@ -3600,7 +3604,7 @@ public final class InteractiveMode {
             cacheWarmingMode: settingsManager.getCacheWarmingMode(),
             thinkingLevel: ThinkingLevel(rawValue: settingsManager.getDefaultThinkingLevel() ?? "") ?? DEFAULT_THINKING_LEVEL,
             availableThinkingLevels: availableThinking,
-            currentTheme: themeController?.getThemeSelection() ?? "dark",
+            currentTheme: themeController?.getThemeSelection() ?? "system",
             availableThemes: getAvailableThemes(),
             hideThinkingBlock: hideThinkingBlock,
             showCacheMissNotices: settingsManager.getShowCacheMissNotices(),
@@ -3666,7 +3670,7 @@ public final class InteractiveMode {
                 onThinkingLevelChange: { _ in },
                 onThemeChange: { [weak self] name in
                     settingsManager.setTheme(name)
-                    Task { @MainActor in await self?.themeController?.setThemeSetting(name) }
+                    self?.themeController?.setThemeSetting(name)
                 },
                 onThemePreview: { [weak self] name in self?.themeController?.preview(name) },
                 onHideThinkingBlockChange: { [weak self] hide in
@@ -4078,13 +4082,13 @@ public final class InteractiveMode {
     @MainActor
     private func showThemeSelector() {
         guard let settingsManager = session?.settingsManager else { return }
-        let current = themeController?.getThemeSelection() ?? "dark"
+        let current = themeController?.getThemeSelection() ?? "system"
         showSelector { done in
             let selector = ThemeSelectorComponent(
                 currentTheme: current,
                 onSelect: { [weak self] name in
                     settingsManager.setTheme(name)
-                    Task { @MainActor in await self?.themeController?.setThemeSetting(name) }
+                    self?.themeController?.setThemeSetting(name)
                     done()
                     self?.showStatus("Theme: \(name)")
                 },
@@ -4564,42 +4568,47 @@ public final class InteractiveMode {
             formatter.string(from: NSNumber(value: value)) ?? "\(value)"
         }
 
-        var info = "\(theme.bold("Session Info"))\n\n"
-        if let sessionName {
-            info += "\(theme.fg(.dim, "Name:")) \(sessionName)\n"
-        }
-        info += "\(theme.fg(.dim, "File:")) \(stats.sessionFile ?? "In-memory")\n"
-        info += "\(theme.fg(.dim, "ID:")) \(stats.sessionId)\n\n"
-        info += "\(theme.bold("Messages"))\n"
-        info += "\(theme.fg(.dim, "User:")) \(stats.userMessages)\n"
-        info += "\(theme.fg(.dim, "Assistant:")) \(stats.assistantMessages)\n"
-        info += "\(theme.fg(.dim, "Tool Calls:")) \(stats.toolCalls)\n"
-        info += "\(theme.fg(.dim, "Tool Results:")) \(stats.toolResults)\n"
-        info += "\(theme.fg(.dim, "Total:")) \(stats.totalMessages)\n\n"
-        info += "\(theme.bold("Tokens"))\n"
-        info += "\(theme.fg(.dim, "Input:")) \(formatNumber(stats.tokens.input))\n"
-        info += "\(theme.fg(.dim, "Output:")) \(formatNumber(stats.tokens.output))\n"
-        if stats.tokens.cacheRead > 0 {
-            info += "\(theme.fg(.dim, "Cache Read:")) \(formatNumber(stats.tokens.cacheRead))\n"
-        }
-        if stats.tokens.cacheWrite > 0 {
-            info += "\(theme.fg(.dim, "Cache Write:")) \(formatNumber(stats.tokens.cacheWrite))\n"
-        }
-        info += "\(theme.fg(.dim, "Total:")) \(formatNumber(stats.tokens.total))\n"
-        info += "\n\(theme.bold("Cache Warming"))\n"
-        info += "\(theme.fg(.dim, "Mode:")) \(session.settingsManager.getCacheWarmingMode().rawValue)\n"
-        info += "\(theme.fg(.dim, "Status:")) \(cacheWarmingStatus.map { formatCacheWarmingStatus($0) } ?? "Inactive (cache warming unavailable)")\n"
-        if let decision = cacheWarmingStatus?.decision, decision.economicsAvailable {
-            info += "\(theme.fg(.dim, "Cache miss penalty:")) $\(String(format: "%.3f", decision.missCost))\n"
-            info += "\(theme.fg(.dim, "Refresh cost:")) $\(String(format: "%.3f", decision.warmCost))\n"
-        }
-        if stats.cost > 0 {
-            info += "\n\(theme.bold("Cost"))\n"
-            info += "\(theme.fg(.dim, "Total:")) \(String(format: "%.4f", stats.cost))"
+        let cacheWarmingMode = session.settingsManager.getCacheWarmingMode().rawValue
+        let renderInfo = {
+            var info = "\(theme.bold("Session Info"))\n\n"
+            if let sessionName {
+                info += "\(theme.fg(.dim, "Name:")) \(sessionName)\n"
+            }
+            info += "\(theme.fg(.dim, "File:")) \(stats.sessionFile ?? "In-memory")\n"
+            info += "\(theme.fg(.dim, "ID:")) \(stats.sessionId)\n\n"
+            info += "\(theme.bold("Messages"))\n"
+            info += "\(theme.fg(.dim, "User:")) \(stats.userMessages)\n"
+            info += "\(theme.fg(.dim, "Assistant:")) \(stats.assistantMessages)\n"
+            info += "\(theme.fg(.dim, "Tool Calls:")) \(stats.toolCalls)\n"
+            info += "\(theme.fg(.dim, "Tool Results:")) \(stats.toolResults)\n"
+            info += "\(theme.fg(.dim, "Total:")) \(stats.totalMessages)\n\n"
+            info += "\(theme.bold("Tokens"))\n"
+            info += "\(theme.fg(.dim, "Input:")) \(formatNumber(stats.tokens.input))\n"
+            info += "\(theme.fg(.dim, "Output:")) \(formatNumber(stats.tokens.output))\n"
+            if stats.tokens.cacheRead > 0 {
+                info += "\(theme.fg(.dim, "Cache Read:")) \(formatNumber(stats.tokens.cacheRead))\n"
+            }
+            if stats.tokens.cacheWrite > 0 {
+                info += "\(theme.fg(.dim, "Cache Write:")) \(formatNumber(stats.tokens.cacheWrite))\n"
+            }
+            info += "\(theme.fg(.dim, "Total:")) \(formatNumber(stats.tokens.total))\n"
+            info += "\n\(theme.bold("Cache Warming"))\n"
+            info += "\(theme.fg(.dim, "Mode:")) \(cacheWarmingMode)\n"
+            info += "\(theme.fg(.dim, "Status:")) \(cacheWarmingStatus.map { formatCacheWarmingStatus($0) } ?? "Inactive (cache warming unavailable)")\n"
+            if let decision = cacheWarmingStatus?.decision, decision.economicsAvailable {
+                info += "\(theme.fg(.dim, "Cache miss penalty:")) $\(String(format: "%.3f", decision.missCost))\n"
+                info += "\(theme.fg(.dim, "Refresh cost:")) $\(String(format: "%.3f", decision.warmCost))\n"
+            }
+            if stats.cost > 0 {
+                info += "\n\(theme.bold("Cost"))\n"
+                info += "\(theme.fg(.dim, "Total:")) \(String(format: "%.4f", stats.cost))"
+            }
+
+            return info
         }
 
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(info, paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText(renderInfo, paddingX: 1, paddingY: 0))
         scheduleRender()
     }
 
@@ -4613,23 +4622,27 @@ public final class InteractiveMode {
         }
         let lists = computeFileLists(fileOps)
 
-        var info = "\(theme.bold("File Operations"))\n\n"
-        if lists.readFiles.isEmpty && lists.modifiedFiles.isEmpty {
-            info += theme.fg(.dim, "No file operations recorded.")
-        } else {
-            if !lists.readFiles.isEmpty {
-                info += "\(theme.bold("Read"))\n"
-                info += lists.readFiles.map { "  \($0)" }.joined(separator: "\n")
-                info += "\n\n"
+        let renderInfo = {
+            var info = "\(theme.bold("File Operations"))\n\n"
+            if lists.readFiles.isEmpty && lists.modifiedFiles.isEmpty {
+                info += theme.fg(.dim, "No file operations recorded.")
+            } else {
+                if !lists.readFiles.isEmpty {
+                    info += "\(theme.bold("Read"))\n"
+                    info += lists.readFiles.map { "  \($0)" }.joined(separator: "\n")
+                    info += "\n\n"
+                }
+                if !lists.modifiedFiles.isEmpty {
+                    info += "\(theme.bold("Modified"))\n"
+                    info += lists.modifiedFiles.map { "  \($0)" }.joined(separator: "\n")
+                }
             }
-            if !lists.modifiedFiles.isEmpty {
-                info += "\(theme.bold("Modified"))\n"
-                info += lists.modifiedFiles.map { "  \($0)" }.joined(separator: "\n")
-            }
+
+            return info
         }
 
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(info, paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText(renderInfo, paddingX: 1, paddingY: 0))
         scheduleRender()
     }
 
@@ -4642,7 +4655,7 @@ public final class InteractiveMode {
         if name.isEmpty {
             if let currentName = session.sessionManager.getSessionName() {
                 chatContainer.addChild(Spacer(1))
-                chatContainer.addChild(Text(theme.fg(.dim, "Session name: \(currentName)"), paddingX: 1, paddingY: 0))
+                chatContainer.addChild(ThemedText({ theme.fg(.dim, "Session name: \(currentName)") }, paddingX: 1, paddingY: 0))
             } else {
                 showWarning("Usage: /name <name>")
             }
@@ -4653,7 +4666,7 @@ public final class InteractiveMode {
         session.sessionManager.appendSessionInfo(name)
         updateTerminalTitle()
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(theme.fg(.dim, "Session name set: \(name)"), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.fg(.dim, "Session name set: \(name)") }, paddingX: 1, paddingY: 0))
         scheduleRender()
     }
 
@@ -4684,7 +4697,7 @@ public final class InteractiveMode {
 
         chatContainer.addChild(Spacer(1))
         chatContainer.addChild(DynamicBorder())
-        chatContainer.addChild(Text(theme.bold(theme.fg(.accent, "What's New")), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "What's New")) }, paddingX: 1, paddingY: 0))
         chatContainer.addChild(Spacer(1))
         chatContainer.addChild(Markdown(changelogMarkdown, paddingX: 1, paddingY: 1, theme: getMarkdownTheme()))
         chatContainer.addChild(DynamicBorder())
@@ -4775,7 +4788,7 @@ public final class InteractiveMode {
 
         chatContainer.addChild(Spacer(1))
         chatContainer.addChild(DynamicBorder())
-        chatContainer.addChild(Text(theme.bold(theme.fg(.accent, "Keyboard Shortcuts")), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "Keyboard Shortcuts")) }, paddingX: 1, paddingY: 0))
         chatContainer.addChild(Spacer(1))
         chatContainer.addChild(Markdown(hotkeys.trimmingCharacters(in: .whitespacesAndNewlines), paddingX: 1, paddingY: 0, theme: getMarkdownTheme()))
         chatContainer.addChild(DynamicBorder())
@@ -4788,11 +4801,11 @@ public final class InteractiveMode {
         let templates = session.promptTemplates.sorted { $0.name.lowercased() < $1.name.lowercased() }
 
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(theme.bold(theme.fg(.accent, "Prompt Templates")), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "Prompt Templates")) }, paddingX: 1, paddingY: 0))
         chatContainer.addChild(Spacer(1))
 
         if templates.isEmpty {
-            chatContainer.addChild(Text(theme.fg(.dim, "No prompt templates found"), paddingX: 1, paddingY: 0))
+            chatContainer.addChild(ThemedText({ theme.fg(.dim, "No prompt templates found") }, paddingX: 1, paddingY: 0))
             scheduleRender()
             return
         }
@@ -4836,7 +4849,7 @@ public final class InteractiveMode {
         applyInteractiveTerminalCapabilities(session.settingsManager)
         tui.setClearOnShrink(session.settingsManager.getClearOnShrink())
         altScreenRenderer?.setCopyOnSelect(session.settingsManager.getFullscreenCopyOnSelect())
-        await themeController?.applyFromSettings()
+        themeController?.applyFromSettings()
         let extensionResult = await session.reloadExtensions()
         setWorkingMessage(nil)
         workingVisible = true
@@ -4957,13 +4970,13 @@ public final class InteractiveMode {
     private func handleDebugCommand() {
         chatContainer.addChild(Spacer(1))
         chatContainer.addChild(Text(getThemeDiagnostics(), paddingX: 1, paddingY: 0))
-        let sample = [
+        let sample = { [
             "Color sample:",
             theme.fg(.accent, "accent"),
             theme.fg(.muted, "muted"),
             theme.bg(.selectedBg, " selectedBg "),
-        ].joined(separator: " ")
-        chatContainer.addChild(Text(sample, paddingX: 1, paddingY: 0))
+        ].joined(separator: " ") }
+        chatContainer.addChild(ThemedText(sample, paddingX: 1, paddingY: 0))
         scheduleRender()
     }
 
@@ -4986,13 +4999,15 @@ public final class InteractiveMode {
            let secondLast = secondLast as? Spacer,
            lastStatusText === last,
            lastStatusSpacer === secondLast {
-            last.setText(theme.fg(.dim, message))
+            lastStatusMessage = message
+            last.invalidate()
             ui.requestRender()
             return
         }
 
         let spacer = Spacer(1)
-        let text = Text(theme.fg(.dim, message), paddingX: 1, paddingY: 0)
+        lastStatusMessage = message
+        let text = ThemedText({ [weak self] in theme.fg(.dim, self?.lastStatusMessage ?? message) }, paddingX: 1, paddingY: 0)
         chatContainer.addChild(spacer)
         chatContainer.addChild(text)
         lastStatusSpacer = spacer
@@ -5002,8 +5017,8 @@ public final class InteractiveMode {
 
     public func showError(_ errorMessage: String) {
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(
-            theme.fg(.error, "Error: \(errorMessage)"),
+        chatContainer.addChild(ThemedText({
+            theme.fg(.error, "Error: \(errorMessage)") },
             paddingX: tuiConfiguration.outputPad,
             paddingY: 0
         ))
@@ -5012,7 +5027,7 @@ public final class InteractiveMode {
 
     public func showWarning(_ warningMessage: String) {
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Text(theme.fg(.warning, "Warning: \(warningMessage)"), paddingX: 1, paddingY: 0))
+        chatContainer.addChild(ThemedText({ theme.fg(.warning, "Warning: \(warningMessage)") }, paddingX: 1, paddingY: 0))
         scheduleRender()
     }
 }

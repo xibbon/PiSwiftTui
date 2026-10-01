@@ -29,16 +29,16 @@ public final class ProjectTrustSelectorComponent: Container, MouseFocusOwner {
 
         addChild(DynamicBorder())
         addChild(Spacer(1))
-        addChild(Text(theme.fg(.accent, "Project trust required"), paddingX: 1, paddingY: 0))
-        addChild(Text(theme.fg(.muted, cwd), paddingX: 1, paddingY: 0))
+        addChild(ThemedText({ theme.fg(.accent, "Project trust required") }, paddingX: 1, paddingY: 0))
+        addChild(ThemedText({ theme.fg(.muted, cwd) }, paddingX: 1, paddingY: 0))
         if let projectTrusted {
             let saved = savedDecision.map { "\($0.decision == true ? "trusted" : "untrusted") (\($0.path))" } ?? "none"
-            addChild(Text(theme.fg(.muted, "Saved decision: \(saved)\nCurrent session: \(projectTrusted ? "trusted" : "untrusted")"), paddingX: 1, paddingY: 0))
+            addChild(ThemedText({ theme.fg(.muted, "Saved decision: \(saved)\nCurrent session: \(projectTrusted ? "trusted" : "untrusted")") }, paddingX: 1, paddingY: 0))
         }
         addChild(Spacer(1))
         addChild(listContainer)
         addChild(Spacer(1))
-        addChild(Text(theme.fg(.dim, "up/down navigate  enter select  esc cancel"), paddingX: 1, paddingY: 0))
+        addChild(ThemedText({ theme.fg(.dim, "up/down navigate  enter select  esc cancel") }, paddingX: 1, paddingY: 0))
         addChild(Spacer(1))
         addChild(DynamicBorder())
 
@@ -60,6 +60,11 @@ public final class ProjectTrustSelectorComponent: Container, MouseFocusOwner {
                 : prefix + marker + theme.fg(.text, option.label)
             listContainer.addChild(Text(line, paddingX: 1, paddingY: 0))
         }
+    }
+
+    public override func invalidate() {
+        updateList()
+        super.invalidate()
     }
 
     public override func handleInput(_ keyData: String) {

@@ -12,7 +12,7 @@ public func selectSession(
 ) async -> String? {
     await withCheckedContinuation { continuation in
         Task { @MainActor in
-            applyStartupTerminalSettings(settingsManager)
+            await prepareStartupTheme(settingsManager)
             let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
             ui.setClearOnShrink(getClearOnShrink(cwd: FileManager.default.currentDirectoryPath, agentDir: getAgentDir(), loadProjectSettings: projectTrusted))
             var resolved = false
@@ -43,7 +43,7 @@ public func selectSession(
 
             ui.addChild(selector)
             ui.setFocus(selector.getSessionList())
-            ui.start()
+            startStartupTui(ui, settingsManager: settingsManager)
         }
     }
 }

@@ -132,7 +132,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         }
         applyStartupTerminalSettings(settingsManager)
         time("SettingsManager.create")
-        let themeName = settingsManager.getTheme()
+        let themeName = resolveThemeSetting(settingsManager.getTheme(), appearance: PiSwiftCodingAgent.getTerminalTheme()) ?? "system"
+        markTerminalColorsPending()
         initTheme(themeName, enableWatcher: parsed.print != true && parsed.mode == nil)
         time("initTheme")
 

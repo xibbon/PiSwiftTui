@@ -1,12 +1,13 @@
 import Foundation
 import MiniTui
+import PiSwiftCodingAgent
 
 @MainActor
 public protocol TerminalThemeProbing: AnyObject {
     func queryTerminalColors(
         timeoutMs: Int,
-        onLateReply: (@MainActor (TerminalColors) -> Void)?
-    ) async -> TerminalColors
+        onLateReply: (@MainActor (MiniTui.TerminalColors) -> Void)?
+    ) async -> MiniTui.TerminalColors
 }
 
 extension TUI: TerminalThemeProbing {}
@@ -14,28 +15,14 @@ extension TUI: TerminalThemeProbing {}
 public func terminalThemeFromEnvironment(
     _ environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> TerminalColorScheme {
-    guard let colorFgBg = environment["COLORFGBG"] else { return .dark }
-    let parts = colorFgBg.split(separator: ";")
-    guard parts.count >= 2, let background = Int(parts[1]) else { return .dark }
-    return background < 8 ? .dark : .light
+    PiSwiftCodingAgent.detectColorFgBgTheme(env: environment) == .light ? .light : .dark
 }
 
-public func terminalTheme(for color: RgbColor) -> TerminalColorScheme {
-    func linear(_ channel: Int) -> Double {
-        let value = Double(channel) / 255
-        return value <= 0.03928
-            ? value / 12.92
-            : pow((value + 0.055) / 1.055, 2.4)
-    }
-
-    let luminance = 0.2126 * linear(color.r)
-        + 0.7152 * linear(color.g)
-        + 0.0722 * linear(color.b)
-    return luminance >= 0.5 ? .light : .dark
+public func terminalTheme(for color: MiniTui.RgbColor) -> TerminalColorScheme {
+    PiSwiftCodingAgent.terminalAppearance(color.codingAgentColor) == .light ? .light : .dark
 }
 
-/// The reported background decides, then a light/dark report the terminal sent earlier, then
-/// `COLORFGBG`, then dark (upstream v0.99.1 `detectTerminalTheme`).
+/// Use the shared library detection rules after the terminal query.
 @MainActor
 public func detectTerminalTheme(
     ui: any TerminalThemeProbing,
@@ -44,11 +31,22 @@ public func detectTerminalTheme(
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) async -> TerminalColorScheme {
     let colors = await ui.queryTerminalColors(timeoutMs: timeoutMs, onLateReply: nil)
-    if let background = colors.background {
-        return terminalTheme(for: background)
+    return PiSwiftCodingAgent.detectTerminalTheme(
+        colors: colors.codingAgentColors,
+        reportedScheme: reportedScheme?.codingAgentAppearance,
+        env: environment
+    ) == .light ? .light : .dark
+}
+
+/// Apply the first query result and any late replies. The task ends after the first result.
+@MainActor
+@discardableResult
+public func requestTerminalColors(
+    _ ui: any TerminalThemeProbing,
+    apply: @escaping @MainActor (MiniTui.TerminalColors) -> Void
+) -> Task<Void, Never> {
+    Task { @MainActor in
+        let colors = await ui.queryTerminalColors(timeoutMs: 100, onLateReply: apply)
+        apply(colors)
     }
-    if let reportedScheme {
-        return reportedScheme
-    }
-    return terminalThemeFromEnvironment(environment)
 }

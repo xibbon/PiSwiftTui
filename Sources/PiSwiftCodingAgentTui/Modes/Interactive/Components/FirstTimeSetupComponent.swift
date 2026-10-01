@@ -25,6 +25,7 @@ public final class FirstTimeSetupComponent: Container {
     }
 
     private let themeOptions = [
+        SetupOption(label: "System (matches your terminal colors)", themeName: "system", shareAnalytics: nil),
         SetupOption(label: "Dark", themeName: "dark", shareAnalytics: nil),
         SetupOption(label: "Light", themeName: "light", shareAnalytics: nil),
     ]
@@ -34,22 +35,18 @@ public final class FirstTimeSetupComponent: Container {
     ]
 
     private var step: Step = .theme
-    private var selectedThemeIndex: Int
+    private var selectedThemeIndex = 0
     private var selectedAnalyticsIndex = 0
-    private let detectedThemeName: String
     private let listContainer: Container
     private let onThemePreviewCallback: (String) -> Void
     private let onSubmitCallback: (FirstTimeSetupResult) -> Void
     private let onCancelCallback: () -> Void
 
     public init(
-        detectedThemeName: String,
         onThemePreview: @escaping (String) -> Void,
         onSubmit: @escaping (FirstTimeSetupResult) -> Void,
         onCancel: @escaping () -> Void
     ) {
-        self.detectedThemeName = detectedThemeName
-        self.selectedThemeIndex = detectedThemeName == "light" ? 1 : 0
         self.listContainer = Container()
         self.onThemePreviewCallback = onThemePreview
         self.onSubmitCallback = onSubmit
@@ -59,21 +56,27 @@ public final class FirstTimeSetupComponent: Container {
         update()
     }
 
+    public override func invalidate() {
+        update()
+        super.invalidate()
+    }
+
     private func update() {
         clear()
         addChild(DynamicBorder())
         addChild(Spacer(1))
-        addChild(Text(theme.fg(.accent, "Welcome to \(APP_NAME), the minimal coding agent."), paddingX: 1, paddingY: 0))
+        addChild(Text(theme.fg(.accent, ["██████", "██  ██", "████  ██", "██    ██"].joined(separator: "\n")), paddingX: 1, paddingY: 0))
+        addChild(Spacer(1))
+        addChild(Text(theme.fg(.accent, theme.bold("Welcome to \(APP_NAME), the minimal coding agent.")), paddingX: 1, paddingY: 0))
         addChild(Spacer(1))
 
         switch step {
         case .theme:
             addChild(Text(theme.fg(.text, "Pick a theme."), paddingX: 1, paddingY: 0))
-            addChild(Text(theme.fg(.muted, "Detected system appearance: \(detectedThemeName)"), paddingX: 1, paddingY: 0))
         case .analytics:
-            addChild(Text(theme.fg(.text, "Opt in to anonymous usage data sharing?"), paddingX: 1, paddingY: 0))
+            addChild(Text(theme.fg(.text, "Opt-in to anonymous usage data sharing?"), paddingX: 1, paddingY: 0))
             addChild(Text(
-                theme.fg(.muted, "Opting in stores a tracking identifier in settings.json and enables anonymous usage analytics."),
+                theme.fg(.muted, "Opting in stores a tracking identifier in settings.json and enables anonymous\nusage analytics. This helps us to better debug, reproduce, and resolve issues\nand bugs within Pi. You can observe what is shared using /privacy and make\nchanges anytime in settings.json."),
                 paddingX: 1,
                 paddingY: 0
             ))
@@ -82,7 +85,7 @@ public final class FirstTimeSetupComponent: Container {
         addChild(Spacer(1))
         addChild(listContainer)
         addChild(Spacer(1))
-        addChild(Text(theme.fg(.dim, "up/down navigate  enter \(step == .theme ? "continue" : "finish")  esc skip setup"), paddingX: 1, paddingY: 0))
+        addChild(Text(rawKeyHint("↑↓", "navigate") + "  " + keyHint(EditorAction.selectConfirm, step == .theme ? "continue" : "finish") + "  " + keyHint(EditorAction.selectCancel, "skip setup"), paddingX: 1, paddingY: 0))
         addChild(Spacer(1))
         addChild(DynamicBorder())
 
@@ -96,9 +99,9 @@ public final class FirstTimeSetupComponent: Container {
 
         for (index, option) in options.enumerated() {
             let isSelected = index == selectedIndex
-            let prefix = isSelected ? "> " : "  "
+            let prefix = isSelected ? theme.fg(.accent, "→ ") : "  "
             let line = isSelected
-                ? theme.fg(.accent, prefix + option.label)
+                ? prefix + theme.fg(.accent, option.label)
                 : prefix + theme.fg(.text, option.label)
             listContainer.addChild(Text(line, paddingX: 1, paddingY: 0))
         }
@@ -121,27 +124,28 @@ public final class FirstTimeSetupComponent: Container {
     }
 
     public override func handleInput(_ keyData: String) {
-        if isArrowUp(keyData) || keyData == "k" {
+        let kb = getKeybindings()
+        if kb.matches(keyData, TUIKeybinding.selectUp) || keyData == "k" {
             moveSelection(-1)
             return
         }
-        if isArrowDown(keyData) || keyData == "j" {
+        if kb.matches(keyData, TUIKeybinding.selectDown) || keyData == "j" {
             moveSelection(1)
             return
         }
-        if isEnter(keyData) || keyData == "\n" {
+        if kb.matches(keyData, TUIKeybinding.selectConfirm) || keyData == "\n" {
             switch step {
             case .theme:
                 step = .analytics
                 update()
             case .analytics:
-                let selectedTheme = themeOptions[selectedThemeIndex].themeName ?? "dark"
+                let selectedTheme = themeOptions[selectedThemeIndex].themeName ?? "system"
                 let shareAnalytics = analyticsOptions[selectedAnalyticsIndex].shareAnalytics ?? false
                 onSubmitCallback(FirstTimeSetupResult(themeName: selectedTheme, shareAnalytics: shareAnalytics))
             }
             return
         }
-        if isEscape(keyData) || isCtrlC(keyData) {
+        if kb.matches(keyData, TUIKeybinding.selectCancel) {
             onCancelCallback()
         }
     }

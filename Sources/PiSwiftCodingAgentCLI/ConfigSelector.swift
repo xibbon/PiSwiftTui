@@ -14,8 +14,7 @@ public func selectConfig(
 ) async {
     await withCheckedContinuation { continuation in
         Task { @MainActor in
-            initTheme(settingsManager.getTheme(), enableWatcher: true)
-            applyStartupTerminalSettings(settingsManager)
+            await prepareStartupTheme(settingsManager, enableWatcher: true)
             let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
             ui.setClearOnShrink(getClearOnShrink(cwd: cwd, agentDir: agentDir, loadProjectSettings: projectTrusted))
             var resolved = false
@@ -45,7 +44,7 @@ public func selectConfig(
 
             ui.addChild(selector)
             ui.setFocus(selector.getResourceList())
-            ui.start()
+            startStartupTui(ui, settingsManager: settingsManager)
         }
     }
 }
