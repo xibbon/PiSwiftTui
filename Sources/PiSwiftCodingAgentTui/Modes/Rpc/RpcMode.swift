@@ -316,7 +316,13 @@ final class PendingCompactionTasks: Sendable {
 }
 
 public func runRpcMode(_ session: AgentSession) async {
-    let output = RpcOutput.takeOverStdout()
+    await runRpcMode(session, output: RpcOutput.takeOverStdout(), readInputLine: { readLine() })
+}
+
+// A supplied input/output pair permits host tests without process-wide stdin changes.
+func runRpcMode(_ session: AgentSession, output: RpcOutput,
+                readInputLine: @Sendable () -> String?) async {
+    await installDefaultToolHtmlRenderer(session)
     let pendingCompactions = PendingCompactionTasks()
 
     // Upstream refreshes the catalogs here in the background (interactive mode starts its own
@@ -389,7 +395,7 @@ public func runRpcMode(_ session: AgentSession) async {
         output.sendLine(encodeSessionEventJSON(event))
     }
 
-    while let line = readLine() {
+    while let line = readInputLine() {
         guard let data = line.data(using: .utf8) else { continue }
         guard let json = try? JSONSerialization.jsonObject(with: data, options: []),
               let dict = json as? [String: Any] else {
@@ -631,7 +637,7 @@ func handleRpcCommand(
 
     case "export_html":
         let outputPath = dict["outputPath"] as? String
-        let path = try session.exportToHtml(outputPath)
+        let path = try await session.exportToHtml(outputPath)
         return makeSuccessResponse(idValue, "export_html", ["path": path])
 
     case "switch_session":

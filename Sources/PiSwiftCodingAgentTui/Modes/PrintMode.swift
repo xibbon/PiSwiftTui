@@ -12,6 +12,7 @@ public func runPrintMode(
     _ initialMessage: String? = nil,
     _ initialImages: [ImageContent]? = nil
 ) async throws {
+    await installDefaultToolHtmlRenderer(session)
     let outputJson = mode == .json
     let machineOutput = takeOverStdoutForMachineReadableOutput()
 

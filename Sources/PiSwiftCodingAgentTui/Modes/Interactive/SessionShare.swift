@@ -12,7 +12,7 @@ struct SessionShareDependencies: Sendable {
             try await execCommand("gh", arguments, FileManager.default.currentDirectoryPath, ExecOptions(signal: token))
         },
         exportHTML: @escaping @MainActor @Sendable (AgentSession, String, String) async throws -> Void = { session, path, themeName in
-            _ = try session.exportToHtml(path, themeName: themeName)
+            _ = try await session.exportToHtml(path, themeName: themeName)
         }
     ) {
         self.runGH = runGH

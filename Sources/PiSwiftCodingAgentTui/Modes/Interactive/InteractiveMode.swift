@@ -434,6 +434,11 @@ public final class InteractiveMode {
         self.setToolSendMessageHandler = setToolSendMessageHandler
         self.fdPath = fdPath
         self.verboseStartup = verbose
+        session.toolHtmlRenderer = TuiToolHtmlRenderer(theme: theme, cwd: session.sessionManager.getCwd(),
+            getTheme: { theme }, getRenderers: { [weak self, weak session] name in
+                guard let session else { return nil }
+                return registeredToolRenderers(name, session: session, fallback: self?.customTools[name]?.tool)
+            })
     }
 
     /// Construct a mounted component host for embedding and deterministic event tests.
@@ -2306,7 +2311,8 @@ public final class InteractiveMode {
 
     @MainActor
     private func getRegisteredToolDefinition(_ name: String) -> CustomTool? {
-        session?.hookRunner?.getExtensionTools().first { $0.name == name } ?? customTools[name]?.tool
+        guard let session else { return customTools[name]?.tool }
+        return registeredToolDefinition(name, session: session, fallback: customTools[name]?.tool)
     }
 
     @MainActor
@@ -3268,7 +3274,7 @@ public final class InteractiveMode {
             return
         }
         if trimmed.hasPrefix("/export") {
-            handleExportCommand(trimmed)
+            await handleExportCommand(trimmed)
             editor.setText("")
             return
         }
@@ -4540,7 +4546,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleExportCommand(_ text: String) {
+    func handleExportCommand(_ text: String) async {
         guard let session else { return }
         let parts = text.split(separator: " ").map(String.init)
         let outputPath = parts.count > 1 ? parts[1] : nil
@@ -4548,7 +4554,7 @@ public final class InteractiveMode {
         do {
             let exported = try outputPath?.hasSuffix(".jsonl") == true
                 ? session.exportToJsonl(outputPath)
-                : session.exportToHtml(outputPath, themeName: theme.name)
+                : await session.exportToHtml(outputPath, themeName: theme.name)
             showStatus("Exported to: \(exported)")
         } catch {
             showError("Export failed: \(error.localizedDescription)")
