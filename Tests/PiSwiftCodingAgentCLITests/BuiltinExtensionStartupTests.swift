@@ -13,12 +13,13 @@ import PiSwiftCodingAgent
     }
 
     @Test func builtInSelectionFollowsSettingsAndFlags() {
-        // C5b added builtin:codemode before tool-search (upstream order without the deferred llama.cpp).
+        // C5b added builtin:codemode before tool-search and C4b added builtin:mcp after it
+        // (upstream order without the deferred llama.cpp).
         let builtin = builtInExtensions
         #expect(selectStartupInlineExtensions(builtin, disabledPaths: [], explicitPaths: [],
-            noExtensions: false).map(\.name) == ["codemode", "tool-search"])
+            noExtensions: false).map(\.name) == ["codemode", "tool-search", "mcp"])
         #expect(selectStartupInlineExtensions(builtin, disabledPaths: ["-" + path], explicitPaths: [],
-            noExtensions: false).map(\.name) == ["codemode"])
+            noExtensions: false).map(\.name) == ["codemode", "mcp"])
         #expect(selectStartupInlineExtensions(builtin, disabledPaths: [], explicitPaths: [],
             noExtensions: true).isEmpty)
         #expect(selectStartupInlineExtensions(builtin, disabledPaths: ["-" + path], explicitPaths: [path],
