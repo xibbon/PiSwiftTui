@@ -324,6 +324,7 @@ public final class InteractiveMode {
     private var customTools: [String: LoadedCustomTool] = [:]
     private var hookShortcuts: [KeyId: HookShortcut] = [:]
     private var keybindings: KeybindingsManager = KeybindingsManager.inMemory()
+    private var mcpUi: InteractiveMcpUi?
     private var selectorCancel: (() -> Void)?
     /// Startup catalog refresh; cancelled on shutdown so it cannot outlive the session.
     private var backgroundCatalogRefreshTask: Task<Void, Never>?
@@ -404,6 +405,7 @@ public final class InteractiveMode {
         changelogMarkdown: String? = nil,
         scopedModels: [ScopedModel] = [],
         customTools: [LoadedCustomTool] = [],
+        mcpUi: InteractiveMcpUi? = nil,
         setToolUIContext: @escaping (HookUIContext, Bool) -> Void = { _, _ in },
         setToolSendMessageHandler: @escaping @Sendable (_ handler: @escaping HookSendMessageHandler) -> Void = { _ in },
         fdPath: String? = nil,
@@ -427,6 +429,7 @@ public final class InteractiveMode {
         self.changelogMarkdown = changelogMarkdown
         self.scopedModels = scopedModels
         self.customTools = Dictionary(uniqueKeysWithValues: customTools.map { ($0.tool.name, $0) })
+        self.mcpUi = mcpUi
         self.setToolUIContext = setToolUIContext
         self.setToolSendMessageHandler = setToolSendMessageHandler
         self.fdPath = fdPath
@@ -434,8 +437,9 @@ public final class InteractiveMode {
     }
 
     /// Construct a mounted component host for embedding and deterministic event tests.
-    convenience init(session: AgentSession, tui: TUI, editor: EditorComponentView, renderer: AltScreenRenderer? = nil) {
-        self.init(session: session, version: VERSION)
+    convenience init(session: AgentSession, tui: TUI, editor: EditorComponentView, renderer: AltScreenRenderer? = nil,
+                     mcpUi: InteractiveMcpUi? = nil) {
+        self.init(session: session, version: VERSION, mcpUi: mcpUi)
         self.tui = tui
         self.ui = TuiRenderAdapter(tui)
         self.editor = editor
@@ -909,6 +913,15 @@ public final class InteractiveMode {
     @MainActor
     func initializeHooksAndCustomTools() async {
         guard let session else { return }
+
+        mcpUi?.attach(custom: { [weak self] factory in
+            guard let self else { return nil }
+            return await self.showHookCustom(factory, options: nil)
+        }, requestRender: { [weak self] in
+            self?.ui.requestRender()
+        }, notify: { [weak self] message in
+            self?.showHookNotify(message, .error)
+        })
 
         let uiContext = InteractiveHookUIContext(
             select: { [weak self] title, options in
@@ -2870,6 +2883,7 @@ public final class InteractiveMode {
     private func performShutdown(fromSignal: Bool = false) async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
+        mcpUi?.cancelManager()
         loadingAnimation?.stop()
         loadingAnimation = nil
         clearWorkingIndicator()
@@ -3388,8 +3402,13 @@ public final class InteractiveMode {
         await prompt(trimmed, images: nil)
     }
 
-    private func prompt(_ text: String, images: [ImageContent]?) async {
+    func prompt(_ text: String, images: [ImageContent]?) async {
         guard let session else { return }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines) == "/mcp", mcpUi != nil,
+           session.hookRunner?.getCommand("mcp")?.sourceInfo?.path == "builtin:mcp" {
+            _ = await handleHookCommand(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            return
+        }
         emitOsc133("B") // command start — user submitted
         emitOsc133("C") // command executed — processing started
         do {
@@ -3402,7 +3421,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleHookCommand(_ text: String) async -> Bool {
+    func handleHookCommand(_ text: String) async -> Bool {
         guard let session, let hookRunner = session.hookRunner else { return false }
         guard text.hasPrefix("/") else { return false }
 
@@ -3418,7 +3437,12 @@ public final class InteractiveMode {
 
         let context = hookRunner.createCommandContext()
         do {
-            try await command.handler(args, context)
+            if commandName == "mcp", args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               command.sourceInfo?.path == "builtin:mcp", let mcpUi {
+                await mcpUi.runManager { try await command.handler(args, context) }
+            } else {
+                try await command.handler(args, context)
+            }
         } catch {
             hookRunner.emitError(HookError(
                 hookPath: "command:\(commandName)",

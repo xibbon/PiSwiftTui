@@ -38,6 +38,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             PackageSubcommand.self,
             ConfigSubcommand.self,
             AuthSubcommand.self,
+            McpSubcommand.self,
             UpdateSubcommand.self,
         ],
         defaultSubcommand: SessionSubcommand.self
@@ -371,8 +372,12 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         }.map { "-" + $0.path })
         let explicitBuiltinPaths = Set(cli.extensions.filter { $0.hasPrefix(BUILTIN_PATH_PREFIX) })
         let knownBuiltinPaths = Set(builtInExtensions.map { BUILTIN_PATH_PREFIX + $0.name })
+        let mcpUi = await MainActor.run { isInteractive ? InteractiveMcpUi() : nil }
+        let hostedBuiltins = startupBuiltinExtensions(
+            agentDir: URL(fileURLWithPath: agentDir, isDirectory: true), mcpUi: mcpUi
+        )
         let inlineExtensions = selectStartupInlineExtensions(
-            builtInExtensions + [PiReview.inlineExtension], disabledPaths: disabledBuiltinPaths,
+            hostedBuiltins + [PiReview.inlineExtension], disabledPaths: disabledBuiltinPaths,
             explicitPaths: explicitBuiltinPaths, noExtensions: parsed.noExtensions == true
         )
         let loadInlineExtensions: @Sendable () -> LoadExtensionsResult = {
@@ -654,6 +659,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                     changelogMarkdown: changelogMarkdown,
                     scopedModels: scopedModels,
                     customTools: customToolsResult.tools,
+                    mcpUi: mcpUi,
                     setToolUIContext: customToolsResult.setUIContext,
                     setToolSendMessageHandler: customToolsResult.setSendMessageHandler,
                     fdPath: nil,
@@ -681,6 +687,11 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
 
     static func main() async {
         let arguments = Array(CommandLine.arguments.dropFirst())
+        let routed = Self.moveLeadingSubcommandToFront(arguments)
+        if routed.first == "mcp" {
+            await runMcpCLI(Array(routed.dropFirst()))
+            return
+        }
         if let modeError = Self.modeArgumentError(arguments) {
             fputs("Error: \(modeError)\n", stderr)
             Darwin.exit(1)
@@ -817,6 +828,8 @@ Built-in Tool Names:
     }
 
     static func preprocessArguments(_ args: [String]) -> [String] {
+        let routed = moveLeadingSubcommandToFront(args)
+        if routed.first == "mcp" { return preprocessMcpArguments(routed) }
         var result: [String] = []
         var i = 0
         while i < args.count {
@@ -899,7 +912,7 @@ Built-in Tool Names:
         }
 
         guard index < args.count,
-              ["package", "config", "auth", "update"].contains(args[index]),
+              ["package", "config", "auth", "mcp", "update"].contains(args[index]),
               index > 0 else {
             return args
         }
