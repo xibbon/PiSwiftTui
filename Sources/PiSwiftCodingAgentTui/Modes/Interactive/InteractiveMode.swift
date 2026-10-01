@@ -2082,7 +2082,7 @@ public final class InteractiveMode {
                             let component = ToolExecutionComponent(
                                 toolName: call.name,
                                 toolCallId: call.id,
-                                args: call.arguments,
+                                args: toolArgumentsWithOrder(call.arguments, argumentsJSON: call.argumentsJSON),
                                 options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
                                 customTool: getRegisteredToolDefinition(call.name),
                                 sourceInfo: session.hookRunner?.getToolSourceInfo(call.name),
@@ -2092,7 +2092,7 @@ public final class InteractiveMode {
                             chatContainer.addChild(component)
                             pendingTools[call.id] = component
                         } else {
-                            pendingTools[call.id]?.updateArgs(call.arguments)
+                            pendingTools[call.id]?.updateArgs(toolArgumentsWithOrder(call.arguments, argumentsJSON: call.argumentsJSON))
                         }
                     }
                 }
@@ -2218,7 +2218,7 @@ public final class InteractiveMode {
             case .assistant(let assistant):
                 for block in assistant.content {
                     if case .toolCall(let call) = block {
-                        toolCalls[call.id] = (name: call.name, args: call.arguments)
+                        toolCalls[call.id] = (name: call.name, args: toolArgumentsWithOrder(call.arguments, argumentsJSON: call.argumentsJSON))
                     }
                 }
                 addMessageToChat(message)

@@ -220,6 +220,8 @@ public struct RpcAgentEvent: Sendable {
     /// Tool identity from a toolcall_start frame.
     public var assistantMessageToolCallId: String?
     public var assistantMessageToolName: String?
+    /// Completed tool call from a tool_call_end frame.
+    public var assistantMessageToolCall: ToolCall?
     public var messages: [AgentMessage]?
     public var toolResults: [ToolResultMessage]?
     public var toolCallId: String?
@@ -248,7 +250,8 @@ public struct RpcAgentEvent: Sendable {
         partialResult: AgentToolResult? = nil,
         result: AgentToolResult? = nil,
         isError: Bool? = nil,
-        parentToolCallId: String? = nil
+        parentToolCallId: String? = nil,
+        assistantMessageToolCall: ToolCall? = nil
     ) {
         self.type = type
         self.message = message
@@ -267,6 +270,7 @@ public struct RpcAgentEvent: Sendable {
         self.result = result
         self.isError = isError
         self.parentToolCallId = parentToolCallId
+        self.assistantMessageToolCall = assistantMessageToolCall
     }
 }
 
@@ -294,6 +298,7 @@ private struct RpcResponsePayload: Sendable {
     let success: Bool
     let data: AnyCodable?
     let error: String?
+    let orderedData: OrderedJSON?
 }
 
 private struct EventCollector {
@@ -669,7 +674,7 @@ public actor RpcClient {
               let messages = data["messages"] as? [[String: Any]] else {
             throw RpcClientError("Invalid get_messages response")
         }
-        return messages.compactMap { decodeAgentMessage($0) }
+        return decodeRpcMessages(messages, ordered: response.orderedData?["messages"])
     }
 
     public func getCommands() async throws -> [RpcSlashCommand] {
@@ -715,19 +720,20 @@ public actor RpcClient {
     }
 
     private func handleLine(_ line: String) async {
-        guard let data = line.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data, options: []),
-              let dict = json as? [String: Any] else {
+        guard let decoded = decodeRpcLine(line) else {
             return
         }
 
+        let dict = decoded.object
+        let ordered = decoded.ordered
         if (dict["type"] as? String) == "response" {
             let payload = RpcResponsePayload(
                 id: dict["id"] as? String,
                 command: dict["command"] as? String ?? "",
                 success: dict["success"] as? Bool ?? false,
                 data: dict["data"].map { AnyCodable($0) },
-                error: dict["error"] as? String
+                error: dict["error"] as? String,
+                orderedData: ordered?["data"]
             )
             if let id = payload.id, let continuation = pendingRequests.removeValue(forKey: id) {
                 continuation.resume(returning: payload)
@@ -735,7 +741,7 @@ public actor RpcClient {
             return
         }
 
-        let event = decodeRpcEvent(dict)
+        let event = decodeRpcEvent(dict, ordered: ordered)
         dispatchEvent(event)
     }
 
@@ -873,7 +879,18 @@ public actor RpcClient {
     }
 }
 
-private func decodeRpcEvent(_ dict: [String: Any]) -> RpcEvent {
+/// Parse order only for lines that contain tool arguments.
+func decodeRpcLine(_ line: String) -> (object: [String: Any], ordered: OrderedJSON?)? {
+    guard let data = line.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    let responseData = object["type"] as? String == "response" ? object["data"] as? [String: Any] : nil
+    let carriesArguments = jsonObjectCarriesToolArguments(object)
+        || responseData.map(jsonObjectCarriesToolArguments) == true
+    let ordered = carriesArguments ? try? OrderedJSON.parse(line, allowDuplicateKeys: true) : nil
+    return (object, ordered)
+}
+
+private func decodeRpcEvent(_ dict: [String: Any], ordered: OrderedJSON? = nil) -> RpcEvent {
     if let type = dict["type"] as? String, type == "hook_ui_request" {
         if let request = decodeHookUIRequest(dict) {
             return .hookUI(request)
@@ -886,7 +903,7 @@ private func decodeRpcEvent(_ dict: [String: Any]) -> RpcEvent {
         let stack = dict["stack"] as? String
         return .hookError(RpcHookError(hookPath: hookPath, event: event, error: error, stack: stack))
     }
-    if let event = decodeAgentEvent(dict) {
+    if let event = decodeAgentEvent(dict, ordered: ordered) {
         return .agent(event)
     }
     return .unknown(dict.mapValues { AnyCodable($0) })
@@ -938,30 +955,40 @@ private func decodeHookUIRequest(_ dict: [String: Any]) -> RpcHookUIRequest? {
     }
 }
 
-func decodeAgentEvent(_ dict: [String: Any]) -> RpcAgentEvent? {
+func decodeAgentEvent(_ dict: [String: Any], ordered: OrderedJSON? = nil) -> RpcAgentEvent? {
     guard let type = dict["type"] as? String else { return nil }
     switch type {
     case "agent_start", "agent_settled", "turn_start", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end":
         return RpcAgentEvent(type: type)
     case "agent_end":
-        let messages = (dict["messages"] as? [[String: Any]] ?? []).compactMap { decodeAgentMessage($0) }
+        let messages = (dict["messages"] as? [[String: Any]] ?? []).enumerated().compactMap { index, message in
+            decodeAgentMessage(message, ordered: ordered?["messages"]?[index])
+        }
         return RpcAgentEvent(type: type, messages: messages)
     case "turn_end":
         let messageDict = dict["message"] as? [String: Any]
-        let message = messageDict.flatMap { decodeAgentMessage($0) }
-        let toolResults = (dict["toolResults"] as? [[String: Any]] ?? []).compactMap { decodeToolResultMessage($0) }
+        let message = messageDict.flatMap { decodeAgentMessage($0, ordered: ordered?["message"]) }
+        let toolResults = (dict["toolResults"] as? [[String: Any]] ?? []).enumerated().compactMap { index, result in
+            decodeToolResultMessage(result, ordered: ordered?["toolResults"]?[index])
+        }
         return RpcAgentEvent(type: type, message: message, toolResults: toolResults)
     case "message_start":
         let messageDict = dict["message"] as? [String: Any]
-        let message = messageDict.flatMap { decodeAgentMessage($0) }
+        let message = messageDict.flatMap { decodeAgentMessage($0, ordered: ordered?["message"]) }
         return RpcAgentEvent(type: type, message: message)
     case "message_update":
         let messageDict = dict["message"] as? [String: Any]
-        let message = messageDict.flatMap { decodeAgentMessage($0) }
+        let message = messageDict.flatMap { decodeAgentMessage($0, ordered: ordered?["message"]) }
         // v0.84.1 (#7290): `message_update` no longer carries a cumulative `message` snapshot.
         // `assistantMessageEvent` is now an object; clients assemble deltas between
         // `message_start` and `message_end`, and `message_end` remains authoritative.
         let eventObject = dict["assistantMessageEvent"] as? [String: Any]
+        let toolCall: ToolCall? = (eventObject?["toolCall"] as? [String: Any]).flatMap { block in
+            guard case .toolCall(let call) = contentBlockFromJSONObject(
+                block, ordered: ordered?["assistantMessageEvent"]?["toolCall"]
+            ) else { return nil }
+            return call
+        }
         return RpcAgentEvent(
             type: type,
             message: message,
@@ -969,30 +996,38 @@ func decodeAgentEvent(_ dict: [String: Any]) -> RpcAgentEvent? {
             assistantMessageContentIndex: eventObject?["contentIndex"] as? Int,
             assistantMessageDelta: eventObject?["delta"] as? String,
             usage: (dict["usage"] as? [String: Any]).map(decodeUsage),
-            assistantMessageToolCallId: eventObject?["id"] as? String,
-            assistantMessageToolName: eventObject?["toolName"] as? String,
-            toolCallId: eventObject?["id"] as? String,
-            toolName: eventObject?["toolName"] as? String
+            assistantMessageToolCallId: toolCall?.id ?? eventObject?["id"] as? String,
+            assistantMessageToolName: toolCall?.name ?? eventObject?["toolName"] as? String,
+            toolCallId: toolCall?.id ?? eventObject?["id"] as? String,
+            toolName: toolCall?.name ?? eventObject?["toolName"] as? String,
+            args: toolCall?.arguments,
+            assistantMessageToolCall: toolCall
         )
     case "message_end":
         let messageDict = dict["message"] as? [String: Any]
-        let message = messageDict.flatMap { decodeAgentMessage($0) }
+        let message = messageDict.flatMap { decodeAgentMessage($0, ordered: ordered?["message"]) }
         return RpcAgentEvent(type: type, message: message)
     case "tool_execution_start":
         let toolCallId = dict["toolCallId"] as? String ?? ""
         let toolName = dict["toolName"] as? String ?? ""
-        let args = (dict["args"] as? [String: Any] ?? [:]).mapValues { AnyCodable($0) }
+        let args = toolArgumentsWithOrder(
+            (dict["args"] as? [String: Any] ?? [:]).mapValues { AnyCodable($0) },
+            argumentsJSON: ordered?["args"].flatMap { toolArgumentsSource($0) }
+        )
         return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, args: args, parentToolCallId: dict["parentToolCallId"] as? String)
     case "tool_execution_update":
         let toolCallId = dict["toolCallId"] as? String ?? ""
         let toolName = dict["toolName"] as? String ?? ""
-        let args = (dict["args"] as? [String: Any] ?? [:]).mapValues { AnyCodable($0) }
-        let partial = (dict["partialResult"] as? [String: Any]).map { decodeAgentToolResult($0) }
+        let args = toolArgumentsWithOrder(
+            (dict["args"] as? [String: Any] ?? [:]).mapValues { AnyCodable($0) },
+            argumentsJSON: ordered?["args"].flatMap { toolArgumentsSource($0) }
+        )
+        let partial = (dict["partialResult"] as? [String: Any]).map { decodeAgentToolResult($0, ordered: ordered?["partialResult"]) }
         return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, args: args, partialResult: partial, parentToolCallId: dict["parentToolCallId"] as? String)
     case "tool_execution_end":
         let toolCallId = dict["toolCallId"] as? String ?? ""
         let toolName = dict["toolName"] as? String ?? ""
-        let result = (dict["result"] as? [String: Any]).map { decodeAgentToolResult($0) }
+        let result = (dict["result"] as? [String: Any]).map { decodeAgentToolResult($0, ordered: ordered?["result"]) }
         let isError = dict["isError"] as? Bool ?? false
         return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, result: result, isError: isError, parentToolCallId: dict["parentToolCallId"] as? String)
     default:
@@ -1000,7 +1035,13 @@ func decodeAgentEvent(_ dict: [String: Any]) -> RpcAgentEvent? {
     }
 }
 
-private func decodeAgentMessage(_ dict: [String: Any]) -> AgentMessage? {
+func decodeRpcMessages(_ messages: [[String: Any]], ordered: OrderedJSON?) -> [AgentMessage] {
+    messages.enumerated().compactMap { index, message in
+        decodeAgentMessage(message, ordered: ordered?[index])
+    }
+}
+
+private func decodeAgentMessage(_ dict: [String: Any], ordered: OrderedJSON? = nil) -> AgentMessage? {
     guard let role = dict["role"] as? String else { return nil }
     switch role {
     case "user":
@@ -1010,9 +1051,9 @@ private func decodeAgentMessage(_ dict: [String: Any]) -> AgentMessage? {
         if let text = contentValue as? String {
             content = .text(text)
         } else if let blocks = contentValue as? [Any] {
-            let contentBlocks = blocks.compactMap { block -> ContentBlock? in
+            let contentBlocks = blocks.enumerated().compactMap { index, block -> ContentBlock? in
                 guard let dict = block as? [String: Any] else { return nil }
-                return contentBlockFromDict(dict)
+                return contentBlockFromJSONObject(dict, ordered: ordered?["content"]?[index])
             }
             content = .blocks(contentBlocks)
         } else {
@@ -1020,48 +1061,11 @@ private func decodeAgentMessage(_ dict: [String: Any]) -> AgentMessage? {
         }
         return .user(UserMessage(content: content, timestamp: timestamp))
     case "assistant":
-        let timestamp = (dict["timestamp"] as? Int64) ?? Int64(Date().timeIntervalSince1970 * 1000)
-        let api = Api(rawValue: dict["api"] as? String ?? "") ?? .openAIResponses
-        let provider = dict["provider"] as? String ?? ""
-        let model = dict["model"] as? String ?? ""
-        let stopReason = StopReason(rawValue: dict["stopReason"] as? String ?? "stop") ?? .stop
-        let errorMessage = dict["errorMessage"] as? String
-        let usageDict = dict["usage"] as? [String: Any] ?? [:]
-        let usage = decodeUsage(usageDict)
-        let contentBlocks = (dict["content"] as? [Any] ?? []).compactMap { block -> ContentBlock? in
-            guard let dict = block as? [String: Any] else { return nil }
-            return contentBlockFromDict(dict)
-        }
-        let assistant = AssistantMessage(
-            content: contentBlocks,
-            api: api,
-            provider: provider,
-            model: model,
-            usage: usage,
-            stopReason: stopReason,
-            errorMessage: errorMessage,
-            timestamp: timestamp
-        )
+        var assistant = assistantMessageFromJSONObject(dict, ordered: ordered)
+        if dict["timestamp"] == nil { assistant.timestamp = Int64(Date().timeIntervalSince1970 * 1000) }
         return .assistant(assistant)
     case "toolResult":
-        let timestamp = (dict["timestamp"] as? Int64) ?? Int64(Date().timeIntervalSince1970 * 1000)
-        let toolCallId = dict["toolCallId"] as? String ?? ""
-        let toolName = dict["toolName"] as? String ?? ""
-        let isError = dict["isError"] as? Bool ?? false
-        let details = dict["details"].map { AnyCodable($0) }
-        let contentBlocks = (dict["content"] as? [Any] ?? []).compactMap { block -> ContentBlock? in
-            guard let dict = block as? [String: Any] else { return nil }
-            return contentBlockFromDict(dict)
-        }
-        let toolResult = ToolResultMessage(
-            toolCallId: toolCallId,
-            toolName: toolName,
-            content: contentBlocks,
-            details: details,
-            isError: isError,
-            timestamp: timestamp
-        )
-        return .toolResult(toolResult)
+        return decodeToolResultMessage(dict, ordered: ordered).map { .toolResult($0) }
     case "bashExecution", "hookMessage", "branchSummary", "compactionSummary":
         let payload = dict
         let timestamp = (dict["timestamp"] as? Int64) ?? Int64(Date().timeIntervalSince1970 * 1000)
@@ -1071,31 +1075,34 @@ private func decodeAgentMessage(_ dict: [String: Any]) -> AgentMessage? {
     }
 }
 
-private func decodeToolResultMessage(_ dict: [String: Any]) -> ToolResultMessage? {
+private func decodeToolResultMessage(_ dict: [String: Any], ordered: OrderedJSON? = nil) -> ToolResultMessage? {
     let toolCallId = dict["toolCallId"] as? String ?? ""
     let toolName = dict["toolName"] as? String ?? ""
     let isError = dict["isError"] as? Bool ?? false
     let timestamp = (dict["timestamp"] as? Int64) ?? Int64(Date().timeIntervalSince1970 * 1000)
     let details = dict["details"].map { AnyCodable($0) }
-    let contentBlocks = (dict["content"] as? [Any] ?? []).compactMap { block -> ContentBlock? in
+    let contentBlocks = (dict["content"] as? [Any] ?? []).enumerated().compactMap { index, block -> ContentBlock? in
         guard let dict = block as? [String: Any] else { return nil }
-        return contentBlockFromDict(dict)
+        return contentBlockFromJSONObject(dict, ordered: ordered?["content"]?[index])
     }
     return ToolResultMessage(
         toolCallId: toolCallId,
         toolName: toolName,
         content: contentBlocks,
         details: details,
+        nestedCalls: (dict["nestedCalls"] as? [String: Any]).flatMap {
+            nestedToolCallsFromJSONObject($0, ordered: ordered?["nestedCalls"])
+        },
         isError: isError,
         timestamp: timestamp
     )
 }
 
-private func decodeAgentToolResult(_ dict: [String: Any]) -> AgentToolResult {
+private func decodeAgentToolResult(_ dict: [String: Any], ordered: OrderedJSON? = nil) -> AgentToolResult {
     let details = dict["details"].map { AnyCodable($0) }
-    let contentBlocks = (dict["content"] as? [Any] ?? []).compactMap { block -> ContentBlock? in
+    let contentBlocks = (dict["content"] as? [Any] ?? []).enumerated().compactMap { index, block -> ContentBlock? in
         guard let dict = block as? [String: Any] else { return nil }
-        return contentBlockFromDict(dict)
+        return contentBlockFromJSONObject(dict, ordered: ordered?["content"]?[index])
     }
     var result = AgentToolResult(content: contentBlocks, details: details)
     result.structuredContent = dict["structuredContent"].map { AnyCodable($0) }

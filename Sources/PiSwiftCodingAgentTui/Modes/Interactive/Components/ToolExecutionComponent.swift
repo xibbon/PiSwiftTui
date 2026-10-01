@@ -274,6 +274,20 @@ public final class ToolExecutionComponent: Container {
             contentText.setText(formatToolExecution())
             hasContent = true
         }
+        if let nested = result?.nestedCalls, !nested.calls.isEmpty {
+            let text = nested.calls.map { call in
+                let args = toolArgumentsWithOrder(call.arguments ?? [:], argumentsJSON: call.argumentsJSON)
+                return formatToolCallWithArgs(call.name, args: args, theme: theme, expanded: expanded)
+            }.joined(separator: "\n")
+            let component = createResultRegion(Text(text, paddingX: 0, paddingY: 0))
+            if renderers != nil {
+                if renderShell == .self { selfRenderContainer.addChild(component) }
+                else { contentBox.addChild(component) }
+            } else {
+                contentText.setText(formatToolExecution() + "\n" + text)
+            }
+            hasContent = true
+        }
         for image in imageComponents { removeChild(image) }
         for spacer in imageSpacers { removeChild(spacer) }
         imageComponents.removeAll()

@@ -2,8 +2,8 @@ import Foundation
 import PiSwiftAI
 import PiSwiftCodingAgent
 
-/// JSON.stringify formatting for tool headers. Dictionary input has no source order.
-func toolArgumentJSON(_ value: OrderedJSON, pretty: Bool = false, depth: Int = 0) -> String {
+/// JSON.stringify formatting for tool headers.
+func toolArgumentJSON(_ value: OrderedJSON, pretty: Bool = false, depth: Int = 0, preserveOrder: Bool = false) -> String {
     let indent = String(repeating: "  ", count: depth)
     let childIndent = indent + "  "
     switch value {
@@ -12,12 +12,12 @@ func toolArgumentJSON(_ value: OrderedJSON, pretty: Bool = false, depth: Int = 0
     case .number(let source): return javascriptNumber(Double(source) ?? .nan)
     case .string(let value): return javascriptJSONString(value)
     case .array(let values):
-        let items = values.map { toolArgumentJSON($0, pretty: pretty, depth: depth + 1) }
+        let items = values.map { toolArgumentJSON($0, pretty: pretty, depth: depth + 1, preserveOrder: preserveOrder) }
         if items.isEmpty { return "[]" }
         return pretty ? "[\n" + items.map { childIndent + $0 }.joined(separator: ",\n") + "\n" + indent + "]" : "[" + items.joined(separator: ",") + "]"
     case .object(let sourcePairs):
-        let pairs = javascriptObjectEntries(sourcePairs)
-        let items = pairs.map { javascriptJSONString($0.0) + (pretty ? ": " : ":") + toolArgumentJSON($0.1, pretty: pretty, depth: depth + 1) }
+        let pairs = preserveOrder ? sourcePairs : javascriptObjectEntries(sourcePairs)
+        let items = pairs.map { javascriptJSONString($0.0) + (pretty ? ": " : ":") + toolArgumentJSON($0.1, pretty: pretty, depth: depth + 1, preserveOrder: preserveOrder) }
         if items.isEmpty { return "{}" }
         return pretty ? "{\n" + items.map { childIndent + $0 }.joined(separator: ",\n") + "\n" + indent + "}" : "{" + items.joined(separator: ",") + "}"
     }
@@ -80,7 +80,11 @@ func toolPreview(_ text: String, maxCharacters: Int) -> String {
 }
 
 public func formatToolCallWithArgs(_ title: String, args: [String: AnyCodable], theme: Theme, expanded: Bool) -> String {
-    formatToolCallWithArgs(title, args: .object(args.keys.sorted().map { ($0, OrderedJSON.fromFoundation(args[$0]!.jsonValue)) }), theme: theme, expanded: expanded)
+    let values = toolArgumentsToOrderedJSON(args)
+    let entries = orderedToolArguments(args).compactMap { pair in
+        values[pair.key].map { (pair.key, $0) }
+    }
+    return formatToolArgumentEntries(title, entries: entries, theme: theme, expanded: expanded, preserveOrder: true)
 }
 
 public func formatToolCallWithArgs(_ title: String, args: OrderedJSON?, theme: Theme, expanded: Bool) -> String {
@@ -88,14 +92,19 @@ public func formatToolCallWithArgs(_ title: String, args: OrderedJSON?, theme: T
     guard let args else { return header }
     if case .null = args { return header }
     let entries = args.objectEntries.map(javascriptObjectEntries) ?? [("args", args)]
+    return formatToolArgumentEntries(title, entries: entries, theme: theme, expanded: expanded, preserveOrder: false)
+}
+
+private func formatToolArgumentEntries(_ title: String, entries: [(String, OrderedJSON)], theme: Theme, expanded: Bool, preserveOrder: Bool) -> String {
+    let header = theme.fg(.toolTitle, theme.bold(title))
     guard !entries.isEmpty else { return header }
     if expanded {
         let lines = entries.map { key, value in
-            let raw = value.stringValue ?? toolArgumentJSON(value, pretty: true)
+            let raw = value.stringValue ?? toolArgumentJSON(value, pretty: true, preserveOrder: preserveOrder)
             return "  \(key): " + normalizeDisplayText(replaceTabs(raw)).replacingOccurrences(of: "\n", with: "\n    ")
         }
         return header + "\n" + theme.fg(.muted, lines.joined(separator: "\n"))
     }
-    let pairs = entries.map { $0.0 + "=" + toolArgumentJSON($0.1) }.joined(separator: " ")
+    let pairs = entries.map { $0.0 + "=" + toolArgumentJSON($0.1, preserveOrder: preserveOrder) }.joined(separator: " ")
     return header + " " + theme.fg(.muted, toolPreview(pairs, maxCharacters: 100))
 }

@@ -429,11 +429,22 @@ public func runRpcMode(_ session: AgentSession) async {
 }
 
 func dispatchRpcCommand(_ type: String, _ command: [String: Any], _ session: AgentSession, _ output: RpcOutput) async {
+    if type == "get_messages" {
+        output.sendLine(encodeRpcMessagesResponse(command["id"], messages: session.messages))
+        return
+    }
     do {
         output.send(try await handleRpcCommand(type, command, session, output))
     } catch {
         output.send(makeErrorResponse(command["id"], type, error.localizedDescription))
     }
+}
+
+func encodeRpcMessagesResponse(_ id: Any?, messages: [AgentMessage]) -> String {
+    let envelope = OrderedJSON.fromFoundation(makeSuccessResponse(id, "get_messages", [:]))
+    return replacingJSONMembers(envelope, with: [
+        "data": .object([("messages", .array(messages.map(encodeAgentMessageJSON)))])
+    ]).serialized()
 }
 
 func handleRpcCommand(
@@ -643,10 +654,6 @@ func handleRpcCommand(
 
     case "get_last_assistant_text":
         return makeSuccessResponse(idValue, "get_last_assistant_text", ["text": session.getLastAssistantText() as Any])
-
-    case "get_messages":
-        let messages = session.messages.map { encodeAgentMessageDict($0) }
-        return makeSuccessResponse(idValue, "get_messages", ["messages": messages])
 
     case "get_commands":
         var commands: [[String: Any]] = []
