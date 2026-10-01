@@ -11,6 +11,7 @@ public protocol EditorComponent: AnyObject {
     func getText() -> String
     func getExpandedText() -> String
     func insertTextAtCursor(_ text: String)
+    func getPasteCursor() -> (line: Int, col: Int)?
     func addToHistory(_ text: String)
     func setAutocompleteProvider(_ provider: AutocompleteProvider)
     func setPaddingX(_ padding: Int)
@@ -21,6 +22,7 @@ public protocol EditorComponent: AnyObject {
 
 public extension EditorComponent {
     func setPaddingX(_ padding: Int) {}
+    func getPasteCursor() -> (line: Int, col: Int)? { (self as? Editor)?.getCursor() }
 }
 
 public typealias EditorComponentView = Component & EditorComponent

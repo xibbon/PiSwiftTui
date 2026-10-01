@@ -211,7 +211,8 @@ public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCur
             let providerBadge = theme.fg(.muted, "[\(item.provider)]")
             let checkmark = isCurrent ? theme.fg(.accent, "✓ ") : "  "
             let prefix = isSelected ? theme.fg(.accent, "→ ") : "  "
-            let badge = isDefaultModel(item.model) ? theme.fg(.muted, " · default") : ""
+            let badge = (isVirtualModel(item.model) ? theme.fg(.muted, " · virtual") : "")
+                + (isDefaultModel(item.model) ? theme.fg(.muted, " · default") : "")
             let line = "\(prefix)\(checkmark)\(isSelected ? theme.fg(.accent, modelText) : modelText) \(providerBadge)\(badge)"
 
             listContainer.addChild(Text(line, paddingX: 0, paddingY: 0))

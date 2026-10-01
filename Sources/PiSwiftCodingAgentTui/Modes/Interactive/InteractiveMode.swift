@@ -281,6 +281,10 @@ public final class InteractiveMode {
     private var tui: TUI?
     private var altScreenRenderer: AltScreenRenderer?
     var clipboardCopy: (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard
+    var clipboardFiles: () throws -> [String]? = readClipboardFilePaths
+    var clipboardImage: () -> ClipboardImageReadResult = readClipboardImagePngData
+    var clipboardText: () -> ClipboardReadResult = readClipboardText
+    var writeClipboardImage: (Data, URL) throws -> Void = { try $0.write(to: $1) }
     private var composition: InteractiveComposition?
     private var tuiConfiguration: InteractiveTuiConfiguration
     private var tuiModeOverride: InteractiveTuiMode?
@@ -662,7 +666,8 @@ public final class InteractiveMode {
         let altScreenRenderer = tui.enableAltScreen(options: interactiveAltScreenOptions(
             wheelScrollLines: tuiConfiguration.mouseWheelStep,
             copyOnSelect: settingsManager.getFullscreenCopyOnSelect(),
-            onRightClickPaste: { [weak self] in self?.handleClipboardImagePaste() }
+            onRightClickPaste: { [weak self] in self?.handleClipboardImagePaste() },
+            fullscreenWheelScrollLines: tuiConfiguration.fullscreenWheelScrollLines
         ))
         altScreenRenderer.setLayoutRoot(composition.fullscreenRoot)
         self.altScreenRenderer = altScreenRenderer
@@ -771,22 +776,9 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func setMouseWheelStep(_ step: Int) {
-        guard let tui, let composition else { return }
-        let normalized = max(1, step)
-        guard normalized != tuiConfiguration.mouseWheelStep else { return }
-        let wasFullscreen = tui.mode == .altScreen
-        if wasFullscreen {
-            _ = tui.switchRenderer(to: .mainScreen)
-        }
-        let renderer = tui.enableAltScreen(options: interactiveAltScreenOptions(wheelScrollLines: normalized, copyOnSelect: session?.settingsManager.getFullscreenCopyOnSelect() ?? true, onRightClickPaste: { [weak self] in self?.handleClipboardImagePaste() }))
-        renderer.setLayoutRoot(composition.fullscreenRoot)
-        altScreenRenderer = renderer
-        tuiConfiguration.mouseWheelStep = normalized
-        if wasFullscreen {
-            _ = tui.switchRenderer(to: .altScreen)
-        }
-        mountWorkingIndicator()
+    func setFullscreenWheelScrollLines(_ lines: PiSwiftCodingAgent.WheelScrollLines) {
+        tuiConfiguration.fullscreenWheelScrollLines = lines
+        altScreenRenderer?.setWheelScrollLines(lines.miniTuiValue)
     }
 
     @MainActor
@@ -2080,6 +2072,7 @@ public final class InteractiveMode {
                                 args: call.arguments,
                                 options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
                                 customTool: getRegisteredToolDefinition(call.name),
+                                sourceInfo: session.hookRunner?.getToolSourceInfo(call.name),
                                 ui: tui
                             )
                             component.setExpanded(toolOutputExpanded)
@@ -2124,6 +2117,7 @@ public final class InteractiveMode {
                     args: args,
                     options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
                     customTool: getRegisteredToolDefinition(toolName),
+                    sourceInfo: session.hookRunner?.getToolSourceInfo(toolName),
                     ui: tui
                 )
                 component.setExpanded(toolOutputExpanded)
@@ -2225,6 +2219,7 @@ public final class InteractiveMode {
                     args: toolInfo?.args ?? [:],
                     options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
                     customTool: getRegisteredToolDefinition(toolInfo?.name ?? toolResult.toolName),
+                    sourceInfo: session.hookRunner?.getToolSourceInfo(toolInfo?.name ?? toolResult.toolName),
                     ui: tui
                 )
                 component.setExpanded(toolOutputExpanded)
@@ -3145,30 +3140,34 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleClipboardImagePaste() {
+    func handleClipboardImagePaste() {
         guard let editor else { return }
-
-        if clipboardHasImage(), let data = getClipboardImagePngData(), !data.isEmpty {
-            let fileName = "pi-clipboard-\(UUID().uuidString).png"
-            let filePath = (NSTemporaryDirectory() as NSString).appendingPathComponent(fileName)
-            do {
-                try data.write(to: URL(fileURLWithPath: filePath))
+        do {
+            if let paths = try clipboardFiles() {
+                let insertion = try clipboardFileInsertion(paths, bashMode: editor.getText().trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("!"), text: editor.getText(), cursor: editor.getPasteCursor())
+                editor.insertTextAtCursor(insertion)
+                scheduleRender()
+                return
+            }
+            switch clipboardImage() {
+            case .content(let data):
+                let fileName = "pi-clipboard-\(UUID().uuidString).png"
+                let filePath = (NSTemporaryDirectory() as NSString).appendingPathComponent(fileName)
+                try writeClipboardImage(data, URL(fileURLWithPath: filePath))
                 editor.insertTextAtCursor(filePath)
                 scheduleRender()
-            } catch {
-                // Ignore clipboard errors.
+                return
+            case .error(let message): throw ClipboardPasteError.read(message)
+            case .empty, .unavailable: break
             }
-            return
-        }
-
-        switch readClipboardText() {
-        case .content(let text):
-            editor.insertTextAtCursor(text)
-            scheduleRender()
-        case .error(let message):
-            showStatus("Paste failed: \(message)")
-        case .empty, .unavailable:
-            break
+            switch clipboardText() {
+            case .content(let text):
+                if !text.isEmpty { editor.insertTextAtCursor(text); scheduleRender() }
+            case .error(let message): throw ClipboardPasteError.read(message)
+            case .empty, .unavailable: break
+            }
+        } catch {
+            showError("Failed to paste from clipboard: \(error.localizedDescription)")
         }
     }
 
@@ -3592,7 +3591,7 @@ public final class InteractiveMode {
         let modelId = settingsManager.getDefaultModel()
         let defaultModel = provider.flatMap { provider in modelId.map { "\(provider)/\($0)" } } ?? "not set"
 
-        let config = SettingsConfig(
+        var config = SettingsConfig(
             autoCompact: settingsManager.getCompactionEnabled(),
             showImages: settingsManager.getShowImages(),
             autoResizeImages: settingsManager.getAutoResizeImages(),
@@ -3632,8 +3631,10 @@ public final class InteractiveMode {
             thinkingCycleKey: formatKeyDisplay(keybindings.getKeys(.cycleThinkingLevel))
         )
 
+        config.fullscreenWheelScrollLines = settingsManager.getFullscreenWheelScrollLines()
+
         showSelector { done in
-            let callbacks = SettingsCallbacks(
+            var callbacks = SettingsCallbacks(
                 onAutoCompactChange: { [weak self] enabled in
                     settingsManager.setCompactionEnabled(enabled)
                     self?.footer?.setAutoCompactEnabled(enabled)
@@ -3717,7 +3718,7 @@ public final class InteractiveMode {
                 },
                 onMouseWheelStepChange: { [weak self] step in
                     settingsManager.setMouseWheelStep(step)
-                    self?.setMouseWheelStep(step)
+                    self?.setFullscreenWheelScrollLines(.lines(step))
                 },
                 onMermaidEnabledChange: { [weak self] enabled in
                     settingsManager.setMermaidEnabled(enabled)
@@ -3765,6 +3766,10 @@ public final class InteractiveMode {
                 }
             )
 
+            callbacks.onFullscreenWheelScrollLinesChange = { [weak self] lines in
+                settingsManager.setFullscreenWheelScrollLines(lines)
+                self?.setFullscreenWheelScrollLines(lines)
+            }
             let selector = SettingsSelectorComponent(config: config, callbacks: callbacks)
             return (component: selector, focus: selector)
         }
@@ -3794,8 +3799,11 @@ public final class InteractiveMode {
             settingsManager: session.settingsManager, builtinExtensions: builtInExtensions.map(\.name))
 
         let resolvedPaths: ResolvedPaths
+        let globalResolvedPaths: ResolvedPaths
         do {
             resolvedPaths = try await packageManager.resolve(onMissing: nil)
+            globalResolvedPaths = try await resolveBuiltinExtensionPaths(settingsManager: session.settingsManager,
+                names: builtInExtensions.map(\.name), cwd: cwd, agentDir: agentDir, projectTrusted: false)
         } catch {
             loader.dispose()
             editorContainer.clear()
@@ -3821,7 +3829,8 @@ public final class InteractiveMode {
                 },
                 requestRender: { [weak self] in
                     self?.ui.requestRender()
-                }
+                },
+                globalResolvedPaths: globalResolvedPaths
             )
             return (component: selector, focus: selector.getResourceList())
         }
@@ -4328,7 +4337,7 @@ public final class InteractiveMode {
 
     @MainActor
     private func handleOAuthLogin(_ provider: OAuthProvider, authStorage: AuthStorage) async {
-        guard let tui, let editorContainer, let editor else { return }
+        guard let session, let tui, let editorContainer, let editor else { return }
         let providerName = getOAuthProviders().first { $0.id == provider }?.name ?? provider.rawValue
 
         let dialog = LoginDialogComponent(tui: tui, providerId: provider.rawValue) { _, _ in }
@@ -4391,15 +4400,16 @@ public final class InteractiveMode {
                 }
             },
             onManualCodeInput: manualInputProvider,
-            signal: dialog.signal
+            signal: dialog.signal,
+            getDeviceId: interactiveOAuthDeviceIdProvider(session.settingsManager)
         )
 
         do {
             try await authStorage.login(provider, callbacks: callbacks)
             // Local credential consistency first — this must be synchronous so the session picks
             // up the new credential immediately.
-            _ = await session?.modelRegistry.refresh(ModelsRefreshOptions(allowNetwork: false))
-            await session?.refreshActiveModel()
+            _ = await session.modelRegistry.refresh(ModelsRefreshOptions(allowNetwork: false))
+            await session.refreshActiveModel()
             restoreEditor()
             showStatus("Logged in to \(providerName). Credentials saved to \(getAuthPath())")
             // Freshness is then chased in a bounded background refresh, so login can never hang
@@ -4559,6 +4569,11 @@ public final class InteractiveMode {
     @MainActor
     func handleSessionCommand() async {
         guard let session else { return }
+        let entries = session.sessionManager.getEntries()
+        let usageBreakdown = getUsageCostBreakdown(entries)
+        let cacheWaste = computeCacheWaste(entries, modelRegistry: session.modelRegistry)
+        let selectedModel = session.agent.state.model
+        let selectedModelKey = "\(selectedModel.provider)/\(selectedModel.id)"
         let cacheWarmingStatus = await session.cacheWarmingStatus()
         let stats = session.getSessionStats()
         let sessionName = session.sessionManager.getSessionName()
@@ -4577,20 +4592,20 @@ public final class InteractiveMode {
             info += "\(theme.fg(.dim, "File:")) \(stats.sessionFile ?? "In-memory")\n"
             info += "\(theme.fg(.dim, "ID:")) \(stats.sessionId)\n\n"
             info += "\(theme.bold("Messages"))\n"
+            info += "\(theme.fg(.dim, "Total:")) \(stats.totalMessages)\n"
             info += "\(theme.fg(.dim, "User:")) \(stats.userMessages)\n"
             info += "\(theme.fg(.dim, "Assistant:")) \(stats.assistantMessages)\n"
-            info += "\(theme.fg(.dim, "Tool Calls:")) \(stats.toolCalls)\n"
-            info += "\(theme.fg(.dim, "Tool Results:")) \(stats.toolResults)\n"
-            info += "\(theme.fg(.dim, "Total:")) \(stats.totalMessages)\n\n"
+            info += "\(theme.fg(.dim, "Tools:")) \(stats.toolCalls) calls, \(stats.toolResults) results\n\n"
             info += "\(theme.bold("Tokens"))\n"
-            info += "\(theme.fg(.dim, "Input:")) \(formatNumber(stats.tokens.input))\n"
+            let promptTokens = stats.tokens.input + stats.tokens.cacheRead + stats.tokens.cacheWrite
+            info += "\(theme.fg(.dim, "Input:")) \(formatNumber(promptTokens))\n"
+            if promptTokens > 0 && (stats.tokens.cacheRead > 0 || stats.tokens.cacheWrite > 0) {
+                let rate = theme.fg(.dim, String(format: "(%.1f%%)", Double(stats.tokens.cacheRead) / Double(promptTokens) * 100))
+                info += "  \(theme.fg(.dim, "Cached:")) \(formatNumber(stats.tokens.cacheRead)) \(rate)\n"
+                let written = stats.tokens.cacheWrite > 0 ? " " + theme.fg(.dim, "(\(formatNumber(stats.tokens.cacheWrite)) written to cache)") : ""
+                info += "  \(theme.fg(.dim, "Uncached:")) \(formatNumber(stats.tokens.input + stats.tokens.cacheWrite))\(written)\n"
+            }
             info += "\(theme.fg(.dim, "Output:")) \(formatNumber(stats.tokens.output))\n"
-            if stats.tokens.cacheRead > 0 {
-                info += "\(theme.fg(.dim, "Cache Read:")) \(formatNumber(stats.tokens.cacheRead))\n"
-            }
-            if stats.tokens.cacheWrite > 0 {
-                info += "\(theme.fg(.dim, "Cache Write:")) \(formatNumber(stats.tokens.cacheWrite))\n"
-            }
             info += "\(theme.fg(.dim, "Total:")) \(formatNumber(stats.tokens.total))\n"
             info += "\n\(theme.bold("Cache Warming"))\n"
             info += "\(theme.fg(.dim, "Mode:")) \(cacheWarmingMode)\n"
@@ -4599,9 +4614,22 @@ public final class InteractiveMode {
                 info += "\(theme.fg(.dim, "Cache miss penalty:")) $\(String(format: "%.3f", decision.missCost))\n"
                 info += "\(theme.fg(.dim, "Refresh cost:")) $\(String(format: "%.3f", decision.warmCost))\n"
             }
-            if stats.cost > 0 {
+            if stats.cost > 0 || cacheWaste.missedTokens > 0 {
                 info += "\n\(theme.bold("Cost"))\n"
-                info += "\(theme.fg(.dim, "Total:")) \(String(format: "%.4f", stats.cost))"
+                info += "\(theme.fg(.dim, "Total:")) $\(String(format: "%.3f", stats.cost))"
+                if usageBreakdown.count > 1 || usageBreakdown.first?.key != selectedModelKey {
+                    for entry in usageBreakdown {
+                        info += "\n  \(theme.fg(.dim, entry.key + ":")) $\(String(format: "%.3f", entry.cost)) \(theme.fg(.dim, "(\(formatTokens(entry.tokens)) tokens)"))"
+                    }
+                }
+                if cacheWaste.missedTokens > 0 {
+                    let missLabel = cacheWaste.missCount == 1 ? "1 miss" : "\(cacheWaste.missCount) misses"
+                    let detail = "\(formatNumber(cacheWaste.missedTokens)) tokens, \(missLabel)"
+                    info += "\n" + theme.fg(.dim, "Cache Re-billed:") + " "
+                    info += cacheWaste.missedCost >= 0.0001
+                        ? "$\(String(format: "%.3f", cacheWaste.missedCost)) " + theme.fg(.dim, "(\(detail))")
+                        : detail
+                }
             }
 
             return info
@@ -4765,7 +4793,7 @@ public final class InteractiveMode {
 | `\(followUp)` | Queue follow-up message |
 | `\(dequeue)` | Restore queued messages |
 | `\(copyMessage)` | Copy selection or last assistant message |
-| `Ctrl+V` | Paste image from clipboard |
+| `Ctrl+V` | Paste files on macOS, images, or text from clipboard |
 | `/` | Slash commands |
 | `!` | Run bash command |
 """

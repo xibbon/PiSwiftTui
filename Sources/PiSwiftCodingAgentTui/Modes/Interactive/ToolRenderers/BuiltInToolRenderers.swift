@@ -8,8 +8,15 @@ public func createAllToolRenderers() -> [String: ToolRenderers] {
 
 /// A custom definition replaces each renderer slot independently.
 @MainActor
-public func withBuiltInRenderers(_ toolName: String, _ definition: CustomTool?) -> ToolRenderers? {
-    let builtIn = createAllToolRenderers()[toolName]
+public func withBuiltInRenderers(_ toolName: String, _ definition: CustomTool?, sourceInfo: SourceInfo? = nil) -> ToolRenderers? {
+    let builtIn: ToolRenderers?
+    if toolName == "codemode", sourceInfo?.path == "builtin:codemode" {
+        builtIn = createCodemodeRenderers()
+    } else if sourceInfo?.path == "builtin:mcp", let namespace = definition?.namespace, namespace.name.hasPrefix("mcp__") {
+        builtIn = createMcpRenderers(label: definition?.label ?? toolName)
+    } else {
+        builtIn = createAllToolRenderers()[toolName]
+    }
     guard let definition else { return builtIn }
     var merged = builtIn ?? ToolRenderers()
     merged.renderShell = definition.renderShell

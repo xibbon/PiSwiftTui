@@ -29,7 +29,7 @@ private func stripPatternPrefix(_ pattern: String) -> String {
     return pattern
 }
 
-/// Resolve a built-in using the project override before the global setting.
+/// Compatibility for old clients. Production flags come from DefaultPackageManager.resolve().
 public func builtinExtensionSetting(path: String, global: [String], project: [String])
     -> (enabled: Bool, projectOverride: Bool) {
     let globalEnabled = !global.contains("-" + path)
@@ -331,6 +331,10 @@ private final class ResourceList: Component, SystemCursorAware {
     private let settingsManager: SettingsManager
     private let cwd: String
     private let agentDir: String
+    private var builtinGlobal: [String: Bool]
+    private var builtinProject: [String: Bool]
+    private var builtinRefreshRevision = 0
+    var requestRender: (() -> Void)?
 
     var onCancel: (() -> Void)?
     var onExit: (() -> Void)?
@@ -342,13 +346,16 @@ private final class ResourceList: Component, SystemCursorAware {
         set { searchInput.usesSystemCursor = newValue }
     }
 
-    init(groups: [ResourceGroup], settingsManager: SettingsManager, cwd: String, agentDir: String, projectMode: Bool) {
+    init(groups: [ResourceGroup], settingsManager: SettingsManager, cwd: String, agentDir: String, projectMode: Bool, globalPaths: ResolvedPaths?) {
         self.groups = groups
         self.projectMode = projectMode
         self.settingsManager = settingsManager
         self.cwd = cwd
         self.agentDir = agentDir
         self.searchInput = Input()
+        let builtins = groups.flatMap { $0.subgroups.flatMap(\.items) }.filter { $0.metadata.source == "builtin" }
+        self.builtinProject = Dictionary(uniqueKeysWithValues: builtins.map { ($0.path, $0.enabled) })
+        self.builtinGlobal = globalPaths.map { Dictionary(uniqueKeysWithValues: $0.extensions.filter { $0.metadata.source == "builtin" }.map { ($0.path, $0.enabled) }) } ?? self.builtinProject
         buildFlatList()
         self.filteredItems = flatItems
         selectFirstItem()
@@ -363,10 +370,7 @@ private final class ResourceList: Component, SystemCursorAware {
                 flatItems.append(.subgroup(subgroup))
                 for item in subgroup.items {
                     if item.metadata.source == "builtin" {
-                        let global = settingsManager.getGlobalSettings().extensions ?? []
-                        let project = projectMode ? settingsManager.getProjectSettings().extensions ?? [] : []
-                        item.enabled = builtinExtensionSetting(path: item.path, global: global,
-                            project: project).enabled
+                        item.enabled = (projectMode ? builtinProject : builtinGlobal)[item.path] ?? item.enabled
                     }
                     flatItems.append(.item(item))
                 }
@@ -527,10 +531,8 @@ private final class ResourceList: Component, SystemCursorAware {
             guard selectedIndex >= 0, selectedIndex < filteredItems.count else { return }
             guard case .item(let item) = filteredItems[selectedIndex] else { return }
             if projectMode, item.metadata.source == "builtin" {
-                let global = settingsManager.getGlobalSettings().extensions ?? []
                 let project = settingsManager.getProjectSettings().extensions ?? []
-                let inheritedEnabled = builtinExtensionSetting(path: item.path, global: global,
-                    project: []).enabled
+                let inheritedEnabled = builtinGlobal[item.path] ?? true
                 let current = project.last(where: { stripPatternPrefix($0) == item.path })
                 let next: String?
                 if current == nil { next = inheritedEnabled ? "-" : "+" }
@@ -539,20 +541,55 @@ private final class ResourceList: Component, SystemCursorAware {
                 let updated = project.filter { stripPatternPrefix($0) != item.path }
                     + (next.map { [$0 + item.path] } ?? [])
                 settingsManager.setProjectExtensionPaths(updated)
-                item.enabled = builtinExtensionSetting(path: item.path, global: global,
-                    project: updated).enabled
+                item.enabled = next.map { $0 == "+" } ?? inheritedEnabled
+                builtinProject[item.path] = item.enabled
+                refreshBuiltinFlags()
                 onToggle?(item, item.enabled)
                 return
             }
             let newEnabled = !item.enabled
             toggleResource(item, enabled: newEnabled)
             item.enabled = newEnabled
+            if item.metadata.source == "builtin" {
+                builtinGlobal[item.path] = newEnabled
+                if !(settingsManager.getProjectSettings().extensions ?? []).contains(where: { stripPatternPrefix($0) == item.path }) {
+                    builtinProject[item.path] = newEnabled
+                }
+                refreshBuiltinFlags()
+            }
             onToggle?(item, newEnabled)
             return
         }
 
         searchInput.handleInput(data)
         filterItems(searchInput.getValue())
+    }
+
+    private func refreshBuiltinFlags() {
+        builtinRefreshRevision += 1
+        let revision = builtinRefreshRevision
+        let names = builtinGlobal.keys.map { String($0.dropFirst(BUILTIN_PATH_PREFIX.count)) }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let global = try await resolveBuiltinExtensionPaths(settingsManager: settingsManager, names: names, cwd: cwd, agentDir: agentDir, projectTrusted: false)
+                let project = try await resolveBuiltinExtensionPaths(settingsManager: settingsManager, names: names, cwd: cwd, agentDir: agentDir)
+                guard revision == builtinRefreshRevision else { return }
+                builtinGlobal = Dictionary(uniqueKeysWithValues: global.extensions.filter { $0.metadata.source == "builtin" }.map { ($0.path, $0.enabled) })
+                builtinProject = Dictionary(uniqueKeysWithValues: project.extensions.filter { $0.metadata.source == "builtin" }.map { ($0.path, $0.enabled) })
+                let selectedId: String?
+                if filteredItems.indices.contains(selectedIndex), case .item(let item) = filteredItems[selectedIndex] { selectedId = item.id }
+                else { selectedId = nil }
+                let query = searchInput.getValue()
+                buildFlatList()
+                filterItems(query)
+                if let selectedId, let index = filteredItems.firstIndex(where: {
+                    if case .item(let item) = $0 { return item.id == selectedId }
+                    return false
+                }) { selectedIndex = index }
+                requestRender?()
+            } catch { requestRender?() }
+        }
     }
 
     private func toggleResource(_ item: ResourceItem, enabled: Bool) {
@@ -664,12 +701,14 @@ public final class ConfigSelectorComponent: Container {
         onClose: @escaping () -> Void,
         onExit: @escaping () -> Void,
         requestRender: @escaping () -> Void,
-        initialProjectMode: Bool = false
+        initialProjectMode: Bool = false,
+        globalResolvedPaths: ResolvedPaths? = nil
     ) {
         let groups = buildGroups(resolvedPaths)
         self.projectMode = initialProjectMode
         self.header = ConfigSelectorHeader(projectMode: initialProjectMode)
-        self.resourceList = ResourceList(groups: groups, settingsManager: settingsManager, cwd: cwd, agentDir: agentDir, projectMode: initialProjectMode)
+        self.resourceList = ResourceList(groups: groups, settingsManager: settingsManager, cwd: cwd, agentDir: agentDir, projectMode: initialProjectMode, globalPaths: globalResolvedPaths)
+        self.resourceList.requestRender = requestRender
         super.init()
 
         addChild(Spacer(1))

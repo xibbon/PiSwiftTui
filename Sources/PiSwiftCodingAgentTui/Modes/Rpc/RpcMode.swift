@@ -423,15 +423,17 @@ public func runRpcMode(_ session: AgentSession) async {
             }
             continue
         }
-        let response: [String: Any]
-        do {
-            response = try await handleRpcCommand(commandType, dict, session, output)
-        } catch {
-            response = makeErrorResponse(idValue, commandType, error.localizedDescription)
-        }
-        output.send(response)
+        await dispatchRpcCommand(commandType, dict, session, output)
     }
     await pendingCompactions.waitForAll()
+}
+
+func dispatchRpcCommand(_ type: String, _ command: [String: Any], _ session: AgentSession, _ output: RpcOutput) async {
+    do {
+        output.send(try await handleRpcCommand(type, command, session, output))
+    } catch {
+        output.send(makeErrorResponse(command["id"], type, error.localizedDescription))
+    }
 }
 
 func handleRpcCommand(
@@ -448,38 +450,37 @@ func handleRpcCommand(
             return makeErrorResponse(idValue, "prompt", "Missing message")
         }
         let images = decodeImages(dict["images"])
-        let idString: String?
-        if let idValue {
-            idString = (idValue as? String) ?? String(describing: idValue)
-        } else {
-            idString = nil
-        }
+        let (accepted, continuation) = AsyncStream<PromptDisposition>.makeStream()
         let promptTask = try await session.submitPrompt(
             message,
-            options: PromptOptions(expandSlashCommands: nil, images: images)
+            options: PromptOptions(expandSlashCommands: nil, images: images, source: .rpc,
+                streamingBehavior: (dict["streamingBehavior"] as? String).flatMap(HookInputStreamingBehavior.init(rawValue:)),
+                preflightResult: { value in
+                    continuation.yield(value)
+                    continuation.finish()
+                })
         )
-        Task.detached {
-            do {
-                try await promptTask.value
-            } catch {
-                output.send(makeErrorResponse(idString, "prompt", error.localizedDescription))
-            }
+        // Preflight errors are returned by submitPrompt. Later run errors use agent events.
+        Task { _ = try? await promptTask.value }
+        var iterator = accepted.makeAsyncIterator()
+        guard let disposition = await iterator.next() else {
+            throw RpcClientError("Prompt preflight returned no disposition")
         }
-        return makeSuccessResponse(idValue, "prompt", nil)
+        return makeSuccessResponse(idValue, "prompt", ["disposition": disposition.rawValue])
 
     case "steer":
         guard let message = dict["message"] as? String else {
             return makeErrorResponse(idValue, "steer", "Missing message")
         }
-        await session.steer(message, images: decodeImages(dict["images"]), source: .rpc)
-        return makeSuccessResponse(idValue, "steer", nil)
+        let disposition = await session.steer(message, images: decodeImages(dict["images"]), source: .rpc)
+        return makeSuccessResponse(idValue, "steer", ["disposition": disposition.rawValue])
 
     case "follow_up":
         guard let message = dict["message"] as? String else {
             return makeErrorResponse(idValue, "follow_up", "Missing message")
         }
-        await session.followUp(message, images: decodeImages(dict["images"]), source: .rpc)
-        return makeSuccessResponse(idValue, "follow_up", nil)
+        let disposition = await session.followUp(message, images: decodeImages(dict["images"]), source: .rpc)
+        return makeSuccessResponse(idValue, "follow_up", ["disposition": disposition.rawValue])
 
     case "clear_queue":
         let cleared = session.clearQueue()

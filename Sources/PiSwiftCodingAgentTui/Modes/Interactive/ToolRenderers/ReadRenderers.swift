@@ -5,7 +5,9 @@ import PiSwiftAgent
 import PiSwiftCodingAgent
 
 private func readLineRange(_ args: [String: AnyCodable], theme: Theme) -> String {
-    guard args["offset"] != nil || args["limit"] != nil else { return "" }
+    let hasOffset = args["offset"].map { !($0.value is NSNull) } ?? false
+    let hasLimit = args["limit"].map { !($0.value is NSNull) } ?? false
+    guard hasOffset || hasLimit else { return "" }
     let start = args["offset"]?.value as? Int ?? 1
     let end = (args["limit"]?.value as? Int).map { start + $0 - 1 }
     return theme.fg(.warning, ":\(start)" + (end != nil && end != 0 ? "-\(end!)" : ""))

@@ -444,20 +444,40 @@ public actor RpcClient {
         stderrBuffer
     }
 
-    public func prompt(_ message: String, images: [ImageContent]? = nil) async throws {
+    @discardableResult
+    public func prompt(_ message: String, images: [ImageContent]? = nil, streamingBehavior: HookInputStreamingBehavior? = nil) async throws -> PromptDisposition {
         var payload: [String: Any] = ["type": "prompt", "message": message]
         if let images {
             payload["images"] = images.map { ["data": $0.data, "mimeType": $0.mimeType] }
         }
-        _ = try await send(payload)
+        if let streamingBehavior { payload["streamingBehavior"] = streamingBehavior.rawValue }
+        let response = try await send(payload)
+        guard let data = try responseData(response) as? [String: Any],
+              let raw = data["disposition"] as? String, let disposition = PromptDisposition(rawValue: raw) else {
+            throw RpcClientError("Invalid prompt response")
+        }
+        return disposition
     }
 
-    public func steer(_ message: String) async throws {
-        _ = try await send(["type": "steer", "message": message])
+    @discardableResult
+    public func steer(_ message: String, images: [ImageContent]? = nil) async throws -> QueuedInputDisposition {
+        try await queueInput(type: "steer", message: message, images: images)
     }
 
-    public func followUp(_ message: String) async throws {
-        _ = try await send(["type": "follow_up", "message": message])
+    @discardableResult
+    public func followUp(_ message: String, images: [ImageContent]? = nil) async throws -> QueuedInputDisposition {
+        try await queueInput(type: "follow_up", message: message, images: images)
+    }
+
+    private func queueInput(type: String, message: String, images: [ImageContent]?) async throws -> QueuedInputDisposition {
+        var payload: [String: Any] = ["type": type, "message": message]
+        if let images { payload["images"] = images.map { ["data": $0.data, "mimeType": $0.mimeType] } }
+        let response = try await send(payload)
+        guard let data = try responseData(response) as? [String: Any],
+              let raw = data["disposition"] as? String, let disposition = QueuedInputDisposition(rawValue: raw) else {
+            throw RpcClientError("Invalid \(type) response")
+        }
+        return disposition
     }
 
     public func abort() async throws {

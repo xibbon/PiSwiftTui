@@ -29,6 +29,7 @@ public struct InteractiveTuiConfiguration: Sendable, Equatable {
     public var mode: InteractiveTuiMode
     public var scrollbar: FullscreenScrollbarMode
     public var mouseWheelStep: Int
+    public var fullscreenWheelScrollLines: PiSwiftCodingAgent.WheelScrollLines
     public var mermaidEnabled: Bool
     public var mermaidRenderWhileStreaming: Bool
     public var latexEnabled: Bool
@@ -37,15 +38,17 @@ public struct InteractiveTuiConfiguration: Sendable, Equatable {
     public init(
         mode: InteractiveTuiMode = .regular,
         scrollbar: FullscreenScrollbarMode = .auto,
-        mouseWheelStep: Int = 1,
+        mouseWheelStep: Int? = nil,
         mermaidEnabled: Bool = true,
         mermaidRenderWhileStreaming: Bool = true,
         latexEnabled: Bool = false,
-        outputPad: Int = 1
+        outputPad: Int = 1,
+        fullscreenWheelScrollLines: PiSwiftCodingAgent.WheelScrollLines? = nil
     ) {
         self.mode = mode
         self.scrollbar = scrollbar
-        self.mouseWheelStep = max(1, mouseWheelStep)
+        self.mouseWheelStep = max(1, mouseWheelStep ?? 1)
+        self.fullscreenWheelScrollLines = fullscreenWheelScrollLines ?? mouseWheelStep.map { .lines(max(1, min(100, $0))) } ?? .auto
         self.mermaidEnabled = mermaidEnabled
         self.mermaidRenderWhileStreaming = mermaidRenderWhileStreaming
         self.latexEnabled = latexEnabled
@@ -60,7 +63,8 @@ public struct InteractiveTuiConfiguration: Sendable, Equatable {
             mermaidEnabled: settingsManager.getMermaidEnabled(),
             mermaidRenderWhileStreaming: settingsManager.getMermaidRenderWhileStreaming(),
             latexEnabled: settingsManager.getLatexEnabled(),
-            outputPad: settingsManager.getOutputPad()
+            outputPad: settingsManager.getOutputPad(),
+            fullscreenWheelScrollLines: settingsManager.getFullscreenWheelScrollLines()
         )
     }
 }
@@ -120,14 +124,15 @@ public struct InteractiveComposition {
 
 @MainActor
 public func interactiveAltScreenOptions(
-    wheelScrollLines: Int = 1,
+    wheelScrollLines: Int? = nil,
     copyOnSelect: Bool = true,
     copySelection: @escaping @MainActor (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard,
     onRightClickPaste: (() -> Void)? = nil,
-    openURL: ((String) -> Void)? = nil
+    openURL: ((String) -> Void)? = nil,
+    fullscreenWheelScrollLines: PiSwiftCodingAgent.WheelScrollLines? = nil
 ) -> AltScreenRendererOptions {
     AltScreenRendererOptions(
-        wheelScrollLines: .lines(wheelScrollLines),
+        wheelScrollLines: fullscreenWheelScrollLines?.miniTuiValue ?? wheelScrollLines.map { .lines($0) } ?? .auto,
         openURL: openURL ?? { url in
             let process = Process()
             #if os(macOS)
@@ -158,4 +163,20 @@ public func interactiveAltScreenOptions(
             }
         }
     )
+}
+
+public extension PiSwiftCodingAgent.WheelScrollLines {
+    var miniTuiValue: MiniTui.WheelScrollLines {
+        switch self {
+        case .auto: .auto
+        case .lines(let count): .lines(count)
+        }
+    }
+
+    var displayValue: String {
+        switch self {
+        case .auto: "auto"
+        case .lines(let count): String(count)
+        }
+    }
 }

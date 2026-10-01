@@ -19,6 +19,9 @@ public func selectConfig(
             ui.setClearOnShrink(getClearOnShrink(cwd: cwd, agentDir: agentDir, loadProjectSettings: projectTrusted))
             var resolved = false
 
+            let globalPaths = try? await resolveBuiltinExtensionPaths(settingsManager: settingsManager,
+                names: resolvedPaths.extensions.filter { $0.metadata.source == "builtin" }.map { String($0.path.dropFirst(BUILTIN_PATH_PREFIX.count)) },
+                cwd: cwd, agentDir: agentDir, projectTrusted: false)
             let selector = ConfigSelectorComponent(
                 resolvedPaths: resolvedPaths,
                 settingsManager: settingsManager,
@@ -39,7 +42,8 @@ public func selectConfig(
                 requestRender: {
                     ui.requestRender()
                 },
-                initialProjectMode: initialProjectMode
+                initialProjectMode: initialProjectMode,
+                globalResolvedPaths: globalPaths
             )
 
             ui.addChild(selector)

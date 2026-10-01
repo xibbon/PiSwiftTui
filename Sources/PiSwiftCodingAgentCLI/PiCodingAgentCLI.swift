@@ -361,18 +361,14 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 discoverDefaults: discoverDefaultExtensions
             )
         time("discoverAndLoadExtensions")
-        runtimeDiagnostics += extensionResult.errors.map {
-            ResourceDiagnostic(type: "error", message: "Failed to load extension: \($0.localizedDescription)")
-        }
+        runtimeDiagnostics += extensionStartupDiagnostics(extensionResult)
 
         // Load built-ins after trust resolution, when project settings are available.
-        let globalExtensionSettings = settingsManager.getGlobalSettings().extensions ?? []
-        let projectExtensionSettings = trust.trusted ? settingsManager.getProjectSettings().extensions ?? [] : []
-        let disabledBuiltinPaths = Set(builtInExtensions.compactMap { item -> String? in
-            let path = BUILTIN_PATH_PREFIX + item.name
-            return builtinExtensionSetting(path: path, global: globalExtensionSettings,
-                project: projectExtensionSettings).enabled ? nil : "-" + path
-        })
+        let resolvedBuiltins = try await resolveBuiltinExtensionPaths(settingsManager: settingsManager,
+            names: builtInExtensions.map(\.name), cwd: cwd, agentDir: getAgentDir(), projectTrusted: trust.trusted)
+        let disabledBuiltinPaths = Set(resolvedBuiltins.extensions.filter {
+            $0.metadata.source == "builtin" && !$0.enabled
+        }.map { "-" + $0.path })
         let explicitBuiltinPaths = Set(cli.extensions.filter { $0.hasPrefix(BUILTIN_PATH_PREFIX) })
         let knownBuiltinPaths = Set(builtInExtensions.map { BUILTIN_PATH_PREFIX + $0.name })
         let inlineExtensions = selectStartupInlineExtensions(
@@ -396,9 +392,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             return LoadExtensionsResult(hooks: hooks, errors: errors)
         }
         let inlineExtensionResult = loadInlineExtensions()
-        runtimeDiagnostics += inlineExtensionResult.errors.map {
-            ResourceDiagnostic(type: "error", message: "Failed to load inline extension: \($0.localizedDescription)")
-        }
+        runtimeDiagnostics += extensionStartupDiagnostics(inlineExtensionResult, inline: true)
 
         let replacementResult = omitReplacedExtensions(extensionResult.hooks + inlineExtensionResult.hooks)
         runtimeDiagnostics += replacementResult.warnings
@@ -729,6 +723,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
 Usage: \(APP_NAME) [options] [--] [@files...] [messages...]
 
 Options:
+  -e, --extension <path>     Load an extension file or builtin:<name>
+  -ne, --no-extensions       Disable extension discovery and built-in extensions
   --use-theme <name[/name]>  Set the initial interactive theme for this run
   --                        End option parsing; treat remaining arguments as messages/files
 
@@ -776,6 +772,9 @@ Examples:
   # Configure resources (extensions, skills, prompts, themes)
   \(APP_NAME) config
   \(APP_NAME) config -l  # start in project-local scope
+
+  # Manage MCP servers
+  \(APP_NAME) mcp <command>
 
   # Manage packages (npm/git)
   \(APP_NAME) package install <source>

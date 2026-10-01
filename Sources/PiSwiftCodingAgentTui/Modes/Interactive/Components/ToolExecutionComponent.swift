@@ -50,6 +50,7 @@ public final class ToolExecutionComponent: Container {
         args: [String: AnyCodable],
         options: ToolExecutionOptions = ToolExecutionOptions(),
         customTool: CustomTool? = nil,
+        sourceInfo: SourceInfo? = nil,
         renderers: ToolRenderers? = nil,
         ui: TUI,
         cwd: String = FileManager.default.currentDirectoryPath
@@ -59,7 +60,7 @@ public final class ToolExecutionComponent: Container {
         self.args = args
         self.showImages = options.showImages
         self.imageWidthCells = options.imageWidthCells
-        self.renderers = renderers ?? withBuiltInRenderers(toolName, customTool)
+        self.renderers = renderers ?? withBuiltInRenderers(toolName, customTool, sourceInfo: sourceInfo)
         self.ui = ui
         self.cwd = cwd
         self.contentBox = Box(paddingX: 1, paddingY: 1, bgFn: { theme.bg(.toolPendingBg, $0) })
@@ -178,7 +179,7 @@ public final class ToolExecutionComponent: Container {
     }
 
     private func createCallFallback() -> Component {
-        Text(theme.fg(.toolTitle, theme.bold(toolName)), paddingX: 0, paddingY: 0)
+        Text(formatToolCallWithArgs(toolName, args: args, theme: theme, expanded: expanded), paddingX: 0, paddingY: 0)
     }
 
     private func fallbackOutput(_ output: String) -> String {
@@ -302,13 +303,7 @@ public final class ToolExecutionComponent: Container {
     }
 
     private func formatToolExecution() -> String {
-        var text = theme.fg(.toolTitle, theme.bold(toolName))
-        let object = args.mapValues { $0.jsonValue }
-        if JSONSerialization.isValidJSONObject(object),
-           let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
-           let json = String(data: data, encoding: .utf8) {
-            text += "\n\n" + json
-        }
+        var text = formatToolCallWithArgs(toolName, args: args, theme: theme, expanded: expanded)
         let output = textOutput()
         if !output.isEmpty { text += "\n" + fallbackOutput(output) }
         return text

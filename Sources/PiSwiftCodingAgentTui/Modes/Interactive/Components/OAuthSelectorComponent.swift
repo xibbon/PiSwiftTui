@@ -8,6 +8,10 @@ public enum OAuthSelectorMode: String, Sendable {
     case logout
 }
 
+func interactiveOAuthDeviceIdProvider(_ settings: SettingsManager) -> @Sendable () -> String {
+    { settings.getOrCreateDeviceId() }
+}
+
 /// Completion options for `/login <provider>`, ordered exactly as the provider selector.
 /// The id is inserted so a completed command is stable even when display names change.
 public func getLoginProviderCompletionOptions(_ providers: [OAuthProviderInfo] = getOAuthProviders()) -> [AutocompleteItem] {
@@ -72,14 +76,15 @@ public final class OAuthSelectorComponent: Container {
                 isLoggedIn = false
             }
             let status = isLoggedIn ? theme.fg(.success, " (logged in)") : ""
+            let label = mode == .login ? provider.loginLabel ?? provider.name : provider.name
 
             let line: String
             if isSelected {
                 let prefix = theme.fg(.accent, "→ ")
-                let name = isAvailable ? theme.fg(.accent, provider.name) : theme.fg(.dim, provider.name)
+                let name = isAvailable ? theme.fg(.accent, label) : theme.fg(.dim, label)
                 line = prefix + name + status
             } else {
-                let name = isAvailable ? "  \(provider.name)" : theme.fg(.dim, "  \(provider.name)")
+                let name = isAvailable ? "  \(label)" : theme.fg(.dim, "  \(label)")
                 line = name + status
             }
 

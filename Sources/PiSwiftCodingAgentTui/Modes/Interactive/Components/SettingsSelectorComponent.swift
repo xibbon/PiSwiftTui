@@ -38,6 +38,7 @@ public struct SettingsConfig: Sendable {
     public var tuiMode: InteractiveTuiMode
     public var fullscreenScrollbar: FullscreenScrollbarMode
     public var mouseWheelStep: Int
+    public var fullscreenWheelScrollLines: PiSwiftCodingAgent.WheelScrollLines
     public var mermaidEnabled: Bool
     public var mermaidRenderWhileStreaming: Bool
     public var latexEnabled: Bool
@@ -111,6 +112,7 @@ public struct SettingsConfig: Sendable {
         self.tuiMode = tuiMode
         self.fullscreenScrollbar = fullscreenScrollbar
         self.mouseWheelStep = mouseWheelStep
+        self.fullscreenWheelScrollLines = .auto
         self.mermaidEnabled = mermaidEnabled
         self.mermaidRenderWhileStreaming = mermaidRenderWhileStreaming
         self.latexEnabled = latexEnabled
@@ -149,6 +151,7 @@ public struct SettingsCallbacks {
     public var onTuiModeChange: (InteractiveTuiMode) -> Void
     public var onFullscreenScrollbarChange: (FullscreenScrollbarMode) -> Void
     public var onMouseWheelStepChange: (Int) -> Void
+    public var onFullscreenWheelScrollLinesChange: (PiSwiftCodingAgent.WheelScrollLines) -> Void = { _ in }
     public var onMermaidEnabledChange: (Bool) -> Void
     public var onMermaidRenderWhileStreamingChange: (Bool) -> Void
     public var onLatexEnabledChange: (Bool) -> Void
@@ -335,11 +338,11 @@ public final class SettingsSelectorComponent: Container, MouseFocusOwner, System
                 values: FullscreenScrollbarMode.allCases.map(\.rawValue)
             ),
             SettingItem(
-                id: "mouse-wheel-step",
-                label: "Mouse wheel step",
-                description: "Lines scrolled for each mouse wheel event",
-                currentValue: String(config.mouseWheelStep),
-                values: ["1", "3", "5", "10"]
+                id: "fullscreen-wheel-scroll-lines",
+                label: "Fullscreen wheel scrolling",
+                description: "Lines per mouse-wheel event in fullscreen mode; 'auto' speeds up fast wheel spins where the terminal does not",
+                currentValue: config.fullscreenWheelScrollLines.displayValue,
+                values: ["auto"] + Set([1, 2, 3, 5, 10] + (Int(config.fullscreenWheelScrollLines.displayValue).map { [$0] } ?? [])).sorted().map(String.init)
             ),
             SettingItem(
                 id: "mermaid-enabled",
@@ -527,10 +530,8 @@ public final class SettingsSelectorComponent: Container, MouseFocusOwner, System
                     if let value = FullscreenExitOutput(rawValue: newValue) { callbacks.onFullscreenExitOutputChange(value) }
                 case "fullscreen-copy-on-select":
                     callbacks.onFullscreenCopyOnSelectChange(newValue == "true")
-                case "mouse-wheel-step":
-                    if let value = Int(newValue) {
-                        callbacks.onMouseWheelStepChange(value)
-                    }
+                case "fullscreen-wheel-scroll-lines":
+                    callbacks.onFullscreenWheelScrollLinesChange(newValue == "auto" ? .auto : .lines(Int(newValue) ?? 1))
                 case "mermaid-enabled":
                     callbacks.onMermaidEnabledChange(newValue == "true")
                 case "mermaid-streaming":

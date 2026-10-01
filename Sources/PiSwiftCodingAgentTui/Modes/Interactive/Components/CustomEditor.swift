@@ -78,6 +78,8 @@ public final class CustomEditor: Component, SystemCursorAware, EditorComponent, 
         editor.getExpandedText()
     }
 
+    public func getPasteCursor() -> (line: Int, col: Int)? { editor.getCursor() }
+
     public func insertTextAtCursor(_ text: String) {
         editor.insertTextAtCursor(text)
     }

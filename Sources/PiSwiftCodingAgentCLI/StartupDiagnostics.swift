@@ -1,5 +1,11 @@
 import PiSwiftCodingAgent
 
+func extensionStartupDiagnostics(_ result: LoadExtensionsResult, inline: Bool = false) -> [ResourceDiagnostic] {
+    result.warnings + result.errors.map {
+        ResourceDiagnostic(type: "error", message: "Failed to load \(inline ? "inline extension" : "extension"): \($0.localizedDescription)")
+    }
+}
+
 struct StartupDiagnosticDisposition: Sendable {
     var diagnostics: [ResourceDiagnostic]
     var hasRuntimeErrors: Bool

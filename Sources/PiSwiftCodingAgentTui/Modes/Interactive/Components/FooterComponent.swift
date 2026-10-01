@@ -3,11 +3,34 @@ import MiniTui
 import PiSwiftAI
 import PiSwiftCodingAgent
 
+public func formatTokens(_ count: Int) -> String {
+    if count < 1000 { return "\(count)" }
+    if count < 10000 { return String(format: "%.1fk", Double(count) / 1000) }
+    if count < 1_000_000 { return "\(Int(round(Double(count) / 1000)))k" }
+    if count < 10_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+    return "\(Int(round(Double(count) / 1_000_000)))M"
+}
+
 public final class FooterComponent: Component {
-    private let session: AgentSession
+    private var session: AgentSession
     private var autoCompactEnabled = true
     private let footerData: FooterDataProviding
     private var bashToolStartDate: Date?
+
+    private struct SessionStats {
+        let session: AgentSession
+        let sessionId: String
+        let leafId: String?
+        let entryCount: Int
+        let limitsModel: Model
+        let usageTotals: UsageTotals
+        let latestCacheHitRate: Double?
+        let contextUsage: ContextUsage?
+    }
+    private var sessionStats: SessionStats?
+    private(set) var statsScanCount = 0
+
+    public func setSession(_ session: AgentSession) { self.session = session }
 
     public init(session: AgentSession, footerData: FooterDataProviding) {
         self.session = session
@@ -26,22 +49,33 @@ public final class FooterComponent: Component {
         // Branch cache invalidation handled by FooterDataProvider.
     }
 
-    public func render(width: Int) -> [String] {
-        let state = session.agent.state
-
-        var totalInput = 0
-        var totalOutput = 0
-        var totalCacheRead = 0
-        var totalCacheWrite = 0
-        var totalCost: Double = 0
-
-        for entry in session.sessionManager.getEntries() {
+    private func getSessionStats() -> SessionStats {
+        let manager = session.sessionManager
+        let entryCount = manager.getEntryCount()
+        let sessionId = manager.getSessionId()
+        let leafId = manager.getLeafId()
+        let limitsModel = session.routedModel?.model ?? session.agent.state.model
+        if let cached = sessionStats, cached.session === session,
+           cached.sessionId == sessionId, cached.leafId == leafId,
+           cached.entryCount == entryCount,
+           cached.limitsModel.provider == limitsModel.provider,
+           cached.limitsModel.id == limitsModel.id,
+           cached.limitsModel.api == limitsModel.api,
+           cached.limitsModel.contextWindow == limitsModel.contextWindow {
+            return cached
+        }
+        var totals = UsageTotals()
+        var latestCacheHitRate: Double?
+        for entry in manager.getEntries() {
             let usage: Usage?
             switch entry {
-            case .usage(let usageEntry): usage = usageEntry.usage
-            case .message(let messageEntry):
-                switch messageEntry.message {
-                case .assistant(let message): usage = message.usage
+            case .usage(let record): usage = record.usage
+            case .message(let record):
+                switch record.message {
+                case .assistant(let message):
+                    usage = message.usage
+                    let prompt = message.usage.input + message.usage.cacheRead + message.usage.cacheWrite
+                    latestCacheHitRate = prompt > 0 ? Double(message.usage.cacheRead) / Double(prompt) * 100 : nil
                 case .toolResult(let result): usage = result.usage
                 default: usage = nil
                 }
@@ -49,36 +83,25 @@ public final class FooterComponent: Component {
             case .branchSummary(let summary): usage = summary.usage
             default: usage = nil
             }
-            if let usage {
-                totalInput += usage.input
-                totalOutput += usage.output
-                totalCacheRead += usage.cacheRead
-                totalCacheWrite += usage.cacheWrite
-                totalCost += usage.cost.total
-            }
+            if let usage { totals.add(usage) }
         }
+        statsScanCount += 1
+        let stats = SessionStats(session: session, sessionId: sessionId, leafId: leafId,
+            entryCount: entryCount, limitsModel: limitsModel, usageTotals: totals,
+            latestCacheHitRate: latestCacheHitRate, contextUsage: session.getContextUsage())
+        sessionStats = stats
+        return stats
+    }
 
-        let lastAssistant = state.messages.reversed().compactMap { message -> AssistantMessage? in
-            if case let .assistant(assistant) = message, assistant.stopReason != .aborted {
-                return assistant
-            }
-            return nil
-        }.first
+    public func render(width: Int) -> [String] {
+        let state = session.agent.state
+        let stats = getSessionStats()
+        let totals = stats.usageTotals
+        let contextWindow = stats.contextUsage?.contextWindow ?? stats.limitsModel.contextWindow
+        let contextPercentValue = stats.contextUsage?.percent ?? 0
+        let contextPercent = stats.contextUsage != nil && stats.contextUsage?.percent == nil ? "?" : String(format: "%.1f", contextPercentValue)
 
-        let contextTokens = lastAssistant.map { $0.usage.input + $0.usage.output + $0.usage.cacheRead + $0.usage.cacheWrite } ?? 0
-        let contextWindow = state.model.contextWindow
-        let contextPercentValue = contextWindow > 0 ? (Double(contextTokens) / Double(contextWindow)) * 100.0 : 0.0
-        let contextPercent = String(format: "%.1f", contextPercentValue)
-
-        let formatTokens: (Int) -> String = { count in
-            if count < 1000 { return "\(count)" }
-            if count < 10000 { return String(format: "%.1fk", Double(count) / 1000.0) }
-            if count < 1_000_000 { return "\(Int(round(Double(count) / 1000.0)))k" }
-            if count < 10_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000.0) }
-            return "\(Int(round(Double(count) / 1_000_000.0)))M"
-        }
-
-        var pwd = FileManager.default.currentDirectoryPath
+        var pwd = session.sessionManager.getCwd()
         if let home = ProcessInfo.processInfo.environment["HOME"], pwd.hasPrefix(home) {
             pwd = "~" + pwd.dropFirst(home.count)
         }
@@ -87,21 +110,25 @@ public final class FooterComponent: Component {
             pwd += " (\(branch))"
         }
 
+        if let name = session.sessionManager.getSessionName() { pwd += " • \(name)" }
         if visibleWidth(pwd) > width {
             pwd = truncateToWidth(pwd, maxWidth: width, ellipsis: "...")
         }
 
         var statsParts: [String] = []
-        if totalInput > 0 { statsParts.append("↑\(formatTokens(totalInput))") }
-        if totalOutput > 0 { statsParts.append("↓\(formatTokens(totalOutput))") }
-        if totalCacheRead > 0 { statsParts.append("R\(formatTokens(totalCacheRead))") }
-        if totalCacheWrite > 0 { statsParts.append("W\(formatTokens(totalCacheWrite))") }
-        if totalCost > 0 {
-            statsParts.append(String(format: "$%.3f", totalCost))
+        if totals.input > 0 { statsParts.append("↑\(formatTokens(totals.input))") }
+        if totals.output > 0 { statsParts.append("↓\(formatTokens(totals.output))") }
+        if totals.cacheRead > 0 { statsParts.append("R\(formatTokens(totals.cacheRead))") }
+        if totals.cacheWrite > 0 { statsParts.append("W\(formatTokens(totals.cacheWrite))") }
+        if (totals.cacheRead > 0 || totals.cacheWrite > 0), let hitRate = stats.latestCacheHitRate {
+            statsParts.append(String(format: "CH%.1f%%", hitRate))
+        }
+        if totals.cost > 0 {
+            statsParts.append(String(format: "$%.3f", totals.cost))
         }
 
         let autoIndicator = autoCompactEnabled ? " (auto)" : ""
-        let contextDisplay = "\(contextPercent)%/\(formatTokens(contextWindow))\(autoIndicator)"
+        let contextDisplay = "\(contextPercent)\(contextPercent == "?" ? "" : "%")/\(formatTokens(contextWindow))\(autoIndicator)"
         let contextText: String
         if contextPercentValue > 90 {
             contextText = theme.fg(.error, contextDisplay)
@@ -117,17 +144,19 @@ public final class FooterComponent: Component {
         var rightSide = modelName
         if state.model.reasoning {
             let thinking = state.thinkingLevel.rawValue
-            if thinking != "off" {
-                rightSide = "\(modelName) • \(thinking)"
-            }
+            rightSide = "\(modelName) • \(thinking == "off" ? "thinking off" : thinking)"
+        }
+
+        if let routed = session.routedModel {
+            rightSide += " → \(routed.model.id)"
+            if let level = routed.thinkingLevel { rightSide += " • \(level.rawValue)" }
         }
 
         var statsLeftWidth = visibleWidth(statsLeft)
         let rightSideWidth = visibleWidth(rightSide)
 
         if statsLeftWidth > width {
-            let plain = stripAnsi(statsLeft)
-            statsLeft = String(plain.prefix(max(0, width - 3))) + "..."
+            statsLeft = truncateToWidth(statsLeft, maxWidth: width, ellipsis: "...")
             statsLeftWidth = visibleWidth(statsLeft)
         }
 
@@ -139,10 +168,10 @@ public final class FooterComponent: Component {
             statsLine = statsLeft + padding + rightSide
         } else {
             let availableForRight = width - statsLeftWidth - minPadding
-            if availableForRight > 3 {
+            if availableForRight > 0 {
                 let plain = stripAnsi(rightSide)
-                let truncated = String(plain.prefix(availableForRight))
-                let padding = String(repeating: " ", count: max(0, width - statsLeftWidth - truncated.count))
+                let truncated = truncateToWidth(plain, maxWidth: availableForRight, ellipsis: "")
+                let padding = String(repeating: " ", count: max(0, width - statsLeftWidth - visibleWidth(truncated)))
                 statsLine = statsLeft + padding + truncated
             } else {
                 statsLine = statsLeft
