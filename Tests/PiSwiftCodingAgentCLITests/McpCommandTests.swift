@@ -90,7 +90,8 @@ struct McpCommandTests {
         #expect(result.output.contains("broken: failed (codemode, global)\n  pi-test-missing-mcp-server\n  spawn pi-test-missing-mcp-server ENOENT"))
         #expect(result.output.contains("parked: disabled (codemode, global)"))
         #expect(result.output.contains("config error: "))
-        #expect(result.output.contains("server \"bad\": needs either \"command\""))
+        // F2: upstream validateMcpServerConfig has no colon in the missing-transport message.
+        #expect(result.output.contains("server \"bad\" needs either \"command\""))
         try context.write(["fixture": mcpCommandServers["fixture"]!])
         #expect(await context.run(["list"]).code == 0)
     }
@@ -118,7 +119,7 @@ struct McpCommandTests {
         try context.write(mcpCommandServers)
         let unknown = await context.run(["login", "nope"])
         #expect(unknown.code == 1)
-        // The shared Swift config loader sorts names. Upstream retains JSON insertion order.
+        // The loader keeps JSON insertion order (F2); the fixture writes with .sortedKeys.
         #expect(unknown.output == "No MCP server named \"nope\". Configured: broken, fixture, parked.")
         let stdio = await context.run(["logout", "fixture"])
         #expect(stdio.code == 1)

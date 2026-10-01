@@ -177,7 +177,11 @@ func t3aSession(model: Model = t3aModel(), manager: SessionManager = .inMemory("
         #expect(mode.chatContainer.children.last is ThemedText)
         let info = try #require(mode.chatContainer.children.last as? ThemedText)
         let previousTheme = theme.name
-        defer { initTheme(previousTheme) }
+        // Fix the color mode: with TERM=dumb and no COLORTERM the dark and light dim colors
+        // quantize to the same 256-color index, and the dark/light comparison below fails.
+        let previousMode = theme.colorMode
+        setTerminalColorMode(.truecolor)
+        defer { setTerminalColorMode(previousMode); initTheme(previousTheme) }
         initTheme("dark")
         info.invalidate()
         let dark = info.render(width: 160)
