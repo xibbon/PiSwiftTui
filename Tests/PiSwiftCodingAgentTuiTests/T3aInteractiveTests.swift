@@ -311,13 +311,16 @@ func t3aSession(model: Model = t3aModel(), manager: SessionManager = .inMemory("
     }
 
     @Test func loginChoiceUsesLabelAndDialogUsesProviderName() {
-        let provider = getOAuthProviders().first { $0.id == .openAI }
-        #expect(provider?.loginLabel == "Sign in with ChatGPT")
-        let dialog = LoginDialogComponent(tui: TUI(terminal: ToolTestTerminal()), providerId: "openai", onComplete: { _, _ in })
-        // v0.99.1 uses loginLabel in the choice; the dialog title uses the provider name.
-        #expect(toolTestText(dialog).contains("Login to \(provider?.name ?? "")"))
-        let selector = OAuthSelectorComponent(mode: .login, authStorage: .inMemory(), onSelect: { _ in }, onCancel: {})
-        #expect(toolTestText(selector).contains("Sign in with ChatGPT"))
+        let registry = ModelRegistry(.inMemory(), nil, modelsStore: InMemoryModelsStore(), networkEnabled: false)
+        let provider = registry.getLoginProvider("openai")
+        #expect(provider?.oauth?.loginLabel == "Sign in with ChatGPT")
+        // Upstream v1.0.0: the method menu uses loginLabel; selectors and dialogs use the provider name.
+        let dialog = LoginDialogComponent(tui: TUI(terminal: ToolTestTerminal()), providerId: "openai", providerName: "OpenAI", onComplete: { _, _ in })
+        #expect(toolTestText(dialog).contains("Login to OpenAI"))
+        let selector = OAuthSelectorComponent(mode: .login,
+            providers: [AuthSelectorProvider(id: "openai", name: "OpenAI", authType: .oauth)],
+            onSelect: { _, _ in }, onCancel: {})
+        #expect(toolTestText(selector).contains("OpenAI"))
         #expect(buildStartupHeader(version: "test", keybindings: KeybindingsManager.create(), expanded: true).contains("to paste files on macOS, images, or text"))
     }
 

@@ -13,7 +13,8 @@ import PiSwiftAgent
 }
 
 @Test func loginProviderCompletionsContainProviderIdentifiers() {
-    let options = getLoginProviderCompletionOptions()
+    // Upstream v1.0.0: completion reads the live provider registry.
+    let options = getLoginProviderCompletionOptions(loginTestRegistry())
     #expect(!options.isEmpty)
     #expect(options.allSatisfy { !$0.value.isEmpty && !$0.label.isEmpty })
 }

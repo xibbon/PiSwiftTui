@@ -308,7 +308,7 @@ public final class InteractiveMode {
     /// Final stacked provider applied to the editor (the base CombinedAutocompleteProvider
     /// possibly wrapped one or more times).
     private(set) var stackedAutocompleteProvider: AutocompleteProvider?
-    private var editorContainer: Container?
+    var editorContainer: Container?
     private var footer: FooterComponent?
     private var footerContainer: Container?
     private var customFooter: Component?
@@ -609,15 +609,14 @@ public final class InteractiveMode {
             SlashCommand(name: "theme", description: "Select theme"),
             SlashCommand(
                 name: "login",
-                description: "Login with OAuth provider",
-                argumentHint: "[provider]",
-                getArgumentCompletions: { query in
-                    let options = getLoginProviderCompletionOptions()
-                    let filtered = fuzzyFilter(options, query: query) { "\($0.value) \($0.label)" }
-                    return filtered.isEmpty ? nil : filtered
+                description: "Configure provider authentication",
+                argumentHint: "<provider>",
+                getArgumentCompletions: { [weak self] query in
+                    guard let registry = self?.session?.modelRegistry else { return nil }
+                    return getLoginProviderCompletions(registry, query: query)
                 }
             ),
-            SlashCommand(name: "logout", description: "Logout from OAuth provider"),
+            SlashCommand(name: "logout", description: "Remove provider authentication"),
             SlashCommand(name: "templates", description: "List prompt templates"),
             SlashCommand(name: "reload", description: "Reload skills, prompts, themes"),
             SlashCommand(name: "export", description: "Export session to HTML"),
@@ -3264,13 +3263,13 @@ public final class InteractiveMode {
         }
         if trimmed == "/login" || trimmed.hasPrefix("/login ") {
             let providerRef = trimmed == "/login" ? nil : String(trimmed.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
-            await handleLoginCommand(providerRef)
             editor.setText("")
+            await handleLoginCommand(providerRef)
             return
         }
         if trimmed == "/logout" {
-            showOAuthSelector(.logout)
             editor.setText("")
+            showOAuthSelector(.logout)
             return
         }
         if trimmed == "/templates" || trimmed == "/template" {
@@ -4297,108 +4296,293 @@ public final class InteractiveMode {
         showStatus("Resumed session")
     }
 
-    private struct OAuthLoginCancelled: Error, LocalizedError {
-        var errorDescription: String? { "Login cancelled" }
+    @MainActor
+    private func showLoginSelector(_ builder: (_ done: @escaping () -> Void) -> (component: Component, focus: Component)) {
+        var component: Component?
+        showSelector { done in
+            let result = builder(done)
+            component = result.component
+            return result
+        }
+        // Ctrl+C must take the same back path as Escape.
+        selectorCancel = { component?.handleInput("\u{001B}") }
     }
 
     @MainActor
-    private func showOAuthSelector(_ mode: OAuthSelectorMode) {
-        guard let session else { return }
-        if mode == .logout {
-            let providers = session.modelRegistry.authStorage.list()
-            let loggedIn = providers.filter { provider in
-                if case .oauth = session.modelRegistry.authStorage.get(provider) {
-                    return true
-                }
-                return false
-            }
-            if loggedIn.isEmpty {
-                showStatus("No OAuth providers logged in. Use /login first.")
-                return
-            }
+    func showOAuthSelector(_ mode: OAuthSelectorMode) {
+        if mode == .login {
+            showLoginAuthTypeSelector()
+            return
         }
-
-        showSelector { done in
-            let selector = OAuthSelectorComponent(
-                mode: mode,
-                authStorage: session.modelRegistry.authStorage,
-                onSelect: { [weak self] providerId in
-                    done()
-                    Task { @MainActor in
-                        await self?.handleOAuthSelection(providerId: providerId, mode: mode)
+        guard let session else { return }
+        let registry = session.modelRegistry
+        let options = registry.authStorage.listCredentials().map { credential in
+            let type: AuthType = credential.type == .oauth ? .oauth : .apiKey
+            return AuthSelectorProvider(id: credential.providerId,
+                name: registry.getProviderDisplayName(credential.providerId), authType: type,
+                status: AuthSelectorStatus(type: type, source: "stored credential"),
+                subscription: registry.getLoginProvider(credential.providerId)?.oauth?.isSubscription == true)
+        }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        guard !options.isEmpty else {
+            showStatus("No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.")
+            return
+        }
+        showLoginSelector { done in
+            let selector = OAuthSelectorComponent(mode: .logout, providers: options, onSelect: { [weak self] id, type in
+                done()
+                guard let option = options.first(where: { $0.id == id && $0.authType == type }) else { return }
+                Task { @MainActor in
+                    guard let self else { return }
+                    do {
+                        await registry.logout(id)
+                        try await self.synchronizeProviderAuthentication(id, operation: .logout)
+                        await session.refreshActiveModel()
+                        self.showStatus(type == .oauth
+                            ? "Logged out of \(option.name)"
+                            : "Removed stored API key for \(option.name). Environment variables and models.json config are unchanged.")
+                        self.refreshProviderCatalogInBackground(providerId: id, actionLabel: "Logged out of \(option.name)")
+                    } catch {
+                        let message = error.localizedDescription
+                        self.showError(error is CredentialSynchronizationError
+                            ? "Credentials removed for \(option.name), but local model state could not be synchronized: \(message)"
+                            : "Logout failed: \(message)")
                     }
-                },
-                onCancel: { [weak self] in
-                    done()
-                    self?.ui.requestRender()
                 }
-            )
+            }, onCancel: { done() })
             return (component: selector, focus: selector)
         }
     }
 
     @MainActor
-    private func handleLoginCommand(_ providerRef: String?) async {
-        guard let providerRef, !providerRef.isEmpty else {
-            showOAuthSelector(.login)
-            return
-        }
-        let normalized = providerRef.lowercased()
-        let matches = getOAuthProviders().filter {
-            $0.id.rawValue.lowercased() == normalized || $0.name.lowercased() == normalized
-        }
-        guard let provider = matches.first else {
-            showError("Unknown login provider: \(providerRef)")
-            return
-        }
-        guard provider.available else {
-            showError("Login provider is unavailable: \(provider.name)")
-            return
-        }
+    func handleLoginCommand(_ providerRef: String?) async {
         guard let session else { return }
-        await handleOAuthLogin(provider.id, authStorage: session.modelRegistry.authStorage)
-    }
-
-    @MainActor
-    private func handleOAuthSelection(providerId: String, mode: OAuthSelectorMode) async {
-        guard let session else { return }
-        guard let provider = OAuthProvider(rawValue: providerId) else {
-            showError("Unknown OAuth provider: \(providerId)")
-            return
-        }
-
-        switch mode {
-        case .login:
-            await handleOAuthLogin(provider, authStorage: session.modelRegistry.authStorage)
-        case .logout:
-            await handleOAuthLogout(provider, authStorage: session.modelRegistry.authStorage)
+        let ref = providerRef?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !ref.isEmpty else { showLoginAuthTypeSelector(); return }
+        let options = getLoginProviderOptions(session.modelRegistry)
+        let matches = options.filter { $0.id.caseInsensitiveCompare(ref) == .orderedSame || $0.name.caseInsensitiveCompare(ref) == .orderedSame }
+        if matches.count == 1 {
+            await startProviderLogin(matches[0])
+        } else if matches.count > 1 && Set(matches.map(\.id)).count == 1 {
+            showLoginAuthTypeSelector(matches)
+        } else {
+            showLoginProviderSelector(initialSearchInput: ref)
         }
     }
 
     @MainActor
-    private func handleOAuthLogin(_ provider: OAuthProvider, authStorage: AuthStorage) async {
-        guard let session, let tui, let editorContainer, let editor else { return }
-        let providerName = getOAuthProviders().first { $0.id == provider }?.name ?? provider.rawValue
+    func showLoginAuthTypeSelector(_ providerOptions: [AuthSelectorProvider]? = nil) {
+        let oauthOption = providerOptions?.first { $0.authType == .oauth }
+        let accountLabel: String
+        if case .oauth(let method) = oauthOption?.method {
+            accountLabel = method.loginLabel ?? "Sign in with an account"
+        } else { accountLabel = "Sign in with an account" }
+        let apiKeyLabel = "Sign in with an API key"
+        let types = providerOptions.map { Set($0.map(\.authType)) } ?? Set([.oauth, .apiKey])
+        var labels: [String] = []
+        if types.contains(.oauth) { labels.append(accountLabel) }
+        if types.contains(.apiKey) { labels.append(apiKeyLabel) }
+        // Radius can add a final option with shimmer and an onBack to this menu.
+        guard !labels.isEmpty else { showStatus("No login methods available."); return }
+        if let providerOptions, labels.count == 1, let option = providerOptions.first {
+            Task { @MainActor in await self.startProviderLogin(option) }
+            return
+        }
+        let title = providerOptions?.first.map { "Select authentication method for \($0.name):" } ?? "Select authentication method:"
+        showLoginSelector { done in
+            let selector = HookSelectorComponent(title: title, options: labels, onSelect: { [weak self] label in
+                done()
+                guard let self else { return }
+                let type: AuthType = label == accountLabel ? .oauth : .apiKey
+                if let providerOptions, let option = providerOptions.first(where: { $0.authType == type }) {
+                    Task { @MainActor in await self.startProviderLogin(option, onBack: { self.showLoginAuthTypeSelector(providerOptions) }) }
+                } else {
+                    self.showLoginProviderSelector(type)
+                }
+            }, onCancel: { done() })
+            return (component: selector, focus: selector)
+        }
+    }
 
-        let dialog = LoginDialogComponent(tui: tui, providerId: provider.rawValue) { _, _ in }
+    @MainActor
+    func showLoginProviderSelector(_ authType: AuthType? = nil, initialSearchInput: String? = nil) {
+        guard let session else { return }
+        let options = getLoginProviderOptions(session.modelRegistry, authType: authType)
+        guard !options.isEmpty else {
+            showStatus(authType == .oauth ? "No account providers available." : authType == .apiKey ? "No API key providers available." : "No login providers available.")
+            return
+        }
+        showLoginSelector { done in
+            let selector = OAuthSelectorComponent(mode: .login, providers: options, onSelect: { [weak self] id, type in
+                done()
+                guard let self, let option = options.first(where: { $0.id == id && $0.authType == type }) else { return }
+                Task { @MainActor in
+                    await self.startProviderLogin(option, onBack: { self.showLoginProviderSelector(authType, initialSearchInput: initialSearchInput) })
+                }
+            }, onCancel: { [weak self] in
+                done()
+                if authType != nil { self?.showLoginAuthTypeSelector() }
+            }, initialSearchInput: initialSearchInput)
+            return (component: selector, focus: selector)
+        }
+    }
+
+    @MainActor
+    func startProviderLogin(_ option: AuthSelectorProvider, onBack: (() -> Void)? = nil) async {
+        guard let session else { return }
+        if option.authType == .oauth, let provider = OAuthProvider(rawValue: option.id) {
+            await handleOAuthLogin(provider, providerName: option.name, authStorage: session.modelRegistry.authStorage, onBack: onBack)
+        } else if case .apiKey(let method) = option.method, method.login != nil {
+            await showApiKeyLoginDialog(option, onBack: onBack)
+        } else {
+            showAmbientAuthDialog(option, onBack: onBack)
+        }
+    }
+
+    @MainActor
+    private func mountLoginDialog(_ dialog: LoginDialogComponent) -> (() -> Void)? {
+        guard let tui, let editorContainer, let editor else { return nil }
         let savedText = editor.getText()
-        final class ManualInputState {
-            var task: Task<String, Error>?
-        }
-        let manualInputState = ManualInputState()
-
-        let restoreEditor: () -> Void = {
+        editorContainer.clear()
+        editorContainer.addChild(dialog)
+        tui.setFocus(dialog)
+        selectorCancel = { dialog.handleInput("\u{001B}") }
+        tui.requestRender()
+        return { [weak self] in
+            self?.selectorCancel = nil
             editorContainer.clear()
             editorContainer.addChild(editor)
             editor.setText(savedText)
             tui.setFocus(editor)
             tui.requestRender()
         }
+    }
 
-        editorContainer.clear()
-        editorContainer.addChild(dialog)
-        tui.setFocus(dialog)
-        tui.requestRender()
+    @MainActor
+    func showAmbientAuthDialog(_ option: AuthSelectorProvider, onBack: (() -> Void)? = nil) {
+        guard let tui else { return }
+        var restoreEditor: (() -> Void)?
+        let dialog = LoginDialogComponent(tui: tui, providerId: option.id, providerName: option.name, title: "\(option.name) setup") { _, _ in
+            restoreEditor?()
+            onBack?()
+        }
+        let methodName: String
+        if case .apiKey(let method) = option.method { methodName = method.name } else { methodName = "Authentication" }
+        dialog.showInfo("\(methodName) is configured outside pi.", links: [], showCloseHint: true)
+        restoreEditor = mountLoginDialog(dialog)
+    }
+
+    @MainActor
+    func showAuthSelect(dialog: LoginDialogComponent, prompt: OAuthSelectPrompt) async throws -> String {
+        guard !dialog.signal.isCancelled, let editorContainer, let tui else { throw LoginDialogError.cancelled }
+        // Radius can supply its intro text as this selector's description.
+        @MainActor final class SelectionState {
+            var continuation: CheckedContinuation<String, Error>?
+            var removeCancellation: (@Sendable () -> Void)?
+        }
+        let state = SelectionState()
+        return try await withCheckedThrowingContinuation { continuation in
+            state.continuation = continuation
+            let finish: @MainActor @Sendable (Result<String, Error>) -> Void = { [weak self] result in
+                guard let continuation = state.continuation else { return }
+                state.continuation = nil
+                state.removeCancellation?()
+                editorContainer.clear()
+                editorContainer.addChild(dialog)
+                tui.setFocus(dialog)
+                self?.selectorCancel = { dialog.handleInput("\u{001B}") }
+                tui.requestRender()
+                continuation.resume(with: result)
+            }
+            let selector = HookSelectorComponent(title: prompt.message, options: prompt.options.map(\.label), onSelect: { label in
+                if dialog.signal.isCancelled { finish(.failure(LoginDialogError.cancelled)); return }
+                if let id = prompt.options.first(where: { $0.label == label })?.id { finish(.success(id)) }
+                else { finish(.failure(LoginDialogError.cancelled)) }
+            }, onCancel: { finish(.failure(LoginDialogError.cancelled)) })
+            editorContainer.clear()
+            editorContainer.addChild(selector)
+            tui.setFocus(selector)
+            selectorCancel = { finish(.failure(LoginDialogError.cancelled)) }
+            tui.requestRender()
+            state.removeCancellation = dialog.signal.onCancel {
+                Task { @MainActor in finish(.failure(LoginDialogError.cancelled)) }
+            }
+        }
+    }
+
+    @MainActor
+    private func showApiKeyLoginDialog(_ option: AuthSelectorProvider, onBack: (() -> Void)?) async {
+        guard let session, let tui else { return }
+        let needsDefaultSelection = !session.modelRegistry.hasConfiguredAuth(session.agent.state.model)
+        let dialog = LoginDialogComponent(tui: tui, providerId: option.id, providerName: option.name) { _, _ in }
+        if option.id == "amazon-bedrock" {
+            dialog.showDetails([
+                theme.fg(.text, "You can also use an AWS profile, IAM keys, or role-based credentials."),
+                theme.fg(.muted, "See:"),
+                theme.fg(.accent, "  \(getDocsPath())/providers.md")
+            ])
+        }
+        guard let restoreEditor = mountLoginDialog(dialog) else { return }
+        let interaction = ProviderAuthInteraction(prompt: { [weak self] prompt in
+            guard !dialog.signal.isCancelled else { throw LoginDialogError.cancelled }
+            switch prompt {
+            case .text(let message, let placeholder): return try await dialog.showPrompt(message, placeholder)
+            case .secret(let message, let placeholder): return try await dialog.showPrompt(message, placeholder, secret: true)
+            case .select(let prompt):
+                guard let self else { throw LoginDialogError.cancelled }
+                return try await self.showAuthSelect(dialog: dialog, prompt: prompt)
+            }
+        }, notify: { event in
+            guard !dialog.signal.isCancelled else { return }
+            switch event {
+            case .info(let message, let links): dialog.showInfo(message, links: links)
+            case .progress(let message): dialog.showProgress(message)
+            }
+        }, signal: dialog.signal)
+        do {
+            try await session.modelRegistry.loginApiKey(option.id, interaction: interaction)
+            try await synchronizeProviderAuthentication(option.id, operation: .login)
+            await session.refreshActiveModel()
+            restoreEditor()
+            completeProviderAuthentication(providerId: option.id, actionLabel: "Saved API key for \(option.name)", selectDefaultAfterLogin: needsDefaultSelection)
+        } catch {
+            restoreEditor()
+            let message = error.localizedDescription
+            if error is CredentialSynchronizationError {
+                showError("Saved API key for \(option.name), but local model state could not be synchronized: \(message)")
+            } else if message == "Login cancelled" { onBack?() }
+            else { showError("Failed to save API key for \(option.name): \(message)") }
+        }
+    }
+
+    @MainActor
+    private func synchronizeProviderAuthentication(_ providerId: String, operation: CredentialSynchronizationOperation) async throws {
+        guard let registry = session?.modelRegistry else { return }
+        // Registry login/logout do not return their local refresh result. Read it here
+        // so a committed credential can report a provider synchronization failure.
+        let result = await registry.refresh(ModelsRefreshOptions(allowNetwork: false))
+        if let cause = result.errors[providerId] {
+            throw CredentialSynchronizationError(providerId: providerId, operation: operation,
+                credential: registry.authStorage.get(providerId), cause: cause)
+        }
+    }
+
+    @MainActor
+    private func completeProviderAuthentication(providerId: String, actionLabel: String, selectDefaultAfterLogin: Bool) {
+        showStatus("\(actionLabel). Credentials saved to \(getAuthPath())")
+        // Radius can offer its MCP server here and use the first catalog model as a fallback.
+        refreshProviderCatalogInBackground(providerId: providerId, actionLabel: actionLabel, selectAfterLogin: selectDefaultAfterLogin)
+    }
+
+    @MainActor
+    private func handleOAuthLogin(_ provider: OAuthProvider, providerName: String, authStorage: AuthStorage, onBack: (() -> Void)?) async {
+        guard let session, let tui else { return }
+        let needsDefaultSelection = !session.modelRegistry.hasConfiguredAuth(session.agent.state.model)
+        let dialog = LoginDialogComponent(tui: tui, providerId: provider.rawValue, providerName: providerName) { _, _ in }
+        guard let restoreEditor = mountLoginDialog(dialog) else { return }
+        final class ManualInputState {
+            var task: Task<String, Error>?
+        }
+        let manualInputState = ManualInputState()
 
         let needsManualInput = provider == .openAICodex || provider == .googleGeminiCli || provider == .googleAntigravity
 
@@ -4417,68 +4601,51 @@ public final class InteractiveMode {
 
         let callbacks = OAuthLoginCallbacks(
             onAuth: { info in
+                guard !dialog.signal.isCancelled else { return }
+                dialog.showAuth(info.url, info.instructions)
                 if needsManualInput {
                     manualInputState.task = Task { @MainActor in
-                        dialog.showAuth(info.url, info.instructions)
                         return try await dialog.showManualInput("Paste redirect URL below, or complete login in browser:")
                     }
-                } else {
-                    Task { @MainActor in
-                        dialog.showAuth(info.url, info.instructions)
-                        if provider == .githubCopilot {
-                            dialog.showWaiting("Waiting for browser authentication...")
-                        }
-                    }
+                } else if provider == .githubCopilot {
+                    dialog.showWaiting("Waiting for browser authentication...")
                 }
             },
             onPrompt: { prompt in
                 try await dialog.showPrompt(prompt.message, prompt.placeholder)
             },
             onProgress: { message in
-                Task { @MainActor in
-                    dialog.showProgress(message)
-                }
+                guard !dialog.signal.isCancelled else { return }
+                dialog.showProgress(message)
             },
             onManualCodeInput: manualInputProvider,
             signal: dialog.signal,
-            getDeviceId: interactiveOAuthDeviceIdProvider(session.settingsManager)
+            getDeviceId: interactiveOAuthDeviceIdProvider(session.settingsManager),
+            onSelect: { [weak self] prompt in
+                guard let self else { throw LoginDialogError.cancelled }
+                return try await self.showAuthSelect(dialog: dialog, prompt: prompt)
+            }
         )
 
         do {
             try await authStorage.login(provider, callbacks: callbacks)
             // Local credential consistency first — this must be synchronous so the session picks
             // up the new credential immediately.
-            _ = await session.modelRegistry.refresh(ModelsRefreshOptions(allowNetwork: false))
+            try await synchronizeProviderAuthentication(provider.rawValue, operation: .login)
             await session.refreshActiveModel()
             restoreEditor()
-            showStatus("Logged in to \(providerName). Credentials saved to \(getAuthPath())")
-            // Freshness is then chased in a bounded background refresh, so login can never hang
-            // behind a stalled catalog fetch (#7027, #7113, #7418).
-            refreshProviderCatalogInBackground(
-                providerId: provider.rawValue,
-                actionLabel: "Logged in to \(providerName)"
-            )
+            manualInputState.task?.cancel()
+            completeProviderAuthentication(providerId: provider.rawValue, actionLabel: "Logged in to \(providerName)", selectDefaultAfterLogin: needsDefaultSelection)
+            // Radius can offer its MCP server after OAuth success.
         } catch {
+            manualInputState.task?.cancel()
             restoreEditor()
             let message = error.localizedDescription
-            if message != "Login cancelled" {
-                showError("Failed to login to \(providerName): \(message)")
-            }
+            if error is CredentialSynchronizationError {
+                showError("Logged in to \(providerName), but local model state could not be synchronized: \(message)")
+            } else if message == "Login cancelled" { onBack?() }
+            else { showError("Failed to login to \(providerName): \(message)") }
         }
-    }
-
-    @MainActor
-    private func handleOAuthLogout(_ provider: OAuthProvider, authStorage: AuthStorage) async {
-        let providerName = getOAuthProviders().first { $0.id == provider }?.name ?? provider.rawValue
-        authStorage.logout(provider)
-        // Local credential consistency first, then bounded background freshness (#7027, #7113, #7418).
-        _ = await session?.modelRegistry.refresh(ModelsRefreshOptions(allowNetwork: false))
-        await session?.refreshActiveModel()
-        showStatus("Logged out of \(providerName)")
-        refreshProviderCatalogInBackground(
-            providerId: provider.rawValue,
-            actionLabel: "Logged out of \(providerName)"
-        )
     }
 
     /// Refreshes a single provider's catalog without blocking the caller. Each call gets its own
@@ -4486,7 +4653,7 @@ public final class InteractiveMode {
     /// coordinator's per-provider generation guard supersedes-and-cancels the previous run
     /// (#7301, #7421).
     @MainActor
-    private func refreshProviderCatalogInBackground(providerId: String, actionLabel: String) {
+    private func refreshProviderCatalogInBackground(providerId: String, actionLabel: String, selectAfterLogin: Bool = false) {
         guard let session else { return }
         let modelAtStart = session.agent.state.model
         let selectionRevision = modelSelectionRevision
@@ -4500,9 +4667,8 @@ public final class InteractiveMode {
             if let warning = CatalogRefreshStatus.authMessage(outcome, actionLabel: actionLabel) {
                 self.showWarning(warning)
             }
-            if actionLabel.hasPrefix("Logged in"),
-               self.canApplyPostLoginSelection(session, previousModel: modelAtStart, revision: selectionRevision),
-               !session.modelRegistry.hasConfiguredAuth(session.agent.state.model) {
+            if selectAfterLogin,
+               self.canApplyPostLoginSelection(session, previousModel: modelAtStart, revision: selectionRevision) {
                 let available = await session.modelRegistry.getAvailable().filter { $0.provider == providerId }
                 if let model = await selectDefaultModel(available: available, registry: session.modelRegistry) {
                     guard self.canApplyPostLoginSelection(session, previousModel: modelAtStart, revision: selectionRevision) else { return }
