@@ -65,7 +65,8 @@ private func withFullscreenSettingsTempDirectories(
         try invalidData.write(to: settingsPath)
 
         let defaults = SettingsManager.create(project.path, agent.path, projectTrusted: false)
-        #expect(defaults.getTuiMode() == "regular")
+        // Upstream v1.0.0 settings-manager.test.ts: an invalid stored mode falls back to fullscreen.
+        #expect(defaults.getTuiMode() == "fullscreen")
         #expect(defaults.getFullscreenScrollbar() == "auto")
         #expect(defaults.getMouseWheelStep() == 1)
         #expect(defaults.getMermaidEnabled() == true)

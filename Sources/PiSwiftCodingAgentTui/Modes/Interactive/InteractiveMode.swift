@@ -692,7 +692,7 @@ public final class InteractiveMode {
         themeController?.applyFromSettings()
         await themeController?.waitForTerminalColors()
 
-        let shouldShowHeader = verboseStartup || !settingsManager.getQuietStartup()
+        let shouldShowHeader = settingsManager.getQuietStartup().showsStartupHeader(verbose: verboseStartup)
         if shouldShowHeader {
             let version = self.version
             let keybindings = self.keybindings
@@ -2591,7 +2591,7 @@ public final class InteractiveMode {
         loadedResourcesContainer.clear()
         guard let session else { return }
         let settingsManager = session.settingsManager
-        guard options.force || verboseStartup || !settingsManager.getQuietStartup() else { return }
+        guard options.force || settingsManager.getQuietStartup().showsStartupDetails(verbose: verboseStartup) else { return }
 
         let metadata = session.resourceLoader.getPathMetadata()
         let expanded = verboseStartup || toolOutputExpanded
@@ -3638,7 +3638,7 @@ public final class InteractiveMode {
             hideThinkingBlock: hideThinkingBlock,
             showCacheMissNotices: settingsManager.getShowCacheMissNotices(),
             collapseChangelog: settingsManager.getCollapseChangelog(),
-            quietStartup: settingsManager.getQuietStartup(),
+            quietStartup: settingsManager.getQuietStartup() != .off,
             doubleEscapeAction: settingsManager.getDoubleEscapeAction(),
             editorPaddingX: settingsManager.getEditorPaddingX(),
             autocompleteMaxVisible: settingsManager.getAutocompleteMaxVisible(),
