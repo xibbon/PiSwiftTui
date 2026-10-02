@@ -15,11 +15,21 @@ struct StartupDiagnosticDisposition: Sendable {
 func startupDiagnosticDisposition(
     startup: [ResourceDiagnostic],
     runtime: [ResourceDiagnostic],
-    isInteractive: Bool
+    isInteractive: Bool,
+    resources: [ResourceDiagnostic] = [],
+    resourcesShown: Bool = false
 ) -> StartupDiagnosticDisposition {
     let hasRuntimeErrors = runtime.contains { $0.type == "error" }
+    let diagnostics = deduplicateDiagnostics(startup + runtime)
+    let chatDiagnostics = isInteractive && resourcesShown && !hasRuntimeErrors
+        ? diagnostics.filter { diagnostic in
+            !resources.contains {
+                $0.type == diagnostic.type && $0.message == diagnostic.message && $0.path == diagnostic.path
+            }
+        }
+        : diagnostics
     return StartupDiagnosticDisposition(
-        diagnostics: deduplicateDiagnostics(startup + runtime),
+        diagnostics: chatDiagnostics,
         hasRuntimeErrors: hasRuntimeErrors,
         shouldPrint: !isInteractive || hasRuntimeErrors
     )

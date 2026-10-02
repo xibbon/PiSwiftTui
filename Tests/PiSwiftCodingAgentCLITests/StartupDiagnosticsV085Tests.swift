@@ -30,4 +30,29 @@ import PiSwiftCodingAgent
         #expect(!result.hasRuntimeErrors)
         #expect(result.diagnostics.first?.message == warning.message)
     }
+
+    @Test func resourceWarningsAppearOnceWhenStartupResourcesAreShown() {
+        let resource = ResourceDiagnostic(type: "warning", message: "description exceeds 1024 characters (1093)", path: "/tmp/xogot/SKILL.md")
+        let settings = ResourceDiagnostic(type: "warning", message: "Invalid settings file")
+        let shown = startupDiagnosticDisposition(startup: [settings], runtime: [resource], isInteractive: true,
+            resources: [resource], resourcesShown: true)
+        #expect(shown.diagnostics.map(\.message) == [settings.message])
+        #expect(!shown.shouldPrint)
+        let quiet = startupDiagnosticDisposition(startup: [], runtime: [resource], isInteractive: true,
+            resources: [resource], resourcesShown: false)
+        #expect(quiet.diagnostics.map(\.message) == [resource.message])
+        let printed = startupDiagnosticDisposition(startup: [], runtime: [resource], isInteractive: false,
+            resources: [resource], resourcesShown: true)
+        #expect(printed.diagnostics.map(\.message) == [resource.message])
+        #expect(printed.shouldPrint)
+    }
+
+    @Test func resourceErrorsRemainVisibleBeforeStartupFailure() {
+        let error = ResourceDiagnostic(type: "error", message: "Resource failed", path: "/tmp/SKILL.md")
+        let result = startupDiagnosticDisposition(startup: [], runtime: [error], isInteractive: true,
+            resources: [error], resourcesShown: true)
+        #expect(result.hasRuntimeErrors)
+        #expect(result.shouldPrint)
+        #expect(result.diagnostics.map(\.message) == [error.message])
+    }
 }

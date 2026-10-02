@@ -2616,10 +2616,11 @@ public final class InteractiveMode {
             ))
             loadedResourcesContainer.addChild(Spacer(1))
         }
-        func addDiagnostics(_ name: String, _ diagnostics: [ResourceDiagnostic]) {
+        func addDiagnostics(_ name: String, _ diagnostics: [ResourceDiagnostic], diagnosticMetadata: [String: PathMetadata]? = nil) {
             guard !diagnostics.isEmpty else { return }
+            let sources = diagnosticMetadata ?? metadata
             loadedResourcesContainer.addChild(ThemedText({ [weak self] in
-                "\(theme.fg(.warning, "[\(name)]"))\n\(self?.formatDiagnostics(diagnostics, metadata) ?? "")"
+                "\(theme.fg(.warning, "[\(name)]"))\n\(self?.formatDiagnostics(diagnostics, sources) ?? "")"
             }, paddingX: 0, paddingY: 0))
             loadedResourcesContainer.addChild(Spacer(1))
         }
@@ -2676,7 +2677,14 @@ public final class InteractiveMode {
             })
         }
 
-        addDiagnostics("Skill conflicts", skillResult.diagnostics)
+        var skillMetadata: [String: PathMetadata] = [:]
+        for skill in skillResult.skills {
+            let info = skill.sourceInfo
+            skillMetadata[skill.filePath] = PathMetadata(
+                source: info.source, scope: info.scope, origin: info.origin ?? "top-level", baseDir: info.baseDir
+            )
+        }
+        addDiagnostics("Skill conflicts", skillResult.diagnostics, diagnosticMetadata: skillMetadata)
         addDiagnostics("Prompt conflicts", session.resourceLoader.getPrompts().diagnostics)
         addDiagnostics("Extension issues", session.resourceLoader.getExtensions().diagnostics)
         // Upstream v0.99.1 removes the Themes list and retains theme diagnostics.

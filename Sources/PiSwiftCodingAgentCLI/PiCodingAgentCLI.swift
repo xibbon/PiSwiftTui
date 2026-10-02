@@ -624,7 +624,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         let diagnosticDisposition = startupDiagnosticDisposition(
             startup: startupSettingsDiagnostics,
             runtime: runtimeDiagnostics,
-            isInteractive: isInteractive
+            isInteractive: isInteractive,
+            resources: resourceLoader.getExtensions().diagnostics + resourceLoader.getSkills().diagnostics
+                + resourceLoader.getPrompts().diagnostics + resourceLoader.getThemes().diagnostics,
+            resourcesShown: settingsManager.getQuietStartup().showsStartupDetails(verbose: parsed.verbose == true)
         )
         let startupDiagnostics = diagnosticDisposition.diagnostics
         if diagnosticDisposition.shouldPrint { reportStartupDiagnostics(startupDiagnostics) }
