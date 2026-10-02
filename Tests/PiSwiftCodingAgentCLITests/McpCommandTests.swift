@@ -290,7 +290,8 @@ struct McpCommandTests {
         #expect(oauth["clientSecret"] as? String == "${SECRET}")
         #expect(oauth["callbackPort"] as? Int == 8765)
         #expect(servers["oauth"]?["headers"] as? [String: String] == ["A": "last=part"])
-        #expect(servers["oauth"]?["exposure"] as? String == "codemode-deferred")
+        // Upstream v1.0.0 replaces the `codemode-deferred` alias with `codemode` when it validates a config.
+        #expect(servers["oauth"]?["exposure"] as? String == "codemode")
         let before = try Data(contentsOf: context.configPath)
         for port in ["nope", "0", "65536", "1.5"] {
             let invalid = await context.run(["add", "invalid", "--url", "https://example.com", "--oauth-callback-port", port])

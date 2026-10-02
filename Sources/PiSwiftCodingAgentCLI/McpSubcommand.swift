@@ -107,8 +107,7 @@ Options for add:
                           OAuth client secret (may be ${NAME} or !command)
   --oauth-callback-port <port>
                           Fixed OAuth callback port
-  --exposure <mode>       codemode (default), codemode-deferred, deferred, direct,
-                          or hidden
+  --exposure <mode>       codemode (default), deferred, direct, or hidden
 
 Other options:
   --json                  Print the list as JSON
