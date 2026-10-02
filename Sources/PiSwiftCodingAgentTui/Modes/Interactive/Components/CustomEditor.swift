@@ -107,6 +107,8 @@ public final class CustomEditor: Component, SystemCursorAware, EditorComponent, 
         editor.getPaddingX()
     }
 
+    func getAutocompleteMaxVisible() -> Int { editor.getAutocompleteMaxVisible() }
+
     public func setAutocompleteMaxVisible(_ maxVisible: Int) {
         editor.setAutocompleteMaxVisible(maxVisible)
     }

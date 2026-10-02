@@ -643,12 +643,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 print("Migrated auth providers: \(list)")
             }
 
-            if !scopedModels.isEmpty {
-                let modelList = scopedModels.map { scoped in
-                    let thinking = scoped.isThinkingExplicit ? ":\((scoped.thinkingLevel ?? .off).rawValue)" : ""
-                    return "\(scoped.model.id)\(thinking)"
-                }.joined(separator: ", ")
-                print("Model scope: \(modelList) (Ctrl+P to cycle)")
+            if let modelScope = startupModelScopeMessage(
+                scopedModels, quietStartup: settingsManager.getQuietStartup(), verbose: parsed.verbose == true
+            ) {
+                print(modelScope)
             }
 
             printTimings()
@@ -1020,6 +1018,11 @@ private func findInitialModelForSession(
     let hasExistingSession = !sessionContext.messages.isEmpty
     let useScopedModels = !scopedModels.isEmpty && parsed.continue != true && parsed.resume != true
     var restoreWarning: String?
+
+    if let provider = parsed.provider, !provider.isEmpty, parsed.model?.isEmpty != false {
+        fputs("Error: --provider requires --model (for example: --provider \(provider) --model <pattern>)\n", stderr)
+        Darwin.exit(1)
+    }
 
     if parsed.model != nil {
         let resolved = resolveCliModel(

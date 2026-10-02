@@ -5,7 +5,7 @@ import PiSwiftCodingAgent
 import PiSwiftCodingAgentTui
 
 struct CLIOptions: ParsableArguments {
-    @Option(help: "Provider name")
+    @Option(help: "Provider to search for --model (requires --model)")
     var provider: String?
 
     @Option(help: "Model ID")
@@ -24,7 +24,7 @@ struct CLIOptions: ParsableArguments {
     @Option(help: "Output mode: text (default), json, or rpc")
     var mode: String?
 
-    @Option(name: .customLong("tui-mode"), help: "TUI mode: regular (default) or fullscreen")
+    @Option(name: .customLong("tui-mode"), help: "TUI mode: fullscreen (default) or regular")
     private var tuiModeOption: String?
 
     @Flag(name: [.customShort("c"), .customLong("continue")], help: "Continue previous session")
@@ -148,14 +148,6 @@ struct CLIOptions: ParsableArguments {
 }
 
 extension CLIOptions {
-    var tuiMode: String {
-        tuiModeOption ?? InteractiveTuiMode.regular.rawValue
-    }
-
-    var parsedTuiMode: InteractiveTuiMode {
-        InteractiveTuiMode(rawValue: tuiMode) ?? .regular
-    }
-
     var parsedTuiModeOverride: InteractiveTuiMode? {
         tuiModeOption.flatMap(InteractiveTuiMode.init(rawValue:))
     }
@@ -163,7 +155,7 @@ extension CLIOptions {
     func resolvedTuiMode(settingsManager: SettingsManager) -> InteractiveTuiMode {
         parsedTuiModeOverride
             ?? InteractiveTuiMode(rawValue: settingsManager.getTuiMode())
-            ?? .regular
+            ?? .fullscreen
     }
 
     func toArgs() -> Args {

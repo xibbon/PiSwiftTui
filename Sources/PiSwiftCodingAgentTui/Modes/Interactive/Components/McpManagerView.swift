@@ -101,10 +101,16 @@ public final class McpManagerView: Component, Focusable, SystemCursorAware, @Mai
                 prompt.install(continuation)
                 cancelPrompt = { prompt.finish(nil) }
                 let input = Input()
+                #if os(macOS)
+                let clickHint = "Cmd+click to open"
+                #else
+                let clickHint = "Ctrl+click to open"
+                #endif
                 let body: [any Component] = [
                     Spacer(1),
                     Text(viewTheme.fg(.muted, "Approve access in your browser. If it did not open, visit:"), paddingX: 1, paddingY: 0),
-                    Text(viewTheme.fg(.accent, authorizationURL.absoluteString), paddingX: 1, paddingY: 0),
+                    Text(viewTheme.fg(.accent, hyperlink(authorizationURL.absoluteString, url: authorizationURL.absoluteString)), paddingX: 1, paddingY: 0),
+                    Text(viewTheme.fg(.dim, hyperlink(clickHint, url: authorizationURL.absoluteString)), paddingX: 1, paddingY: 0),
                     Spacer(1),
                     Text(viewTheme.fg(.muted, "If the browser runs on another machine, paste the URL it was redirected to:"), paddingX: 1, paddingY: 0),
                     input,

@@ -45,7 +45,8 @@ func t3aSession(model: Model = t3aModel(), manager: SessionManager = .inMemory("
         SettingsConfig(autoCompact: true, showImages: true, autoResizeImages: true, blockImages: false,
             enableSkillCommands: true, steeringMode: "all", followUpMode: "all", transport: .sse,
             thinkingLevel: .high, availableThinkingLevels: [.off, .high], currentTheme: "dark", availableThemes: ["dark"],
-            hideThinkingBlock: false, showCacheMissNotices: true, collapseChangelog: false, quietStartup: false,
+            // Upstream v1.0.0: quietStartup now uses QuietStartup.
+            hideThinkingBlock: false, showCacheMissNotices: true, collapseChangelog: false, quietStartup: .off,
             doubleEscapeAction: "tree", editorPaddingX: 0, autocompleteMaxVisible: 5,
             tuiMode: .fullscreen, fullscreenScrollbar: .auto, mouseWheelStep: 1,
             mermaidEnabled: false, mermaidRenderWhileStreaming: false, latexEnabled: false, outputPad: 1)

@@ -28,6 +28,8 @@ struct McpAddSubcommand: AsyncParsableCommand {
     @Option(name: .customLong("oauth-client-id")) var oauthClientID: String?
     @Option(name: .customLong("oauth-client-secret")) var oauthClientSecret: String?
     @Option(name: .customLong("oauth-callback-port")) var oauthCallbackPort: String?
+    @Option(name: .customLong("oauth-client-name"), help: "Client name sent when registering with the OAuth server") var oauthClientName: String?
+    @Option(name: .customLong("description"), help: "What the server offers, shown in the system prompt") var description: String?
     @Option(name: .customLong("exposure")) var exposure: String?
     @Argument var server: String
     @Argument(parsing: .postTerminator) var command: [String] = []
@@ -37,7 +39,8 @@ struct McpAddSubcommand: AsyncParsableCommand {
         if local { args.append("--local") }
         for (flag, value) in [("url", url), ("cwd", cwd), ("bearer-token-env-var", bearerTokenEnvVar),
                               ("oauth-client-id", oauthClientID), ("oauth-client-secret", oauthClientSecret),
-                              ("oauth-callback-port", oauthCallbackPort), ("exposure", exposure)] {
+                              ("oauth-callback-port", oauthCallbackPort), ("oauth-client-name", oauthClientName),
+                              ("description", description), ("exposure", exposure)] {
             if let value { args += ["--" + flag, value] }
         }
         for value in environment { args += ["--env", value] }
@@ -107,7 +110,10 @@ Options for add:
                           OAuth client secret (may be ${NAME} or !command)
   --oauth-callback-port <port>
                           Fixed OAuth callback port
+  --oauth-client-name <name>
+                          Client name sent when registering with the OAuth server
   --exposure <mode>       codemode (default), deferred, direct, or hidden
+  --description <text>    What the server offers, shown in the system prompt
 
 Other options:
   --json                  Print the list as JSON
@@ -157,7 +163,8 @@ private func mcpHasKnownOptionSyntax(_ args: [String]) -> Bool {
     switch command {
     case "add": known = ["local": .flag, "url": .value, "env": .list, "cwd": .value,
         "header": .list, "bearer-token-env-var": .value, "oauth-client-id": .value,
-        "oauth-client-secret": .value, "oauth-callback-port": .value, "exposure": .value]
+        "oauth-client-secret": .value, "oauth-callback-port": .value, "oauth-client-name": .value,
+        "description": .value, "exposure": .value]
     case "remove": known = ["local": .flag]
     case "list": known = ["json": .flag]
     case "login": known = ["timeout": .value]
@@ -239,7 +246,7 @@ func runMcpCommand(_ args: [String], options: McpCommandOptions) async -> Int32 
         }
         if command == "logout" {
             do {
-                let removed = try credentials.remove(url)
+                let removed = try credentials.remove(name: name, url: url)
                 options.log(removed ? "Signed out of MCP server \"\(name)\"." : "No stored credentials for MCP server \"\(name)\".")
                 return 0
             } catch { options.error(error.localizedDescription); return 1 }
@@ -310,14 +317,15 @@ private func parseMcpPairs(_ option: String, pairs: [String]?, error: (String) -
 private func addMcpCommand(_ args: [String], projectConfig: URL, options: McpCommandOptions) -> Int32 {
     guard let parsed = parseMcpOptions(args, known: ["local": .flag, "url": .value, "env": .list,
         "cwd": .value, "header": .list, "bearer-token-env-var": .value, "oauth-client-id": .value,
-        "oauth-client-secret": .value, "oauth-callback-port": .value, "exposure": .value], error: options.error, maxPositionals: 2) else { return 1 }
+        "oauth-client-secret": .value, "oauth-callback-port": .value, "oauth-client-name": .value,
+        "description": .value, "exposure": .value], error: options.error, maxPositionals: 2) else { return 1 }
     let command = Array(parsed.positional.dropFirst())
     let url = parsed.values["url"]
     guard let name = parsed.positional.first, !name.isEmpty, (url == nil) != command.isEmpty else {
         options.error("Usage: \(APP_NAME) mcp add <server> [options] (--url <url> | -- <command> [args...])\n\(mcpHelpHint)")
         return 1
     }
-    let httpOnly = ["header", "bearer-token-env-var", "oauth-client-id", "oauth-client-secret", "oauth-callback-port"]
+    let httpOnly = ["header", "bearer-token-env-var", "oauth-client-id", "oauth-client-secret", "oauth-callback-port", "oauth-client-name"]
     if let misplaced = (url == nil ? httpOnly : ["env", "cwd"]).first(where: { parsed.has($0) }) {
         options.error("--\(misplaced) only applies to \(url == nil ? "HTTP servers (--url)" : "stdio servers").")
         return 1
@@ -331,6 +339,7 @@ private func addMcpCommand(_ args: [String], projectConfig: URL, options: McpCom
         var oauth: [String: Any] = [:]
         oauth["clientId"] = parsed.values["oauth-client-id"]
         oauth["clientSecret"] = parsed.values["oauth-client-secret"]
+        oauth["clientName"] = parsed.values["oauth-client-name"]
         if let port = parsed.values["oauth-callback-port"] { oauth["callbackPort"] = mcpNumber(port) }
         if !oauth.isEmpty { value["oauth"] = oauth }
     } else {
@@ -341,6 +350,7 @@ private func addMcpCommand(_ args: [String], projectConfig: URL, options: McpCom
         value["cwd"] = parsed.values["cwd"]
     }
     value["exposure"] = parsed.values["exposure"]
+    value["description"] = parsed.values["description"]
     if let invalid = validateMcpServerConfig(name: name, value: value) { options.error(invalid); return 1 }
     let path = parsed.flags.contains("local") ? projectConfig : options.agentDir.appendingPathComponent("mcp.json")
     let scope = parsed.flags.contains("local") ? "project" : "global"
@@ -440,7 +450,7 @@ private func loginMcpCommand(_ entry: McpServerEntry, connection: McpServerConne
             presenter = try makeMcpMacOSSignInPresenter(settings: settings, callbackTimeoutSeconds: timeout,
                 pasteRedirectURL: paste, openAuthorizationURL: open)
         }
-        try await signInMcpServer(serverURL: url, credentials: credentials, settings: settings,
+        try await signInMcpServer(name: name, serverURL: url, credentials: credentials, settings: settings,
             challenge: await connection.challenge, presenter: presenter, http: options.oauthHTTP)
     } catch {
         if error is CancellationError || error is McpCLIInputCancelled || error.localizedDescription == "MCP sign-in timed out" {
@@ -477,7 +487,8 @@ private func readMcpRedirectURL() async throws -> String {
 func preprocessMcpArguments(_ args: [String]) -> [String] {
     guard args.count >= 2, args[0] == "mcp", args[1] == "add" else { return args }
     let valueOptions: Set<String> = ["--url", "--env", "--cwd", "--header", "--bearer-token-env-var",
-        "--oauth-client-id", "--oauth-client-secret", "--oauth-callback-port", "--exposure"]
+        "--oauth-client-id", "--oauth-client-secret", "--oauth-callback-port", "--oauth-client-name",
+        "--description", "--exposure"]
     var index = 2
     var positionals = 0
     while index < args.count {

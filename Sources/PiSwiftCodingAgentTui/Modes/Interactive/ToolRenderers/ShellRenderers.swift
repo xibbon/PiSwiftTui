@@ -13,38 +13,6 @@ private final class ShellRenderState {
     deinit { timer?.cancel() }
 }
 
-@MainActor
-private final class ShellOutputPreview: Component {
-    let output: String
-    let theme: Theme
-    private var cachedWidth: Int?
-    private var cachedPreview: VisualTruncateResult?
-
-    init(output: String, theme: Theme) {
-        self.output = output
-        self.theme = theme
-    }
-
-    func render(width: Int) -> [String] {
-        if cachedWidth != width || cachedPreview == nil {
-            cachedPreview = truncateToVisualLines(output, maxVisualLines: 5, width: width)
-            cachedWidth = width
-        }
-        guard let preview = cachedPreview else { return [] }
-        if preview.skippedCount > 0 {
-            let hint = theme.fg(.muted, "... (\(preview.skippedCount) earlier lines,")
-                + " " + keyHint(.expandTools, "to expand") + theme.fg(.muted, ")")
-            return ["", truncateToWidth(hint, maxWidth: width, ellipsis: "...")] + preview.visualLines
-        }
-        return [""] + preview.visualLines
-    }
-
-    func invalidate() {
-        cachedWidth = nil
-        cachedPreview = nil
-    }
-}
-
 /// Shell tools use the same renderer with a different prompt.
 @MainActor
 public func createShellRenderers(prompt: String) -> ToolRenderers {
@@ -101,7 +69,11 @@ public func createShellRenderers(prompt: String) -> ToolRenderers {
                 if options.expanded {
                     component.addChild(Text("\n" + styled, paddingX: 0, paddingY: 0))
                 } else {
-                    component.addChild(ShellOutputPreview(output: styled, theme: theme))
+                    component.addChild(Spacer(1))
+                    component.addChild(VisualLinePreview(text: styled, maxVisualLines: 5, keep: .end) { hidden in
+                        theme.fg(.muted, "... (\(hidden) earlier lines,")
+                            + " " + keyHint(.expandTools, "to expand") + theme.fg(.muted, ")")
+                    })
                 }
             }
             if truncated || fullOutputPath != nil {

@@ -9,17 +9,29 @@ public func createMcpRenderers(label: String) -> ToolRenderers {
     ToolRenderers(renderCall: { args, theme, context in
         toolText(formatToolCallWithArgs(label, args: args, theme: theme, expanded: context.expanded), context: context)
     }, renderResult: { result, options, theme, context in
+        let component = (context.lastComponent as? Container) ?? Container()
+        component.clear()
         let output = getTextOutput(result, showImages: context.showImages).trimmingCharacters(in: .whitespacesAndNewlines)
-        let lines = output.isEmpty ? [] : replaceTabs(output).components(separatedBy: "\n")
-        let shown = options.expanded ? lines : Array(lines.prefix(5))
-        var text = shown.map { theme.fg(context.isError ? .error : .toolOutput, $0) }.joined(separator: "\n")
-        if shown.count < lines.count { text += toolMoreLinesHint(lines.count - shown.count, theme: theme) }
-        return toolText(text.isEmpty ? "" : "\n" + text, context: context)
+        guard !output.isEmpty else { return component }
+        let styled = replaceTabs(output).components(separatedBy: "\n")
+            .map { theme.fg(context.isError ? .error : .toolOutput, $0) }.joined(separator: "\n")
+        component.addChild(Spacer(1))
+        if options.expanded {
+            component.addChild(Text(styled, paddingX: 0, paddingY: 0))
+        } else {
+            component.addChild(VisualLinePreview(text: styled, maxVisualLines: 5, keep: .start) { hidden in
+                codemodeExpandHint(hidden, theme: theme)
+            })
+            if let path = toolDetails(result)["fullOutputPath"] as? String, !path.isEmpty {
+                component.addChild(Text(theme.fg(.muted, "Full output: \(path)"), paddingX: 0, paddingY: 0))
+            }
+        }
+        return component
     })
 }
 
 private func codemodeExpandHint(_ hidden: Int, theme: Theme) -> String {
-    String(toolMoreLinesHint(hidden, theme: theme).dropFirst())
+    theme.fg(.muted, "... (\(hidden) more lines,") + " " + keyHint(.expandTools, "to expand") + theme.fg(.muted, ")")
 }
 
 func codemodeCost(_ cost: Double) -> String {
@@ -60,19 +72,29 @@ private func codemodeCall(_ call: [String: Any], theme: Theme, expanded: Bool) -
 @MainActor
 public func createCodemodeRenderers() -> ToolRenderers {
     ToolRenderers(renderCall: { args, theme, context in
-        var text = theme.fg(.toolTitle, theme.bold("codemode"))
-        if let code = str(args["code"]) {
-            if !code.isEmpty {
-                let normalized = normalizeDisplayText(code).replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
-                let lines = highlightCode(replaceTabs(normalized), lang: "javascript")
-                let shown = context.expanded ? lines : Array(lines.prefix(10))
-                text += "\n" + shown.joined(separator: "\n")
-                if shown.count < lines.count { text += "\n" + codemodeExpandHint(lines.count - shown.count, theme: theme) }
+        let title = theme.fg(.toolTitle, theme.bold("codemode"))
+        let component = (context.lastComponent as? Container) ?? Container()
+        component.clear()
+        guard let code = str(args["code"]) else {
+            component.addChild(Text(title + " " + invalidArgText(theme), paddingX: 0, paddingY: 0))
+            return component
+        }
+        component.addChild(Text(title, paddingX: 0, paddingY: 0))
+        if !code.isEmpty {
+            let normalized = normalizeDisplayText(code).replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+            let highlighted = highlightCode(replaceTabs(normalized), lang: "javascript").joined(separator: "\n")
+            if context.expanded {
+                component.addChild(Text(highlighted, paddingX: 0, paddingY: 0))
+            } else {
+                component.addChild(VisualLinePreview(text: highlighted, maxVisualLines: 10, keep: .start) { hidden in
+                    codemodeExpandHint(hidden, theme: theme)
+                })
             }
-        } else { text += " " + invalidArgText(theme) }
-        return toolText(text, context: context)
+        }
+        return component
     }, renderResult: { result, options, theme, context in
-        var sections: [String] = []
+        let component = (context.lastComponent as? Container) ?? Container()
+        component.clear()
         let details = toolDetails(result)
         let calls = details["calls"] as? [[String: Any]] ?? []
         if !calls.isEmpty {
@@ -83,7 +105,8 @@ public func createCodemodeRenderers() -> ToolRenderers {
             }
             let priced = calls.compactMap { ($0["cost"] as? NSNumber)?.doubleValue }.filter { $0 != 0 }
             if priced.count > 1 { lines.append(theme.fg(.muted, "Model calls: " + codemodeCost(priced.reduce(0, +)))) }
-            sections.append(lines.joined(separator: "\n"))
+            component.addChild(Spacer(1))
+            component.addChild(Text(lines.joined(separator: "\n"), paddingX: 0, paddingY: 0))
         }
         var content = result.content
         if case .text(let first) = content.first,
@@ -92,15 +115,20 @@ public func createCodemodeRenderers() -> ToolRenderers {
         }
         let output = options.isPartial ? "" : getTextOutput(AgentToolResult(content: content), showImages: context.showImages).trimmingCharacters(in: .whitespacesAndNewlines)
         if !output.isEmpty {
-            let lines = replaceTabs(output).components(separatedBy: "\n")
-            let shown = options.expanded ? lines : Array(lines.prefix(5))
-            var text = shown.map { theme.fg(context.isError ? .error : .toolOutput, $0) }.joined(separator: "\n")
-            if shown.count < lines.count { text += "\n" + codemodeExpandHint(lines.count - shown.count, theme: theme) }
-            if !options.expanded, let path = details["fullOutputPath"] as? String, !path.isEmpty {
-                text += "\n" + theme.fg(.muted, "Full output: \(path)")
+            let styled = replaceTabs(output).components(separatedBy: "\n")
+                .map { theme.fg(context.isError ? .error : .toolOutput, $0) }.joined(separator: "\n")
+            component.addChild(Spacer(1))
+            if options.expanded {
+                component.addChild(Text(styled, paddingX: 0, paddingY: 0))
+            } else {
+                component.addChild(VisualLinePreview(text: styled, maxVisualLines: 5, keep: .start) { hidden in
+                    codemodeExpandHint(hidden, theme: theme)
+                })
+                if let path = details["fullOutputPath"] as? String, !path.isEmpty {
+                    component.addChild(Text(theme.fg(.muted, "Full output: \(path)"), paddingX: 0, paddingY: 0))
+                }
             }
-            sections.append(text)
         }
-        return toolText(sections.isEmpty ? "" : "\n" + sections.joined(separator: "\n\n"), context: context)
+        return component
     })
 }

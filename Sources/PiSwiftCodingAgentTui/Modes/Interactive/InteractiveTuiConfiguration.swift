@@ -57,7 +57,7 @@ public struct InteractiveTuiConfiguration: Sendable, Equatable {
 
     public init(settingsManager: SettingsManager, modeOverride: InteractiveTuiMode? = nil) {
         self.init(
-            mode: modeOverride ?? InteractiveTuiMode(rawValue: settingsManager.getTuiMode()) ?? .regular,
+            mode: modeOverride ?? InteractiveTuiMode(rawValue: settingsManager.getTuiMode()) ?? .fullscreen,
             scrollbar: FullscreenScrollbarMode(rawValue: settingsManager.getFullscreenScrollbar()) ?? .auto,
             mouseWheelStep: settingsManager.getMouseWheelStep(),
             mermaidEnabled: settingsManager.getMermaidEnabled(),

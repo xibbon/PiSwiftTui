@@ -441,7 +441,8 @@ private func systemSettingsConfig() -> SettingsConfig {
         enableSkillCommands: true, steeringMode: "one-at-a-time", followUpMode: "one-at-a-time", transport: .sse,
         thinkingLevel: .high, availableThinkingLevels: [.off, .high],
         availableThemes: ["dark", "light", "other", "system"], hideThinkingBlock: false,
-        showCacheMissNotices: true, collapseChangelog: false, quietStartup: false, doubleEscapeAction: "tree",
+        // Upstream v1.0.0: quietStartup now uses QuietStartup.
+        showCacheMissNotices: true, collapseChangelog: false, quietStartup: .off, doubleEscapeAction: "tree",
         editorPaddingX: 0, autocompleteMaxVisible: 5, tuiMode: .regular, fullscreenScrollbar: .auto,
         mouseWheelStep: 1, mermaidEnabled: true, mermaidRenderWhileStreaming: true, latexEnabled: false, outputPad: 1)
 }

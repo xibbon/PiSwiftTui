@@ -34,13 +34,13 @@ private final class FullscreenTestTerminal: Terminal {
     func setTitle(_ title: String) {}
 }
 
-@Test func tuiModeOptionDefaultsToRegularAndParsesFullscreen() throws {
+@Test func tuiModeOptionHasNoOverrideAndParsesFullscreen() throws {
     let defaults = try CLIOptions.parse([])
-    #expect(defaults.tuiMode == "regular")
-    #expect(defaults.parsedTuiMode == .regular)
+    // Upstream v1.0.0: no CLI flag uses the fullscreen setting default.
+    #expect(defaults.parsedTuiModeOverride == nil)
 
     let fullscreen = try CLIOptions.parse(["--tui-mode", "fullscreen"])
-    #expect(fullscreen.parsedTuiMode == .fullscreen)
+    #expect(fullscreen.parsedTuiModeOverride == .fullscreen)
 }
 
 @Test func invalidTuiModeHasClearDiagnostic() {

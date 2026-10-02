@@ -31,7 +31,7 @@ public struct SettingsConfig: Sendable {
     public var hideThinkingBlock: Bool
     public var showCacheMissNotices: Bool
     public var collapseChangelog: Bool
-    public var quietStartup: Bool
+    public var quietStartup: QuietStartup
     public var doubleEscapeAction: String
     public var editorPaddingX: Int
     public var autocompleteMaxVisible: Int
@@ -69,7 +69,7 @@ public struct SettingsConfig: Sendable {
         hideThinkingBlock: Bool,
         showCacheMissNotices: Bool,
         collapseChangelog: Bool,
-        quietStartup: Bool,
+        quietStartup: QuietStartup,
         doubleEscapeAction: String,
         editorPaddingX: Int,
         autocompleteMaxVisible: Int,
@@ -144,7 +144,7 @@ public struct SettingsCallbacks {
     public var onHideThinkingBlockChange: (Bool) -> Void
     public var onShowCacheMissNoticesChange: (Bool) -> Void
     public var onCollapseChangelogChange: (Bool) -> Void
-    public var onQuietStartupChange: (Bool) -> Void
+    public var onQuietStartupChange: (QuietStartup) -> Void
     public var onDoubleEscapeActionChange: (String) -> Void
     public var onEditorPaddingXChange: (Int) -> Void
     public var onAutocompleteMaxVisibleChange: (Int) -> Void
@@ -178,7 +178,7 @@ public struct SettingsCallbacks {
         onHideThinkingBlockChange: @escaping (Bool) -> Void,
         onShowCacheMissNoticesChange: @escaping (Bool) -> Void,
         onCollapseChangelogChange: @escaping (Bool) -> Void,
-        onQuietStartupChange: @escaping (Bool) -> Void,
+        onQuietStartupChange: @escaping (QuietStartup) -> Void,
         onDoubleEscapeActionChange: @escaping (String) -> Void,
         onEditorPaddingXChange: @escaping (Int) -> Void,
         onAutocompleteMaxVisibleChange: @escaping (Int) -> Void,
@@ -305,9 +305,9 @@ public final class SettingsSelectorComponent: Container, MouseFocusOwner, System
             SettingItem(
                 id: "quiet-startup",
                 label: "Quiet startup",
-                description: "Disable verbose printing at startup",
-                currentValue: config.quietStartup ? "true" : "false",
-                values: ["true", "false"]
+                description: "Disable verbose printing at startup (header: keep only the startup header)",
+                currentValue: config.quietStartup == .header ? "header" : (config.quietStartup == .on ? "true" : "false"),
+                values: ["true", "header", "false"]
             ),
             SettingItem(
                 id: "double-escape-action",
@@ -326,7 +326,7 @@ public final class SettingsSelectorComponent: Container, MouseFocusOwner, System
             SettingItem(
                 id: "tui-mode",
                 label: "TUI mode",
-                description: "Interface layout; fullscreen mode is experimental",
+                description: "Interface layout; regular mode uses the terminal's normal scrollback",
                 currentValue: config.tuiMode.rawValue,
                 values: InteractiveTuiMode.allCases.map(\.rawValue)
             ),
@@ -507,7 +507,7 @@ public final class SettingsSelectorComponent: Container, MouseFocusOwner, System
                 case "collapse-changelog":
                     callbacks.onCollapseChangelogChange(newValue == "true")
                 case "quiet-startup":
-                    callbacks.onQuietStartupChange(newValue == "true")
+                    callbacks.onQuietStartupChange(newValue == "header" ? .header : (newValue == "true" ? .on : .off))
                 case "double-escape-action":
                     callbacks.onDoubleEscapeActionChange(newValue)
                 case "editor-padding-x":

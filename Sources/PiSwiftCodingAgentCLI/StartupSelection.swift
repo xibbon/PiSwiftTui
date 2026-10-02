@@ -1,6 +1,7 @@
 import PiSwiftAI
 import PiSwiftAgent
 import PiSwiftCodingAgent
+import PiSwiftCodingAgentTui
 
 func startupThinkingLevel(
     settingsManager: SettingsManager,
@@ -27,4 +28,22 @@ func startupToolNames(_ args: Args, settingsManager: SettingsManager) -> [ToolNa
     }
     let excluded = Set(args.excludeTools ?? [])
     return names.filter { !excluded.contains($0.rawValue) }
+}
+
+func startupModelScopeMessage(
+    _ models: [ScopedModel], quietStartup: QuietStartup, verbose: Bool,
+    keybindings: KeybindingsManager = .create()
+) -> String? {
+    guard !models.isEmpty, quietStartup.showsStartupDetails(verbose: verbose) else { return nil }
+    let modelList = models.map { scoped in
+        let thinking = scoped.isThinkingExplicit ? ":\((scoped.thinkingLevel ?? .off).rawValue)" : ""
+        return "\(scoped.model.id)\(thinking)"
+    }.joined(separator: ", ")
+    let cycleKeys = keybindings.getKeys(.cycleModelForward).map { key in
+        key.split(separator: "+").map { part in
+            part.prefix(1).uppercased() + part.dropFirst()
+        }.joined(separator: "+")
+    }.joined(separator: "/")
+    let cycleHint = cycleKeys.isEmpty ? "" : " (\(cycleKeys) to cycle)"
+    return "Model scope: \(modelList)\(cycleHint)"
 }

@@ -1,7 +1,8 @@
+import Foundation
 import MiniTui
 import PiSwiftCodingAgent
 
-public func buildStartupHeader(version: String, keybindings: KeybindingsManager, expanded: Bool) -> String {
+public func buildStartupHeader(version: String, keybindings: KeybindingsManager, expanded: Bool, showDetails: Bool = true, environment: [String: String] = ProcessInfo.processInfo.environment) -> String {
     let logo = piLogoLines()
     func displayKeys(_ keys: String) -> String {
         #if os(macOS)
@@ -49,8 +50,10 @@ public func buildStartupHeader(version: String, keybindings: KeybindingsManager,
             hint(.expandTools, "more"),
         ].joined(separator: theme.fg(.muted, " · "))
     }
-    let withLogo = "\(logo.top) \(theme.fg(.dim, "v\(version)"))\n\(logo.bottom) \(instructions)"
+    let withLogo = supportsPiLogo(environment: environment)
+        ? "\(logo.top) \(theme.fg(.dim, "v\(version)"))\n\(logo.bottom) \(instructions)"
+        : "\(piWordmark()) \(theme.fg(.dim, "v\(version)"))\n\(instructions)"
     if expanded { return "\(withLogo)\n\n\(onboarding)" }
-    let compactOnboarding = theme.fg(.dim, "Press \(key(.expandTools)) to show full startup help and loaded resources.")
+    let compactOnboarding = theme.fg(.dim, "Press \(key(.expandTools)) to show full startup help\(showDetails ? " and loaded resources" : "").")
     return "\(withLogo)\n\(compactOnboarding)\n\n\(onboarding)"
 }

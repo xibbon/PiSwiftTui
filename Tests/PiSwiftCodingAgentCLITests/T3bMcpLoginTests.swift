@@ -88,13 +88,14 @@ func t3bMcpLoginSignsInAndReportsReconnectResult(_ reconnectFails: Bool) async t
         error: { text in lines.withLock { $0.append(text) } },
         createTransport: { _, _, _ in
             attempts.withLock { $0 += 1 }
-            guard try credentials.tokens(for: serverURL) != nil else { throw McpOAuthError.authorizationRequired }
+            // Upstream v1.0.0 stores MCP credentials per server name and URL (#10252, mcp-oauth-refresh.test.ts).
+            guard try credentials.tokens(name: "docs", url: serverURL) != nil else { throw McpOAuthError.authorizationRequired }
             if reconnectFails { throw McpRuntimeError.connectionFailed("fixture reconnect failed") }
             return t3bLoggedInTransport()
         }, makePresenter: { _, _, open in T3bLoginPresenter(open: open) }, oauthHTTP: http)
     let code = await runMcpCommand(["login", "docs", "--timeout", "600.5"], options: options)
     let output = lines.withLock { $0.joined(separator: "\n") }
-    #expect(try credentials.tokens(for: serverURL)?.accessToken == "fixture-token")
+    #expect(try credentials.tokens(name: "docs", url: serverURL)?.accessToken == "fixture-token")
     #expect(await http.tokenRequests == 1)
     #expect(attempts.withLock { $0 } == 2)
     #expect(output.contains("Sign in to MCP server \"docs\" in your browser:\nhttp://127.0.0.1:45454/authorize?"))

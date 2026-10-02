@@ -274,6 +274,7 @@ public final class InteractiveMode {
     public var lastStatusText: ThemedText?
     private var lastStatusMessage = ""
     var builtInHeader: ExpandableText?
+    private let startupHeaderContainer = Container()
     let loadedResourcesContainer = Container()
 
     private var session: AgentSession?
@@ -286,7 +287,7 @@ public final class InteractiveMode {
     var clipboardText: () -> ClipboardReadResult = readClipboardText
     var writeClipboardImage: (Data, URL) throws -> Void = { try $0.write(to: $1) }
     private var composition: InteractiveComposition?
-    private var tuiConfiguration: InteractiveTuiConfiguration
+    private(set) var tuiConfiguration: InteractiveTuiConfiguration
     private var tuiModeOverride: InteractiveTuiMode?
     private var version: String = VERSION
     private var changelogMarkdown: String?
@@ -360,7 +361,7 @@ public final class InteractiveMode {
     private let bugReportHints = BugReportHintTracker()
     private var entriesRenderedByBoundaryCompaction: Set<String> = []
     private var toolOutputExpanded = false
-    private var hideThinkingBlock = false
+    private(set) var hideThinkingBlock = false
     private let defaultWorkingMessage = "Working"
     private var workingMessage: String?
     private(set) var workingVisible = true
@@ -418,7 +419,7 @@ public final class InteractiveMode {
         self.init(
             chatContainer: Container(),
             ui: NullRenderRequester(),
-            tuiConfiguration: InteractiveTuiConfiguration(mode: tuiMode ?? .regular)
+            tuiConfiguration: InteractiveTuiConfiguration(settingsManager: session.settingsManager, modeOverride: tuiMode)
         )
         self.tuiModeOverride = tuiMode
         self.startupDiagnostics = startupDiagnostics
@@ -443,8 +444,8 @@ public final class InteractiveMode {
 
     /// Construct a mounted component host for embedding and deterministic event tests.
     convenience init(session: AgentSession, tui: TUI, editor: EditorComponentView, renderer: AltScreenRenderer? = nil,
-                     mcpUi: InteractiveMcpUi? = nil) {
-        self.init(session: session, version: VERSION, mcpUi: mcpUi)
+                     mcpUi: InteractiveMcpUi? = nil, tuiMode: InteractiveTuiMode? = nil, verbose: Bool = false) {
+        self.init(session: session, version: VERSION, mcpUi: mcpUi, verbose: verbose, tuiMode: tuiMode)
         self.tui = tui
         self.ui = TuiRenderAdapter(tui)
         self.editor = editor
@@ -646,8 +647,7 @@ public final class InteractiveMode {
             transcriptChildren.append(component)
         }
 
-        let headerContainer = Container()
-        addTranscriptChild(headerContainer)
+        addTranscriptChild(startupHeaderContainer)
         addTranscriptChild(loadedResourcesContainer)
 
         tui.addChild(chatContainer)
@@ -692,41 +692,7 @@ public final class InteractiveMode {
         themeController?.applyFromSettings()
         await themeController?.waitForTerminalColors()
 
-        let shouldShowHeader = settingsManager.getQuietStartup().showsStartupHeader(verbose: verboseStartup)
-        if shouldShowHeader {
-            let version = self.version
-            let keybindings = self.keybindings
-            let header = ExpandableText(
-                collapsed: { buildStartupHeader(version: version, keybindings: keybindings, expanded: false) },
-                expanded: { buildStartupHeader(version: version, keybindings: keybindings, expanded: true) },
-                isExpanded: verboseStartup || toolOutputExpanded, paddingX: 1, paddingY: 0
-            )
-            builtInHeader = header
-            headerContainer.addChild(Spacer(1))
-            headerContainer.addChild(header)
-            headerContainer.addChild(Spacer(1))
-
-            if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                headerContainer.addChild(DynamicBorder())
-                if settingsManager.getCollapseChangelog() {
-                    let condensed = "Updated. Use /changelog to view details."
-                    headerContainer.addChild(Text(condensed, paddingX: 1, paddingY: 0))
-                } else {
-                    headerContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "What's New")) }, paddingX: 1, paddingY: 0))
-                    headerContainer.addChild(Spacer(1))
-                    headerContainer.addChild(Markdown(changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines), paddingX: 1, paddingY: 0, theme: getMarkdownTheme()))
-                    headerContainer.addChild(Spacer(1))
-                }
-                headerContainer.addChild(DynamicBorder())
-            }
-        } else {
-            headerContainer.addChild(Text("", paddingX: 0, paddingY: 0))
-            if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                headerContainer.addChild(Spacer(1))
-                let condensed = "Updated. Use /changelog to view details."
-                headerContainer.addChild(Text(condensed, paddingX: 1, paddingY: 0))
-            }
-        }
+        refreshStartupHeader()
 
         tui.requestRender()
 
@@ -762,6 +728,50 @@ public final class InteractiveMode {
 
         if let tmuxWarning = await checkTmuxKeyboardSetup() {
             showWarning(tmuxWarning)
+        }
+    }
+
+    @MainActor
+    func refreshStartupHeader() {
+        guard let settingsManager = session?.settingsManager else { return }
+        let headerContainer = startupHeaderContainer
+        headerContainer.clear()
+        builtInHeader = nil
+        let shouldShowHeader = settingsManager.getQuietStartup().showsStartupHeader(verbose: verboseStartup)
+        if shouldShowHeader {
+            let version = self.version
+            let keybindings = self.keybindings
+            let showDetails = settingsManager.getQuietStartup().showsStartupDetails(verbose: verboseStartup)
+            let header = ExpandableText(
+                collapsed: { buildStartupHeader(version: version, keybindings: keybindings, expanded: false, showDetails: showDetails) },
+                expanded: { buildStartupHeader(version: version, keybindings: keybindings, expanded: true, showDetails: showDetails) },
+                isExpanded: verboseStartup || toolOutputExpanded, paddingX: 1, paddingY: 0
+            )
+            builtInHeader = header
+            headerContainer.addChild(Spacer(1))
+            headerContainer.addChild(header)
+            headerContainer.addChild(Spacer(1))
+
+            if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                headerContainer.addChild(DynamicBorder())
+                if settingsManager.getCollapseChangelog() {
+                    let condensed = "Updated. Use /changelog to view details."
+                    headerContainer.addChild(Text(condensed, paddingX: 1, paddingY: 0))
+                } else {
+                    headerContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "What's New")) }, paddingX: 1, paddingY: 0))
+                    headerContainer.addChild(Spacer(1))
+                    headerContainer.addChild(Markdown(changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines), paddingX: 1, paddingY: 0, theme: getMarkdownTheme()))
+                    headerContainer.addChild(Spacer(1))
+                }
+                headerContainer.addChild(DynamicBorder())
+            }
+        } else {
+            headerContainer.addChild(Text("", paddingX: 0, paddingY: 0))
+            if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                headerContainer.addChild(Spacer(1))
+                let condensed = "Updated. Use /changelog to view details."
+                headerContainer.addChild(Text(condensed, paddingX: 1, paddingY: 0))
+            }
         }
     }
 
@@ -3638,7 +3648,7 @@ public final class InteractiveMode {
             hideThinkingBlock: hideThinkingBlock,
             showCacheMissNotices: settingsManager.getShowCacheMissNotices(),
             collapseChangelog: settingsManager.getCollapseChangelog(),
-            quietStartup: settingsManager.getQuietStartup() != .off,
+            quietStartup: settingsManager.getQuietStartup(),
             doubleEscapeAction: settingsManager.getDoubleEscapeAction(),
             editorPaddingX: settingsManager.getEditorPaddingX(),
             autocompleteMaxVisible: settingsManager.getAutocompleteMaxVisible(),
@@ -4875,6 +4885,33 @@ public final class InteractiveMode {
         scheduleRender()
     }
 
+    /// Refresh host state after the session reads settings and replaces extension tools.
+    @MainActor
+    private func refreshHostSettingsAfterReload() {
+        guard let session, let tui else { return }
+        let settings = session.settingsManager
+        let next = InteractiveTuiConfiguration(settingsManager: settings, modeOverride: tuiModeOverride)
+        let currentMode = tuiConfiguration.mode
+        tuiConfiguration = next
+        tuiConfiguration.mode = currentMode
+        if next.mode != currentMode { _ = switchTuiMode(next.mode) }
+        setFullscreenScrollbar(next.scrollbar)
+        setFullscreenWheelScrollLines(next.fullscreenWheelScrollLines)
+        applyInteractiveTerminalCapabilities(settings)
+        tui.setClearOnShrink(settings.getClearOnShrink())
+        altScreenRenderer?.setCopyOnSelect(settings.getFullscreenCopyOnSelect())
+        defaultEditor?.setPaddingX(settings.getEditorPaddingX())
+        editor?.setPaddingX(settings.getEditorPaddingX())
+        defaultEditor?.setAutocompleteMaxVisible(settings.getAutocompleteMaxVisible())
+        editor?.setAutocompleteMaxVisible(settings.getAutocompleteMaxVisible())
+        hideThinkingBlock = settings.getHideThinkingBlock()
+        updateToolImages(settings.getShowImages())
+        footer?.setAutoCompactEnabled(settings.getCompactionEnabled())
+        themeController?.applyFromSettings()
+        // Image resize/block, quiet startup, and skill settings are read at each use.
+        // renderInitialMessages and rebuildAutocomplete below read their new values.
+    }
+
     @MainActor
     func handleReloadCommand() async {
         guard let session, let tui, let editorContainer, let currentEditor = editor else { return }
@@ -4904,11 +4941,8 @@ public final class InteractiveMode {
         }
 
         await session.reload()
-        applyInteractiveTerminalCapabilities(session.settingsManager)
-        tui.setClearOnShrink(session.settingsManager.getClearOnShrink())
-        altScreenRenderer?.setCopyOnSelect(session.settingsManager.getFullscreenCopyOnSelect())
-        themeController?.applyFromSettings()
         let extensionResult = await session.reloadExtensions()
+        refreshHostSettingsAfterReload()
         setWorkingMessage(nil)
         workingVisible = true
         setWorkingIndicator(nil)
@@ -4917,6 +4951,7 @@ public final class InteractiveMode {
         keybindings = KeybindingsManager.create()
         skills = session.resourceLoader.getSkills().skills
         setRegisteredThemes(session.resourceLoader.getThemes().themes)
+        refreshStartupHeader()
 
         // Refresh hook-derived UI state so dropped extensions disappear and freshly-loaded
         // ones become reachable. setupHookShortcuts replaces the entire shortcut map.
