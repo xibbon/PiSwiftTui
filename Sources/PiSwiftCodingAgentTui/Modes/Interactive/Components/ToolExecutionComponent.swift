@@ -25,7 +25,12 @@ public final class ToolExecutionComponent: Container {
     private let rendererState = ToolRenderState()
     private var imageComponents: [Image] = []
     private var imageSpacers: [Spacer] = []
-    private var convertedImages: [Int: ImageContent] = [:]
+    private struct ImageSource: Equatable {
+        let data: String
+        let mimeType: String
+        let widthCells: Int
+    }
+    private var imageSources: [ImageSource] = []
     private let toolName: String
     private let toolCallId: String
     private var args: [String: AnyCodable]
@@ -140,9 +145,7 @@ public final class ToolExecutionComponent: Container {
     public func updateResult(_ result: ToolResultMessage, isPartial: Bool = false) {
         self.result = result
         self.isPartial = isPartial
-        convertedImages.removeAll()
         updateDisplay()
-        maybeConvertImagesForKitty()
     }
 
     public func setExpanded(_ expanded: Bool) {
@@ -153,7 +156,6 @@ public final class ToolExecutionComponent: Container {
     public func setShowImages(_ show: Bool) {
         showImages = show
         updateDisplay()
-        maybeConvertImagesForKitty()
     }
 
     public func setImageWidthCells(_ width: Int) {
@@ -288,29 +290,38 @@ public final class ToolExecutionComponent: Container {
             }
             hasContent = true
         }
+        let previousImages = imageComponents
+        let previousSources = imageSources
         for image in imageComponents { removeChild(image) }
         for spacer in imageSpacers { removeChild(spacer) }
         imageComponents.removeAll()
+        imageSources.removeAll()
         imageSpacers.removeAll()
         if let result, getCapabilities().images != nil, showImages {
-            let caps = getCapabilities()
             let images = result.content.compactMap { block -> ImageContent? in
                 if case .image(let image) = block { return image }
                 return nil
             }
-            for (index, image) in images.enumerated() {
-                let resolved = convertedImages[index] ?? image
-                guard caps.images != .kitty || resolved.mimeType == "image/png" else { continue }
+            for image in images where !image.data.isEmpty && !image.mimeType.isEmpty {
+                let source = ImageSource(data: image.data, mimeType: image.mimeType, widthCells: imageWidthCells)
+                let index = imageComponents.count
+                if source.mimeType != "image/png" { ensurePngTranscoder() }
                 let spacer = Spacer(1)
-                let component = Image(
-                    base64Data: resolved.data, mimeType: resolved.mimeType,
-                    theme: ImageTheme(fallbackColor: { theme.fg(.toolOutput, $0) }),
-                    options: ImageOptions(maxWidthCells: imageWidthCells)
-                )
+                let component: Image
+                if previousSources.indices.contains(index), previousSources[index] == source {
+                    component = previousImages[index]
+                } else {
+                    component = Image(
+                        base64Data: source.data, mimeType: source.mimeType,
+                        theme: ImageTheme(fallbackColor: { theme.fg(.toolOutput, $0) }),
+                        options: ImageOptions(maxWidthCells: source.widthCells)
+                    )
+                }
                 addChild(spacer)
                 addChild(component)
                 imageSpacers.append(spacer)
                 imageComponents.append(component)
+                imageSources.append(source)
             }
         }
         hideComponent = renderers != nil && !hasContent && imageComponents.isEmpty
@@ -321,21 +332,5 @@ public final class ToolExecutionComponent: Container {
         let output = textOutput()
         if !output.isEmpty { text += "\n" + fallbackOutput(output) }
         return text
-    }
-
-    private func maybeConvertImagesForKitty() {
-        guard getCapabilities().images == .kitty, let result else { return }
-        let images = result.content.compactMap { block -> ImageContent? in
-            if case .image(let image) = block { return image }
-            return nil
-        }
-        for (index, image) in images.enumerated() {
-            guard image.mimeType != "image/png", convertedImages[index] == nil else { continue }
-            if let converted = convertToPng(image.data, image.mimeType) {
-                convertedImages[index] = converted
-                updateDisplay()
-                ui.requestRender()
-            }
-        }
     }
 }

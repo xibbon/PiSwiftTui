@@ -12,7 +12,8 @@ import Testing
         let dialog = LoginDialogComponent(tui: TUI(terminal: ToolTestTerminal()),
             providerId: "prompt-repro", providerName: "Prompt Repro", onComplete: { _, _ in })
         dialog.authBrowserOpener = { _ in true }
-        dialog.authClipboardCopy = { _ in .success }
+        // D3: inject the explicit URL copy operation; do not copy on display.
+        dialog.authURLCopy = { _ in .success }
         return dialog
     }
 
@@ -53,7 +54,8 @@ import Testing
         let output = lines(dialog).joined(separator: "\n")
         #expect(output.contains("https://example.invalid/login"))
         #expect(output.contains("Authorize the extension"))
-        #expect(output.contains("URL copied to clipboard"))
+        // D3: show the copy key hint until the user presses the key.
+        #expect(output.contains("to copy"))
 #if os(macOS)
         #expect(output.contains("Cmd+click to open"))
 #else

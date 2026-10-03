@@ -226,7 +226,8 @@ func runMcpCommand(_ args: [String], options: McpCommandOptions) async -> Int32 
         guard let parsed = parseMcpOptions(rest, known: ["json": .flag], error: options.error) else { return 1 }
         guard parsed.positional.isEmpty else { options.error("Usage: \(APP_NAME) mcp list [--json]\n\(mcpHelpHint)"); return 1 }
         let report = await inspectMcpServers(loaded, cwd: options.cwd, credentials: credentials, note: note,
-            log: McpServerLog(path: options.agentDir.appendingPathComponent("mcp.log")), createTransport: options.createTransport)
+            log: McpServerLog(path: options.agentDir.appendingPathComponent("mcp.log")),
+            clientMetadataDocumentURL: piSwiftClientMetadataDocumentURL, createTransport: options.createTransport)
         return printMcpList(report, json: parsed.flags.contains("json"), options: options)
     case "login", "logout":
         guard let parsed = parseMcpOptions(rest, known: command == "login" ? ["timeout": .value] : [:], error: options.error) else { return 1 }
@@ -239,7 +240,8 @@ func runMcpCommand(_ args: [String], options: McpCommandOptions) async -> Int32 
             return 1
         }
         let connection = McpServerConnection(entry: entry, cwd: options.cwd, createTransport: options.createTransport,
-            credentials: credentials, log: McpServerLog(path: options.agentDir.appendingPathComponent("mcp.log")))
+            credentials: credentials, log: McpServerLog(path: options.agentDir.appendingPathComponent("mcp.log")),
+            clientMetadataDocumentURL: piSwiftClientMetadataDocumentURL)
         guard let url = await connection.oauthURL else {
             options.error("MCP server \"\(name)\" does not use OAuth. Only HTTP servers without an Authorization header do.")
             return 1
@@ -407,6 +409,7 @@ private func printMcpList(_ report: McpListReport, json: Bool, options: McpComma
         else { state = server.state == "needs-auth" ? "needs sign-in" : server.state }
         options.log("\(server.name): \(state) (\(server.exposure.rawValue), \(server.scope.rawValue))")
         options.log("  \(server.transport)")
+        if let override = server.override { options.log("  project override: \(override)") }
         if server.state == "needs-auth" { options.log("  sign in with: \(APP_NAME) mcp login \(server.name)") }
         if !server.tools.isEmpty {
             let tools = server.tools.map { tool in server.toolExposure?[tool].map { "\(tool) [\($0.rawValue)]" } ?? tool }
@@ -451,7 +454,8 @@ private func loginMcpCommand(_ entry: McpServerEntry, connection: McpServerConne
                 pasteRedirectURL: paste, openAuthorizationURL: open)
         }
         try await signInMcpServer(name: name, serverURL: url, credentials: credentials, settings: settings,
-            challenge: await connection.challenge, presenter: presenter, http: options.oauthHTTP)
+            challenge: await connection.challenge, presenter: presenter,
+            clientMetadataDocumentURL: piSwiftClientMetadataDocumentURL, http: options.oauthHTTP)
     } catch {
         if error is CancellationError || error is McpCLIInputCancelled || error.localizedDescription == "MCP sign-in timed out" {
             options.error("Sign-in to MCP server \"\(name)\" was cancelled or not completed within \(mcpTimeoutText(timeout)) seconds.")

@@ -14,17 +14,6 @@ public enum LoginDialogError: Error, LocalizedError {
     }
 }
 
-func loginClipboardNotice(for result: PiSwiftCodingAgent.ClipboardCopyResult) -> String {
-    switch result {
-    case .success:
-        return "URL copied to clipboard"
-    case .osc52SentUnverified:
-        return "Sent a copy request to the terminal; copy the URL above if needed"
-    case .failure:
-        return "Copy the URL above into your browser"
-    }
-}
-
 public final class LoginDialogComponent: Container, SystemCursorAware, Focusable {
     private let contentContainer: Container
     private let input: Input
@@ -36,8 +25,9 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
     private var inputIsSecret = false
     private var pendingInputId: UUID?
     private var removeInputCancellationHandler: (@Sendable () -> Void)?
+    private var authURL: AuthUrlComponent?
     var authBrowserOpener: (String) -> Bool = openBrowser
-    var authClipboardCopy: (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard
+    var authURLCopy: @MainActor (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard
     public let signal: CancellationToken
     public var focused: Bool {
         get { input.focused }
@@ -141,19 +131,10 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
     public func showAuth(_ url: String, _ instructions: String?) {
         contentContainer.clear()
         contentContainer.addChild(Spacer(1))
-        let linkedUrl = "\u{001B}]8;;\(url)\u{0007}\(url)\u{001B}]8;;\u{0007}"
-        contentContainer.addChild(Text(theme.fg(.accent, linkedUrl), paddingX: 1, paddingY: 0))
-
-#if os(macOS)
-        let clickHint = "Cmd+click to open"
-#else
-        let clickHint = "Ctrl+click to open"
-#endif
-        let hyperlink = "\u{001B}]8;;\(url)\u{0007}\(clickHint)\u{001B}]8;;\u{0007}"
-        contentContainer.addChild(Text(theme.fg(.dim, hyperlink), paddingX: 1, paddingY: 0))
-
-        let copyNotice = loginClipboardNotice(for: authClipboardCopy(url))
-        contentContainer.addChild(Text(theme.fg(.dim, copyNotice), paddingX: 1, paddingY: 0))
+        let link = AuthUrlComponent(url: url, requestRender: { [tui] in tui.requestRender() },
+                                    clipboardCopy: authURLCopy)
+        authURL = link
+        contentContainer.addChild(link)
 
         if let instructions {
             contentContainer.addChild(Spacer(1))
@@ -196,6 +177,7 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
     }
 
     public func showDetails(_ lines: [String]) {
+        authURL = nil
         contentContainer.clear()
         contentContainer.addChild(Spacer(1))
         for line in lines {
@@ -234,6 +216,10 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
     public override func handleInput(_ keyData: String) {
         if isEscape(keyData) || isCtrlC(keyData) {
             cancel()
+            return
+        }
+        if let authURL, appKeyMatches(keyData, .copyMessage) {
+            authURL.copy()
             return
         }
         input.handleInput(keyData)

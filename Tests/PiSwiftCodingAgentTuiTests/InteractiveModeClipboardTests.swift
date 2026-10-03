@@ -102,10 +102,21 @@ private func assistantMessage(_ text: String) -> AgentMessage {
     #expect(await failure.copySelection?("text") == MiniTui.ClipboardCopyResult.failed("Backend unavailable"))
 }
 
+@MainActor
 @Test func loginCopyNoticeRequiresVerifiedCopy() {
-    #expect(loginClipboardNotice(for: .success) == "URL copied to clipboard")
-    #expect(loginClipboardNotice(for: .osc52SentUnverified).contains("copy request"))
-    #expect(loginClipboardNotice(for: .failure("Backend unavailable")) == "Copy the URL above into your browser")
+    // D3: the explicit AuthUrl copy operation reports each backend result.
+    let outcomes: [(PiSwiftCodingAgent.ClipboardCopyResult, String)] = [
+        (.success, "Copied URL to clipboard"),
+        (.osc52SentUnverified, "Sent a copy request to the terminal; clipboard not verified"),
+        (.failure("Backend unavailable"), "Backend unavailable"),
+    ]
+    for (result, expected) in outcomes {
+        let link = AuthUrlComponent(url: "https://example.invalid/login", requestRender: {}, clipboardCopy: { _ in result })
+        link.copy()
+        let output = stripTerminalSequences(link.render(width: 160).joined(separator: "\n"))
+        #expect(output.contains(expected))
+        if result != .success { #expect(!output.contains("Copied URL to clipboard")) }
+    }
 }
 
 @MainActor

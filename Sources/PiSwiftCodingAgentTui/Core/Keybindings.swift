@@ -50,6 +50,10 @@ func currentAppHintKeys(_ action: AppAction) -> [KeyId] {
     activeAppHintKeys.withLock { $0[action] ?? [] }
 }
 
+func appKeyMatches(_ data: String, _ action: AppAction) -> Bool {
+    currentAppHintKeys(action).contains { matchesKey(data, $0) }
+}
+
 public final class KeybindingsManager {
     private let config: KeybindingsConfig
     private let appActionToKeys: [AppAction: [KeyId]]

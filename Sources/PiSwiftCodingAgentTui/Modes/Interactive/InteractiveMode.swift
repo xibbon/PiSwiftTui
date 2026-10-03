@@ -2098,8 +2098,7 @@ public final class InteractiveMode {
                                 toolCallId: call.id,
                                 args: toolArgumentsWithOrder(call.arguments, argumentsJSON: call.argumentsJSON),
                                 options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
-                                customTool: getRegisteredToolDefinition(call.name),
-                                sourceInfo: session.hookRunner?.getToolSourceInfo(call.name),
+                                renderers: resolvedToolRenderers(call.name, session: session, fallback: customTools[call.name]?.tool),
                                 ui: tui
                             )
                             component.setExpanded(toolOutputExpanded)
@@ -2143,8 +2142,7 @@ public final class InteractiveMode {
                     toolCallId: toolCallId,
                     args: args,
                     options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
-                    customTool: getRegisteredToolDefinition(toolName),
-                    sourceInfo: session.hookRunner?.getToolSourceInfo(toolName),
+                    renderers: resolvedToolRenderers(toolName, session: session, fallback: customTools[toolName]?.tool),
                     ui: tui
                 )
                 component.setExpanded(toolOutputExpanded)
@@ -2245,8 +2243,8 @@ public final class InteractiveMode {
                     toolCallId: toolResult.toolCallId,
                     args: toolInfo?.args ?? [:],
                     options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
-                    customTool: getRegisteredToolDefinition(toolInfo?.name ?? toolResult.toolName),
-                    sourceInfo: session.hookRunner?.getToolSourceInfo(toolInfo?.name ?? toolResult.toolName),
+                    renderers: resolvedToolRenderers(toolInfo?.name ?? toolResult.toolName, session: session,
+                        fallback: customTools[toolInfo?.name ?? toolResult.toolName]?.tool),
                     ui: tui
                 )
                 component.setExpanded(toolOutputExpanded)
@@ -2316,12 +2314,6 @@ public final class InteractiveMode {
         guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
         chatContainer.addChild(Spacer(1))
         chatContainer.addChild(ThemedText({ theme.fg(.warning, thinkingDropNoticeText(notice)) }, paddingX: 1, paddingY: 0))
-    }
-
-    @MainActor
-    private func getRegisteredToolDefinition(_ name: String) -> CustomTool? {
-        guard let session else { return customTools[name]?.tool }
-        return registeredToolDefinition(name, session: session, fallback: customTools[name]?.tool)
     }
 
     @MainActor
@@ -3427,7 +3419,7 @@ public final class InteractiveMode {
 
     func prompt(_ text: String, images: [ImageContent]?) async {
         guard let session else { return }
-        if text.trimmingCharacters(in: .whitespacesAndNewlines) == "/mcp", mcpUi != nil,
+        if Self.usesMcpManager(text), mcpUi != nil,
            session.hookRunner?.getCommand("mcp")?.sourceInfo?.path == "builtin:mcp" {
             _ = await handleHookCommand(text.trimmingCharacters(in: .whitespacesAndNewlines))
             return
@@ -3441,6 +3433,12 @@ public final class InteractiveMode {
                 self.showError(error.localizedDescription)
             }
         }
+    }
+
+    @MainActor
+    private static func usesMcpManager(_ text: String) -> Bool {
+        let parts = text.split(whereSeparator: { $0.isWhitespace })
+        return parts.first == "/mcp" && (parts.count == 1 || parts.dropFirst().first == "login")
     }
 
     @MainActor
@@ -3460,7 +3458,7 @@ public final class InteractiveMode {
 
         let context = hookRunner.createCommandContext()
         do {
-            if commandName == "mcp", args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            if Self.usesMcpManager(trimmed),
                command.sourceInfo?.path == "builtin:mcp", let mcpUi {
                 await mcpUi.runManager { try await command.handler(args, context) }
             } else {

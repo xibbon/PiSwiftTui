@@ -197,7 +197,7 @@ extension CLIOptions {
         result.sessionId = sessionId
         result.sessionDir = sessionDir
         if let models {
-            result.models = models.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            result.models = models.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         }
         if let tools {
             let toolNames = tools.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }

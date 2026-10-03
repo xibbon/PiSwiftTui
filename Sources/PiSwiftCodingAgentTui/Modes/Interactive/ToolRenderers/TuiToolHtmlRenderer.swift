@@ -92,8 +92,7 @@ func registeredToolDefinition(_ name: String, session: AgentSession,
 @MainActor
 func registeredToolRenderers(_ name: String, session: AgentSession,
                              fallback: CustomTool? = nil) -> ToolRenderers? {
-    let definition = registeredToolDefinition(name, session: session, fallback: fallback)
-    return withBuiltInRenderers(name, definition, sourceInfo: session.hookRunner?.getToolSourceInfo(name))
+    resolvedToolRenderers(name, session: session, fallback: fallback)
 }
 
 @MainActor

@@ -9,6 +9,13 @@ public func createAllToolRenderers() -> [String: ToolRenderers] {
 /// A custom definition replaces each renderer slot independently.
 @MainActor
 public func withBuiltInRenderers(_ toolName: String, _ definition: CustomTool?, sourceInfo: SourceInfo? = nil) -> ToolRenderers? {
+    let builtIn = builtInToolRenderers(toolName, definition, sourceInfo: sourceInfo)
+    guard let definition else { return builtIn }
+    return applyingRendererSlots(CustomToolRenderers(tool: definition), to: builtIn)
+}
+
+@MainActor
+private func builtInToolRenderers(_ toolName: String, _ definition: CustomTool?, sourceInfo: SourceInfo?) -> ToolRenderers? {
     let builtIn: ToolRenderers?
     if toolName == "codemode", sourceInfo?.path == "builtin:codemode" {
         builtIn = createCodemodeRenderers()
@@ -17,18 +24,49 @@ public func withBuiltInRenderers(_ toolName: String, _ definition: CustomTool?, 
     } else {
         builtIn = createAllToolRenderers()[toolName]
     }
-    guard let definition else { return builtIn }
+    return builtIn
+}
+
+@MainActor
+private func applyingRendererSlots(_ value: CustomToolRenderers, to builtIn: ToolRenderers?) -> ToolRenderers {
     var merged = builtIn ?? ToolRenderers()
-    merged.renderShell = definition.renderShell
-    if let call = definition.renderCall {
+    if let shell = value.renderShell { merged.renderShell = shell }
+    if let call = value.renderCall {
         merged.renderCall = { args, theme, _ in
             try call(args, theme) as? Component ?? Text("", paddingX: 0, paddingY: 0)
         }
     }
-    if let result = definition.renderResult {
+    if let result = value.renderResult {
         merged.renderResult = { value, options, theme, _ in
             try result(value, options, theme) as? Component ?? Text("", paddingX: 0, paddingY: 0)
         }
     }
     return merged
+}
+
+/// Use the library resolver chain and draw host renderer families on the main actor.
+@MainActor
+func resolvedToolRenderers(_ name: String, session: AgentSession,
+                           fallback: CustomTool? = nil) -> ToolRenderers? {
+    let definition = registeredToolDefinition(name, session: session, fallback: fallback)
+    let builtIn = builtInToolRenderers(name, definition,
+        sourceInfo: session.hookRunner?.getToolSourceInfo(name))
+    let base: () -> CustomToolRenderers? = {
+        if let definition { return CustomToolRenderers(tool: definition) }
+        // Keep host built-ins in the chain even when the library has no tool definition.
+        return builtIn == nil ? nil : CustomToolRenderers()
+    }
+    let value: CustomToolRenderers?
+    if let runner = session.hookRunner {
+        value = runner.resolveToolRenderers(name, base: base)
+    } else {
+        value = base()
+    }
+    guard let value else { return nil }
+    let family: ToolRenderers?
+    switch value.builtIn {
+    case .mcp(let label): family = createMcpRenderers(label: label)
+    case nil: family = builtIn
+    }
+    return applyingRendererSlots(value, to: family)
 }

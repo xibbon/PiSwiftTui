@@ -12,6 +12,7 @@ public final class McpManagerView: Component, Focusable, SystemCursorAware, @Mai
     private var inputTarget: (any Focusable)?
     private var cursorTarget: (any SystemCursorAware)?
     private var cancelPrompt: (() -> Void)?
+    var authURLCopy: @MainActor (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard
 
     public var focused = false {
         didSet { inputTarget?.focused = focused }
@@ -101,16 +102,12 @@ public final class McpManagerView: Component, Focusable, SystemCursorAware, @Mai
                 prompt.install(continuation)
                 cancelPrompt = { prompt.finish(nil) }
                 let input = Input()
-                #if os(macOS)
-                let clickHint = "Cmd+click to open"
-                #else
-                let clickHint = "Ctrl+click to open"
-                #endif
+                let link = AuthUrlComponent(url: authorizationURL.absoluteString, requestRender: requestRender,
+                                            clipboardCopy: authURLCopy)
                 let body: [any Component] = [
                     Spacer(1),
                     Text(viewTheme.fg(.muted, "Approve access in your browser. If it did not open, visit:"), paddingX: 1, paddingY: 0),
-                    Text(viewTheme.fg(.accent, hyperlink(authorizationURL.absoluteString, url: authorizationURL.absoluteString)), paddingX: 1, paddingY: 0),
-                    Text(viewTheme.fg(.dim, hyperlink(clickHint, url: authorizationURL.absoluteString)), paddingX: 1, paddingY: 0),
+                    link,
                     Spacer(1),
                     Text(viewTheme.fg(.muted, "If the browser runs on another machine, paste the URL it was redirected to:"), paddingX: 1, paddingY: 0),
                     input,
@@ -125,6 +122,10 @@ public final class McpManagerView: Component, Focusable, SystemCursorAware, @Mai
                     }
                     if keys.matches(data, TUIKeybinding.selectCancel) {
                         prompt.finish(nil)
+                        return
+                    }
+                    if appKeyMatches(data, .copyMessage) {
+                        link.copy()
                         return
                     }
                     input.handleInput(data)
