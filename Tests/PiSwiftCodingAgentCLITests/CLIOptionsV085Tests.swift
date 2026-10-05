@@ -72,13 +72,18 @@ import PiSwiftCodingAgent
         values.defaultTools = ["read", "grep", "find"]
         settings.applyOverrides(values)
         var args = Args()
-        #expect(startupToolNames(args, settingsManager: settings) == [.read, .grep, .find])
+        // T1 replaces startupToolNames with the shared selection and string names. Keep all cases.
+        let registered = ToolName.allCases.map { InitialToolRegistration(name: $0.rawValue, isBuiltin: true) }
+        func activeNames(_ args: Args) -> [String] {
+            selectStartupTools(args, registeredTools: registered, settingsManager: settings).initial.activeToolNames
+        }
+        #expect(activeNames(args) == ["read", "grep", "find"])
         args.excludeTools = ["find"]
-        #expect(startupToolNames(args, settingsManager: settings) == [.read, .grep])
+        #expect(activeNames(args) == ["read", "grep"])
         args.noTools = true
-        #expect(startupToolNames(args, settingsManager: settings).isEmpty)
-        args.tools = [.bash, .find]
-        #expect(startupToolNames(args, settingsManager: settings) == [.bash])
+        #expect(activeNames(args).isEmpty)
+        args.tools = ["bash", "find"]
+        #expect(activeNames(args) == ["bash"])
     }
 
     @Test func savedTrustMarkerUsesClosestStoredAncestor() {

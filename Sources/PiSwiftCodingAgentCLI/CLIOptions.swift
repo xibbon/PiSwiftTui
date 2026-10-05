@@ -63,10 +63,10 @@ struct CLIOptions: ParsableArguments {
     @Option(name: [.customShort("m"), .customLong("models")], help: "Comma-separated model patterns for Ctrl+P cycling")
     var models: String?
 
-    @Option(name: .customLong("tools"), help: "Comma-separated list of tools to enable")
+    @Option(name: .customLong("tools"), help: "Comma-separated allowlist of tool names or patterns (*) to enable\nKeeps MCP tools unless an entry starts with mcp__")
     var tools: String?
 
-    @Option(name: .customLong("exclude-tools"), help: "Comma-separated list of tools to disable after loading")
+    @Option(name: .customLong("exclude-tools"), help: "Comma-separated denylist of tool names or patterns (*) to disable\nApplies to all tools, MCP tools included")
     var excludeTools: String?
 
     @Flag(name: .customLong("no-tools"), help: "Disable all built-in tools")
@@ -93,6 +93,9 @@ struct CLIOptions: ParsableArguments {
 
     @Flag(name: .customLong("no-extensions"), help: "Disable extension discovery and built-in extensions (explicit -e paths still work)")
     var noExtensions: Bool = false
+
+    @Flag(name: .customLong("no-mcp"), help: "Disable built-in MCP support: no servers connect and no MCP tools")
+    var noMcp: Bool = false
 
     @Flag(name: .customLong("offline"), help: "Disable package/update network operations")
     var offline: Bool = false
@@ -200,16 +203,9 @@ extension CLIOptions {
             result.models = models.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         }
         if let tools {
-            let toolNames = tools.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-            var valid: [ToolName] = []
-            for name in toolNames {
-                if let tool = ToolName(rawValue: name) {
-                    valid.append(tool)
-                } else {
-                    Self.warn("Warning: Unknown tool \"\(name)\". Valid tools: \(ToolName.allCases.map { $0.rawValue }.joined(separator: ", "))")
-                }
-            }
-            result.tools = valid
+            result.tools = tools.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
         }
         if let excludeTools {
             result.excludeTools = excludeTools
@@ -234,6 +230,9 @@ extension CLIOptions {
         }
         if noExtensions {
             result.noExtensions = true
+        }
+        if noMcp {
+            result.noMcp = true
         }
         if offline || Self.isOfflineEnvironmentEnabled() {
             result.offline = true

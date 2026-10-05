@@ -11,10 +11,12 @@ func selectStartupInlineExtensions(
     _ extensions: [InlineExtension],
     disabledPaths: Set<String>,
     explicitPaths: Set<String>,
-    noExtensions: Bool
+    noExtensions: Bool,
+    noMcp: Bool = false
 ) -> [InlineExtension] {
     extensions.filter { item in
         if !item.builtin { return true }
+        if noMcp && item.name == "mcp" { return false }
         let path = BUILTIN_PATH_PREFIX + item.name
         return explicitPaths.contains(path) || (!noExtensions && !disabledPaths.contains("-" + path))
     }
@@ -318,6 +320,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             additionalThemePaths: parsed.themes ?? [],
             noExtensions: parsed.noExtensions ?? false,
             builtinExtensions: builtInExtensions.map(\.name),
+            disabledBuiltinExtensions: parsed.noMcp == true ? ["mcp"] : [],
             noSkills: parsed.noSkills ?? false,
             noPromptTemplates: parsed.noPromptTemplates ?? false,
             noContextFiles: parsed.noContextFiles ?? false,
@@ -340,14 +343,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 blockImages: settingsManager.getBlockImages()
             ))
         )
-        // v0.68.0 / v0.70.0: tool selection is layered:
-        //   --no-tools         → disable everything (no built-ins, no extension/custom tools)
-        //   --no-builtin-tools → keep extension/custom tools, disable only the default built-in set
-        //   --tools <names>    → explicit allowlist (overrides above defaults)
-        //   (default)          → enable read/bash/edit/write built-ins
-        let excludedToolNames = Set(parsed.excludeTools ?? [])
+        let excludedTools = ToolNameMatcher(parsed.excludeTools ?? [])
         let disableCustomTools = parsed.noTools == true && parsed.tools == nil
-        let filteredSelectedToolNames = startupToolNames(parsed, settingsManager: settingsManager)
         let baseHookPaths = parsed.noExtensions == true ? [] : settingsManager.getHooks()
         let hookPaths = baseHookPaths + (parsed.hooks ?? [])
         let hookLoadResult = parsed.noExtensions == true
@@ -396,7 +393,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         )
         let inlineExtensions = selectStartupInlineExtensions(
             hostedBuiltins + [PiReview.inlineExtension], disabledPaths: disabledBuiltinPaths,
-            explicitPaths: explicitBuiltinPaths, noExtensions: parsed.noExtensions == true
+            explicitPaths: explicitBuiltinPaths, noExtensions: parsed.noExtensions == true,
+            noMcp: parsed.noMcp == true
         )
         let loadInlineExtensions: @Sendable () -> LoadExtensionsResult = {
             var hooks: [LoadedHook] = []
@@ -443,20 +441,13 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         }
 
         let wrappedCustomTools = wrapCustomTools(customToolsResult.tools, getCustomToolContext)
-            .filter { !disableCustomTools && !excludedToolNames.contains($0.name) }
+            .filter { !disableCustomTools && !excludedTools.matches($0.name) }
 
         let extensionToolDefinitions = (hookRunner?.getExtensionTools() ?? []).map {
             LoadedCustomTool(path: "<extension>", resolvedPath: "<extension>", tool: $0)
         }
         let wrappedExtensionTools = wrapCustomTools(extensionToolDefinitions, getCustomToolContext)
-            .filter { !disableCustomTools && !excludedToolNames.contains($0.name) }
-
-        let selectedToolNameSet = Set(filteredSelectedToolNames.map { $0.rawValue })
-        let customToolsByName = Dictionary(uniqueKeysWithValues: wrappedCustomTools.map { ($0.name, $0) })
-        let selectedTools = filteredSelectedToolNames.compactMap { name in
-            customToolsByName[name.rawValue] ?? allBuiltInToolsMap[name]
-        }
-        let extraCustomTools = wrappedCustomTools.filter { !selectedToolNameSet.contains($0.name) }
+            .filter { !disableCustomTools && !excludedTools.matches($0.name) }
 
         var toolRegistry: [String: AgentTool] = [:]
         for (name, tool) in allBuiltInToolsMap {
@@ -465,20 +456,23 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         for tool in wrappedCustomTools + wrappedExtensionTools {
             toolRegistry[tool.name] = tool
         }
-        for name in excludedToolNames {
-            toolRegistry.removeValue(forKey: name)
-        }
-
-        let toolDefinitions = Dictionary(
+        let allToolDefinitions = Dictionary(
             (customToolsResult.tools + extensionToolDefinitions).map { ($0.tool.name, $0.tool) },
             uniquingKeysWith: { _, newer in newer }
-        ).filter { toolRegistry[$0.key] != nil }
-        var seenRegistryNames: Set<String> = []
-        let toolRegistryOrder = (ToolName.allCases.map(\.rawValue) +
-            (wrappedCustomTools + wrappedExtensionTools).map(\.name))
-            .filter { toolRegistry[$0] != nil && seenRegistryNames.insert($0).inserted }
-        let allTools = (selectedTools + extraCustomTools + wrappedExtensionTools)
-            .filter { activatesStartupTool(toolDefinitions[$0.name]) }
+        )
+        let builtinNames = Set(ToolName.allCases.map(\.rawValue))
+        let registryOrder = ToolName.allCases.map(\.rawValue) + (wrappedCustomTools + wrappedExtensionTools).map(\.name)
+        let toolSelection = selectStartupTools(parsed, registeredTools: registryOrder.compactMap { name in
+            guard toolRegistry[name] != nil else { return nil }
+            let definition = allToolDefinitions[name]
+            return InitialToolRegistration(name: name, isBuiltin: builtinNames.contains(name) && definition == nil,
+                exposure: definition?.exposure ?? .direct, defaultActive: definition?.defaultActive ?? true)
+        }, settingsManager: settingsManager)
+        let registeredNames = Set(toolSelection.initial.registeredToolNames)
+        toolRegistry = toolRegistry.filter { registeredNames.contains($0.key) }
+        let toolDefinitions = allToolDefinitions.filter { registeredNames.contains($0.key) }
+        let toolRegistryOrder = toolSelection.initial.registeredToolNames
+        let allTools = toolSelection.initial.activeToolNames.compactMap { toolRegistry[$0] }
         let initialActiveToolNames = allTools.map(\.name)
 
         let loaderSystemPrompt = resourceLoader.getSystemPrompt()
@@ -616,6 +610,9 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             modelRegistry: modelRegistry,
             skillsSettings: skillsSettings,
             eventBus: eventBus,
+            usesDefaultTools: toolSelection.usesDefaultTools,
+            excludedToolNames: toolSelection.excludedToolNames,
+            allowedToolNames: toolSelection.allowedToolNames,
             toolRegistry: toolRegistry,
             toolRegistryOrder: toolRegistryOrder,
             toolDefinitions: toolDefinitions,
@@ -624,7 +621,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             wrapExtensionTools: { tools in
                 let defs = tools.map { LoadedCustomTool(path: "<extension>", resolvedPath: "<extension>", tool: $0) }
                 let wrapped = wrapCustomTools(defs, getCustomToolContext)
-                    .filter { !disableCustomTools && !excludedToolNames.contains($0.name) }
+                    .filter { !disableCustomTools && !excludedTools.matches($0.name) }
                 return hookRunner.map { wrapToolsWithHooks(wrapped, $0) } ?? wrapped
             }
         ))
@@ -753,8 +750,13 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
 Usage: \(APP_NAME) [options] [--] [@files...] [messages...]
 
 Options:
+  --tools <tools>           Comma-separated allowlist of tool names or patterns (*) to enable
+                            Keeps MCP tools unless an entry starts with mcp__
+  --exclude-tools <tools>   Comma-separated denylist of tool names or patterns (*) to disable
+                            Applies to all tools, MCP tools included
   -e, --extension <path>     Load an extension file or builtin:<name>
   -ne, --no-extensions       Disable extension discovery and built-in extensions
+  --no-mcp                  Disable built-in MCP support: no servers connect and no MCP tools
   --use-theme <name[/name]>  Set the initial interactive theme for this run
   --                        End option parsing; treat remaining arguments as messages/files
 
@@ -794,6 +796,9 @@ Examples:
 
   # Read-only mode (no file modifications possible)
   \(APP_NAME) --tools read,grep,find,ls -p "Review the code in src/"
+
+  # Codemode with only the tools of one MCP server
+  \(APP_NAME) --tools read,bash,codemode,'mcp__radius__*'
 
   # Export a session file to HTML
   \(APP_NAME) --export ~/\(CONFIG_DIR_NAME)/agent/sessions/--path--/session.jsonl

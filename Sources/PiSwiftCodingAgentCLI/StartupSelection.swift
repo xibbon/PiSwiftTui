@@ -17,17 +17,32 @@ func startupThinkingLevel(
     return settingsManager.getDefaultThinkingLevel().flatMap(PiSwiftAgent.ThinkingLevel.init(rawValue:)) ?? DEFAULT_THINKING_LEVEL
 }
 
-func startupToolNames(_ args: Args, settingsManager: SettingsManager) -> [ToolName] {
-    let names: [ToolName]
-    if let explicit = args.tools {
-        names = explicit
-    } else if args.noTools == true || args.noBuiltinTools == true {
-        names = []
-    } else {
-        names = settingsManager.getDefaultTools()?.compactMap(ToolName.init(rawValue:)) ?? [.read, .bash, .edit, .write]
-    }
-    let excluded = Set(args.excludeTools ?? [])
-    return names.filter { !excluded.contains($0.rawValue) }
+struct StartupToolSelection: Sendable {
+    let initial: InitialToolSelection
+    let allowedToolNames: Set<String>?
+    let excludedToolNames: Set<String>
+    let usesDefaultTools: Bool
+}
+
+func selectStartupTools(
+    _ args: Args,
+    registeredTools: [InitialToolRegistration],
+    settingsManager: SettingsManager
+) -> StartupToolSelection {
+    let noTools: NoToolsMode? = args.noTools == true ? .all : (args.noBuiltinTools == true ? .builtin : nil)
+    let excludeTools = args.excludeTools ?? []
+    return StartupToolSelection(
+        initial: selectInitialTools(
+            registeredTools: registeredTools,
+            toolNames: args.tools,
+            excludeTools: excludeTools,
+            noTools: noTools,
+            defaultToolNames: settingsManager.getDefaultTools() ?? ["read", "bash", "edit", "write"]
+        ),
+        allowedToolNames: args.tools.map(Set.init) ?? (noTools == .all ? [] : nil),
+        excludedToolNames: Set(excludeTools),
+        usesDefaultTools: args.tools == nil && noTools == nil
+    )
 }
 
 func startupModelScopeMessage(

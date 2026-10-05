@@ -169,7 +169,7 @@ private func parseCLI(_ args: [String]) throws -> Args {
 
 @Test func parseArgsToolsAndSkills() throws {
     let tools = try parseCLI(["--tools", "read,grep"])
-    #expect(tools.tools == [.read, .grep])
+    #expect(tools.tools == ["read", "grep"])
 
     let excluded = try parseCLI(["--exclude-tools", "bash,write,custom-tool"])
     #expect(excluded.excludeTools == ["bash", "write", "custom-tool"])
