@@ -10,20 +10,6 @@ func visibleStartupExtensionPaths(_ paths: [String]) -> [String] {
     paths.filter { !$0.hasPrefix(BUILTIN_PATH_PREFIX) }
 }
 
-// MARK: - OSC 133 semantic prompt markers
-
-/// Emit an OSC 133 marker to stdout for terminal shell integration.
-/// - `;A` — prompt start (ready for input)
-/// - `;B` — command start (user submitted)
-/// - `;C` — command executed (processing started)
-/// - `;D` — command finished (output complete)
-private func emitOsc133(_ marker: String) {
-    let sequence = "\u{001B}]133;\(marker)\u{0007}"
-    if let data = sequence.data(using: .utf8) {
-        FileHandle.standardOutput.write(data)
-    }
-}
-
 @MainActor
 public protocol RenderRequesting: AnyObject {
     func requestRender()
@@ -386,6 +372,9 @@ public final class InteractiveMode {
     private var hookEventTask: Task<Void, Never>?
     private var sigcontSource: DispatchSourceSignal?
     private var isShuttingDown = false
+    private var hasExitedForTerminalError = false
+    /// The CLI exits the process. Tests can record the status instead.
+    var exitProcess: @MainActor (Int32) -> Void = { Darwin.exit($0) }
     /// v0.70.5: signal sources for SIGHUP/SIGTERM that drive a clean shutdown so extensions
     /// receive `session_shutdown` and detached children get killed before the process exits.
     private var shutdownSignalSources: [DispatchSourceSignal] = []
@@ -414,7 +403,8 @@ public final class InteractiveMode {
         tuiMode: InteractiveTuiMode? = nil,
         startupDiagnostics: [ResourceDiagnostic] = [],
         initialThemeSetting: String? = nil,
-        terminal: Terminal? = nil
+        terminal: Terminal? = nil,
+        exitProcess: @escaping @MainActor (Int32) -> Void = { Darwin.exit($0) }
     ) {
         self.init(
             chatContainer: Container(),
@@ -425,6 +415,7 @@ public final class InteractiveMode {
         self.startupDiagnostics = startupDiagnostics
         self.initialThemeSetting = initialThemeSetting
         self.injectedTerminal = terminal
+        self.exitProcess = exitProcess
         self.session = session
         self.version = version
         self.changelogMarkdown = changelogMarkdown
@@ -522,6 +513,7 @@ public final class InteractiveMode {
             ui = TuiRenderAdapter(created)
         }
         guard let tui else { return }
+        registerTerminalIOErrorHandler()
         tui.setClearOnShrink(session.settingsManager.getClearOnShrink())
 
         tui.onGlobalInput = { [weak self] data in
@@ -687,6 +679,7 @@ public final class InteractiveMode {
         defaultEditor.onAction(.exit) { [weak self] in self?.handleCtrlD() }
         defaultEditor.onSubmit = { [weak self] text in self?.handleStartupSubmit(text) }
         tui.start()
+        guard !isShuttingDown else { return }
 
         themeController?.applyFromSettings()
         await themeController?.waitForTerminalColors()
@@ -2895,19 +2888,22 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func performShutdown(fromSignal: Bool = false) async {
+    func performShutdown(fromSignal: Bool = false) async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
         mcpUi?.cancelManager()
         loadingAnimation?.stop()
         loadingAnimation = nil
         clearWorkingIndicator()
-        tui?.terminal.setProgress(false)
+        if !fromSignal { tui?.terminal.setProgress(false) }
         unregisterShutdownSignalHandlers()
 
         if fromSignal {
             killTrackedDetachedChildren()
             await emitSessionShutdownEvents()
+            guard !hasExitedForTerminalError else { return }
+            tui?.terminal.setProgress(false)
+            themeController?.dispose()
         }
 
         unsubscribeFromAgent()
@@ -2920,17 +2916,97 @@ public final class InteractiveMode {
         // Consume delayed terminal capability replies while input is still in raw mode. This
         // prevents them from reaching the parent shell after terminal state is restored.
         tui?.terminal.drainInput(maxMs: 100, idleMs: 10)
-        themeController?.dispose()
+        if !fromSignal { themeController?.dispose() }
         stopInteractiveTui()
+        guard !hasExitedForTerminalError else { return }
 
         if !fromSignal {
             await emitSessionShutdownEvents()
         }
+        guard !hasExitedForTerminalError else { return }
+        tui?.setIOErrorHandler(nil)
 
         if let continuation = exitContinuation {
             exitContinuation = nil
             continuation.resume()
         }
+    }
+
+    /// Install this before renderer startup, which can write to the terminal.
+    func registerTerminalIOErrorHandler() {
+        #if canImport(Darwin)
+        _ = fcntl(STDERR_FILENO, F_SETNOSIGPIPE, 1)
+        #endif
+        tui?.setIOErrorHandler { [weak self] error in
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.handleTerminalIOError(error) }
+            } else {
+                Task { @MainActor [weak self] in self?.handleTerminalIOError(error) }
+            }
+        }
+    }
+
+    func handleTerminalIOError(_ error: TerminalIOError) {
+        guard !hasExitedForTerminalError else { return }
+        // Loss must also end a normal shutdown that is waiting for extension cleanup.
+        if error.isTerminalLoss {
+            emergencyTerminalExit()
+            return
+        }
+        if isShuttingDown {
+            finishTerminalErrorExit(1)
+            return
+        }
+        isShuttingDown = true
+        unregisterShutdownSignalHandlers()
+        killTrackedDetachedChildren()
+        themeController?.dispose()
+        tui?.stop()
+        guard !hasExitedForTerminalError else { return }
+        tui?.setIOErrorHandler(nil)
+        let failure = InteractiveTerminalFailure(error: error)
+        writeTerminalDiagnostic("\(APP_NAME) exiting due to terminal I/O error: \(failure.localizedDescription)\n")
+        guard !hasExitedForTerminalError else { return }
+        _ = crashLog.append(kind: .uncaughtException, error: failure,
+                            sessionFile: session?.sessionManager.getSessionFile(),
+                            cwd: session?.sessionManager.getCwd() ?? FileManager.default.currentDirectoryPath,
+                            version: version)
+        finishTerminalErrorExit(1)
+    }
+
+    private func emergencyTerminalExit() {
+        isShuttingDown = true
+        unregisterShutdownSignalHandlers()
+        tui?.setIOErrorHandler(nil)
+        killTrackedDetachedChildren()
+        finishTerminalErrorExit(129)
+    }
+
+    private func finishTerminalErrorExit(_ status: Int32) {
+        hasExitedForTerminalError = true
+        tui?.setIOErrorHandler(nil)
+        exitProcess(status)
+    }
+
+    private func writeTerminalDiagnostic(_ message: String) {
+        Data(message.utf8).withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(STDERR_FILENO, base.advanced(by: offset), bytes.count - offset)
+                let code = errno
+                if count > 0 { offset += count; continue }
+                if count < 0 && code == EINTR { continue }
+                let error = TerminalIOError.systemCall(operation: .write, descriptor: STDERR_FILENO,
+                                                       errno: count == 0 ? EIO : code)
+                if error.isTerminalLoss { emergencyTerminalExit() }
+                return
+            }
+        }
+    }
+
+    private func emitOsc133(_ marker: String) {
+        tui?.terminal.write("\u{001B}]133;\(marker)\u{0007}")
     }
 
     func stopInteractiveTui(_ output: FullscreenExitOutput? = nil) {

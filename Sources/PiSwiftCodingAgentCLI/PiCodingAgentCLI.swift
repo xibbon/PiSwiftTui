@@ -26,6 +26,27 @@ func activatesStartupTool(_ definition: CustomTool?) -> Bool {
     return (exposure == .direct || exposure == .modelOnly) && definition.defaultActive != false
 }
 
+enum AppMode: Sendable, Equatable {
+    case interactive, print, rpc, json
+
+    var hookMode: HookMode {
+        switch self {
+        case .interactive: .tui
+        case .print: .print
+        case .rpc: .rpc
+        case .json: .json
+        }
+    }
+}
+
+/// Descriptor state is supplied by the caller so tests do not need a real terminal.
+func resolveAppMode(_ parsed: Args, stdinIsTTY: Bool, stdoutIsTTY: Bool) -> AppMode {
+    if parsed.mode == .rpc { return .rpc }
+    if parsed.mode == .json { return .json }
+    if parsed.print == true || !stdinIsTTY || !stdoutIsTTY { return .print }
+    return .interactive
+}
+
 @main
 struct PiCodingAgentCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -55,6 +76,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         var parsed = cli.toArgs()
         time("parseArgs")
         let resolvedOffline = parsed.offline == true
+        let stdinIsTTY = isatty(STDIN_FILENO) == 1
+        let stdoutIsTTY = isatty(STDOUT_FILENO) == 1
+        let appMode = resolveAppMode(parsed, stdinIsTTY: stdinIsTTY, stdoutIsTTY: stdoutIsTTY)
+        let isInteractive = appMode == .interactive
 
         let cwd = FileManager.default.currentDirectoryPath
         let agentDir = getAgentDir()
@@ -90,7 +115,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             }
         }
 
-        if parsed.mode == .rpc, !parsed.fileArgs.isEmpty {
+        if appMode == .rpc, !parsed.fileArgs.isEmpty {
             fputs("Error: @file arguments are not supported in RPC mode\n", stderr)
             Darwin.exit(1)
         }
@@ -99,13 +124,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             approve: parsed.approve == true,
             noApprove: parsed.noApprove == true
         )
-        let trustMode: HookMode = {
-            if parsed.mode == .rpc { return .rpc }
-            if parsed.mode == .json { return .json }
-            if parsed.print == true || parsed.mode != nil { return .print }
-            return .tui
-        }()
-        if trustMode == .tui {
+        let trustMode = appMode.hookMode
+        if isInteractive {
             await runFirstTimeSetupIfNeeded(
                 settingsManager: startupSettingsManager,
                 isInteractive: true
@@ -121,12 +141,12 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             persistChoice: trustChoice != nil,
             noExtensions: parsed.noExtensions == true,
             mode: trustMode,
-            hasUI: trustMode == .tui
+            hasUI: isInteractive
         )
         let trust = trustContext.trust
         let settingsManager = trustContext.settingsManager
         var runtimeDiagnostics: [ResourceDiagnostic] = []
-        if trustMode == .tui, let useTheme = cli.useTheme {
+        if isInteractive, let useTheme = cli.useTheme {
             var overrides = Settings()
             overrides.theme = useTheme
             settingsManager.applyOverrides(overrides)
@@ -135,11 +155,11 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         time("SettingsManager.create")
         let themeName = resolveThemeSetting(settingsManager.getTheme(), appearance: PiSwiftCodingAgent.getTerminalTheme()) ?? "system"
         markTerminalColorsPending()
-        initTheme(themeName, enableWatcher: parsed.print != true && parsed.mode == nil)
+        initTheme(themeName, enableWatcher: isInteractive)
         time("initTheme")
 
         // If stdin is a pipe, read all of it and prepend to the initial message
-        if parsed.mode != .rpc, isatty(STDIN_FILENO) == 0 {
+        if appMode != .rpc, !stdinIsTTY {
             var stdinContent = ""
             while let line = readLine(strippingNewline: false) {
                 stdinContent += line
@@ -203,8 +223,6 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             time("resolveModelScope")
         }
 
-        let isInteractive = parsed.print != true && parsed.mode == nil
-        let mode = parsed.mode ?? .text
         let shouldPrintMessages = isInteractive
         var nonInteractiveSignalSources: [DispatchSourceSignal] = []
         if !isInteractive {
@@ -633,7 +651,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         if diagnosticDisposition.shouldPrint { reportStartupDiagnostics(startupDiagnostics) }
         if diagnosticDisposition.hasRuntimeErrors { throw ExitCode.failure }
 
-        if mode == .rpc {
+        if appMode == .rpc {
             await runRpcMode(createdSession)
             return
         }
@@ -678,7 +696,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         } else {
             try await runPrintMode(
                 createdSession,
-                mode,
+                appMode == .json ? .json : .text,
                 parsed.messages,
                 initialMessageResult.message,
                 initialMessageResult.images
