@@ -5,21 +5,25 @@ import PiSwiftCodingAgent
 /// Component that renders a skill invocation message with collapsed/expanded state.
 /// Uses same background color as custom messages for visual consistency.
 /// Only renders the skill block itself - user message is rendered separately.
-public final class SkillInvocationMessageComponent: Container {
+public final class SkillInvocationMessageComponent: Container, OutputPaddingSetting {
     private let skillBlock: ParsedSkillBlock
     private let box: Box
     private var expanded = false
     private var expandHint: String
 
-    public init(skillBlock: ParsedSkillBlock, expandHint: String = "ctrl+o") {
+    public init(skillBlock: ParsedSkillBlock, expandHint: String = "ctrl+o", outputPad: Int = 1) {
         self.skillBlock = skillBlock
         self.expandHint = expandHint
-        self.box = Box(paddingX: 1, paddingY: 1, bgFn: { theme.bg(.customMessageBg, $0) })
+        self.box = Box(paddingX: outputPad, paddingY: 1, bgFn: { theme.bg(.customMessageBg, $0) })
         super.init()
 
         addChild(Spacer(1))
         addChild(box)
         updateDisplay()
+    }
+
+    public func setOutputPad(_ outputPad: Int) {
+        box.setPaddingX(outputPad)
     }
 
     public func setExpanded(_ expanded: Bool) {

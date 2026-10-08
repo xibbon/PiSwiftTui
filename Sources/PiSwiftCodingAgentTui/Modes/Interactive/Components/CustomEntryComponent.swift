@@ -4,16 +4,23 @@ import PiSwiftCodingAgent
 
 /// Presents a persisted display-only extension entry. These entries intentionally never
 /// pass through the agent's model context; they are rendered from `SessionManager` only.
-public final class CustomEntryComponent: Container {
+public final class CustomEntryComponent: Container, OutputPaddingSetting {
     private let entry: CustomEntry
     private let renderer: EntryRenderer?
     private var renderedComponent: Component?
     private var expanded = false
+    private var outputPad: Int
 
-    public init(entry: CustomEntry, renderer: EntryRenderer?) {
+    public init(entry: CustomEntry, renderer: EntryRenderer?, outputPad: Int = 1) {
         self.entry = entry
         self.renderer = renderer
+        self.outputPad = outputPad
         super.init()
+        rebuild()
+    }
+
+    public func setOutputPad(_ outputPad: Int) {
+        self.outputPad = outputPad
         rebuild()
     }
 

@@ -32,7 +32,7 @@ public final class TuiToolHtmlRenderer: ToolHtmlRenderer {
         return ToolRenderContext(args: arguments[id] ?? [:], toolCallId: id,
             lastComponent: last, state: state, cwd: cwd, executionStarted: true,
             argsComplete: true, isPartial: partial, expanded: expanded,
-            showImages: false, isError: error)
+            showImages: false, isError: error, durationMs: nil, outputPad: 1)
     }
 
     // These methods have no suspension point. Each component/state update is atomic

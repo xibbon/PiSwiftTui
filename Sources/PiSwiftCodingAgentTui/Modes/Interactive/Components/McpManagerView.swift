@@ -90,7 +90,18 @@ public final class McpManagerView: Component, Focusable, SystemCursorAware, @Mai
     }
 
     public func status(title: String, message: String) {
-        setContent(frame(title: title, body: [Spacer(1), Text(viewTheme.fg(.muted, message), paddingX: 1, paddingY: 0)]))
+        status(title: title, message: message, onCancel: nil)
+    }
+
+    public func status(title: String, message: String, onCancel: (@MainActor @Sendable () -> Void)?) {
+        let body: [any Component] = [Spacer(1), Text(viewTheme.fg(.muted, message), paddingX: 1, paddingY: 0)]
+        guard let onCancel else { setContent(frame(title: title, body: body)); return }
+        var cancelled = false
+        setContent(frame(title: title, body: body, footer: hint(.selectCancel, "cancel")), inputHandler: { data in
+            guard !cancelled, getKeybindings().matches(data, TUIKeybinding.selectCancel) else { return }
+            cancelled = true
+            onCancel()
+        })
     }
 
     public func redirectURL(title: String, authorizationURL: URL) async -> URL? {

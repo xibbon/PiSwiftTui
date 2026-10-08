@@ -5,17 +5,19 @@ import PiSwiftAgent
 import PiSwiftCodingAgent
 
 public struct ToolExecutionOptions: Sendable {
+    public var outputPad: Int
     public var showImages: Bool
     public var imageWidthCells: Int
 
-    public init(showImages: Bool = true, imageWidthCells: Int = 60) {
+    public init(showImages: Bool = true, imageWidthCells: Int = 60, outputPad: Int = 1) {
+        self.outputPad = outputPad
         self.showImages = showImages
         self.imageWidthCells = max(1, imageWidthCells)
     }
 }
 
 @MainActor
-public final class ToolExecutionComponent: Container {
+public final class ToolExecutionComponent: Container, OutputPaddingSetting {
     private let contentBox: Box
     private let contentText: Text
     private let selfRenderContainer = Container()
@@ -37,6 +39,7 @@ public final class ToolExecutionComponent: Container {
     private var expanded = false
     private var showImages: Bool
     private var imageWidthCells: Int
+    private var outputPad: Int
     private var isPartial = true
     private var executionStarted = false
     private var argsComplete = false
@@ -63,13 +66,14 @@ public final class ToolExecutionComponent: Container {
         self.toolName = toolName
         self.toolCallId = toolCallId
         self.args = args
+        self.outputPad = options.outputPad
         self.showImages = options.showImages
         self.imageWidthCells = options.imageWidthCells
         self.renderers = renderers ?? withBuiltInRenderers(toolName, customTool, sourceInfo: sourceInfo)
         self.ui = ui
         self.cwd = cwd
-        self.contentBox = Box(paddingX: 1, paddingY: 1, bgFn: { theme.bg(.toolPendingBg, $0) })
-        self.contentText = Text("", paddingX: 1, paddingY: 1, customBgFn: { theme.bg(.toolPendingBg, $0) })
+        self.contentBox = Box(paddingX: options.outputPad, paddingY: 1, bgFn: { theme.bg(.toolPendingBg, $0) })
+        self.contentText = Text("", paddingX: options.outputPad, paddingY: 1, customBgFn: { theme.bg(.toolPendingBg, $0) })
         super.init()
         addChild(Spacer(1))
         if self.renderers != nil {
@@ -91,7 +95,8 @@ public final class ToolExecutionComponent: Container {
             lastComponent: lastComponent, state: rendererState, cwd: cwd,
             executionStarted: executionStarted, argsComplete: argsComplete,
             isPartial: isPartial, expanded: expanded, showImages: showImages,
-            isError: result?.isError ?? false
+            isError: result?.isError ?? false,
+            durationMs: isPartial ? nil : result?.durationMs, outputPad: outputPad
         )
     }
 
@@ -145,6 +150,11 @@ public final class ToolExecutionComponent: Container {
     public func updateResult(_ result: ToolResultMessage, isPartial: Bool = false) {
         self.result = result
         self.isPartial = isPartial
+        updateDisplay()
+    }
+
+    public func setOutputPad(_ outputPad: Int) {
+        self.outputPad = outputPad
         updateDisplay()
     }
 
@@ -231,6 +241,7 @@ public final class ToolExecutionComponent: Container {
                 selfRenderContainer.clear()
                 addRenderedChild = selfRenderContainer.addChild
             } else {
+                contentBox.setPaddingX(outputPad)
                 contentBox.setBgFn(bgFn)
                 contentBox.clear()
                 addRenderedChild = contentBox.addChild
@@ -255,7 +266,7 @@ public final class ToolExecutionComponent: Container {
                     do {
                         renderedResult = try renderer(
                             AgentToolResult(content: result.content, details: result.details),
-                            RenderResultOptions(expanded: expanded, isPartial: isPartial), theme,
+                            RenderResultOptions(expanded: expanded, isPartial: isPartial, durationMs: isPartial ? nil : result.durationMs, outputPad: outputPad), theme,
                             getRenderContext(resultRendererComponent)
                         )
                         resultRendererComponent = renderedResult
@@ -272,6 +283,7 @@ public final class ToolExecutionComponent: Container {
                 }
             }
         } else {
+            contentText.setPaddingX(outputPad)
             contentText.setCustomBgFn(bgFn)
             contentText.setText(formatToolExecution())
             hasContent = true

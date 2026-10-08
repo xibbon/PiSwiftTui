@@ -75,6 +75,10 @@ public final class InteractiveMcpUi: McpUi {
 
     public func status(title: String, message: String) { view?.status(title: title, message: message) }
 
+    public func status(title: String, message: String, onCancel: (@MainActor @Sendable () -> Void)?) {
+        view?.status(title: title, message: message, onCancel: onCancel)
+    }
+
     public func redirectURL(title: String, authorizationURL: URL) async -> URL? {
         await view?.redirectURL(title: title, authorizationURL: authorizationURL)
     }

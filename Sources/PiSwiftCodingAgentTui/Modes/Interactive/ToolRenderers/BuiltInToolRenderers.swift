@@ -37,8 +37,9 @@ private func applyingRendererSlots(_ value: CustomToolRenderers, to builtIn: Too
         }
     }
     if let result = value.renderResult {
-        merged.renderResult = { value, options, theme, _ in
-            try result(value, options, theme) as? Component ?? Text("", paddingX: 0, paddingY: 0)
+        merged.renderResult = { value, options, theme, context in
+            let options = RenderResultOptions(expanded: options.expanded, isPartial: options.isPartial, durationMs: context.durationMs, outputPad: context.outputPad)
+            return try result(value, options, theme) as? Component ?? Text("", paddingX: 0, paddingY: 0)
         }
     }
     return merged

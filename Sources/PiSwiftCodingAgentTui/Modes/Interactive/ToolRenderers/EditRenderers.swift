@@ -42,13 +42,13 @@ private func editPreviewInput(_ args: [String: AnyCodable]) -> EditPreviewInput?
 private func editCallComponent(_ context: ToolRenderContext) -> EditCallRenderComponent {
     let component = (context.lastComponent as? EditCallRenderComponent)
         ?? (context.state.values["editCallComponent"] as? EditCallRenderComponent)
-        ?? EditCallRenderComponent(paddingX: 1, paddingY: 1, bgFn: { $0 })
+        ?? EditCallRenderComponent(paddingX: context.outputPad, paddingY: 1, bgFn: { $0 })
     context.state.values["editCallComponent"] = component
     return component
 }
 
 @MainActor
-private func buildEditCall(_ component: EditCallRenderComponent, args: [String: AnyCodable], theme: Theme, cwd: String) {
+private func buildEditCall(_ component: EditCallRenderComponent, args: [String: AnyCodable], theme: Theme, cwd: String, outputPad: Int) {
     switch component.preview {
     case .success: component.setBgFn { theme.bg(.toolSuccessBg, $0) }
     case .error: component.setBgFn { theme.bg(.toolErrorBg, $0) }
@@ -56,6 +56,7 @@ private func buildEditCall(_ component: EditCallRenderComponent, args: [String: 
         let background: ThemeBg = component.settledError ? .toolErrorBg : .toolPendingBg
         component.setBgFn { theme.bg(background, $0) }
     }
+    component.setPaddingX(outputPad)
     component.clear()
     let path = renderToolPath(str(toolPathArgument(args)), theme, cwd)
     component.addChild(Text(theme.fg(.toolTitle, theme.bold("edit")) + " " + path, paddingX: 0, paddingY: 0))
@@ -112,7 +113,7 @@ public func createEditRenderers() -> ToolRenderers {
                     if setEditPreview(component, preview: preview, argsKey: argsKey) { context.invalidate() }
                 }
             }
-            buildEditCall(component, args: args, theme: theme, cwd: context.cwd)
+            buildEditCall(component, args: args, theme: theme, cwd: context.cwd, outputPad: context.outputPad)
             return component
         },
         renderResult: { result, _, theme, context in
@@ -130,7 +131,7 @@ public func createEditRenderers() -> ToolRenderers {
                     call.settledError = context.isError
                     changed = true
                 }
-                if changed { buildEditCall(call, args: context.args, theme: theme, cwd: context.cwd) }
+                if changed { buildEditCall(call, args: context.args, theme: theme, cwd: context.cwd, outputPad: context.outputPad) }
             }
             var output: String?
             if context.isError {
@@ -152,7 +153,7 @@ public func createEditRenderers() -> ToolRenderers {
             component.clear()
             if let output {
                 component.addChild(Spacer(1))
-                component.addChild(Text(output, paddingX: 1, paddingY: 0))
+                component.addChild(Text(output, paddingX: context.outputPad, paddingY: 0))
             }
             return component
         }

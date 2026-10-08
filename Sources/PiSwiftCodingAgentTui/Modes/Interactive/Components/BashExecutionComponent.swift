@@ -5,8 +5,10 @@ import PiSwiftCodingAgent
 private let previewLines = 20
 
 @MainActor
-public final class BashExecutionComponent: Container {
+public final class BashExecutionComponent: Container, OutputPaddingSetting {
     private let command: String
+    private let colorKey: ThemeColor
+    private var outputPad: Int
     private var outputLines: [String] = []
     private var status: String = "running"
     private var exitCode: Int?
@@ -17,15 +19,18 @@ public final class BashExecutionComponent: Container {
     private let contentContainer: Container
     private let ui: TUI
 
-    public init(command: String, ui: TUI) {
+    public init(command: String, ui: TUI, excludeFromContext: Bool = false, outputPad: Int = 1) {
         self.command = command
         self.ui = ui
-        let borderColor: (String) -> String = { theme.fg(.bashMode, $0) }
+        let colorKey: ThemeColor = excludeFromContext ? .dim : .bashMode
+        self.colorKey = colorKey
+        self.outputPad = outputPad
+        let borderColor: (String) -> String = { theme.fg(colorKey, $0) }
 
         self.contentContainer = Container()
         self.loader = Loader(
             ui: ui,
-            spinnerColorFn: { theme.fg(.bashMode, $0) },
+            spinnerColorFn: { theme.fg(colorKey, $0) },
             messageColorFn: { theme.fg(.muted, $0) },
             message: "Running... (esc to cancel)"
         )
@@ -42,6 +47,11 @@ public final class BashExecutionComponent: Container {
 
     public override func invalidate() {
         super.invalidate()
+        updateDisplay()
+    }
+
+    public func setOutputPad(_ outputPad: Int) {
+        self.outputPad = outputPad
         updateDisplay()
     }
 
@@ -91,17 +101,16 @@ public final class BashExecutionComponent: Container {
 
         contentContainer.clear()
 
-        let header = Text(theme.fg(.bashMode, theme.bold("$ \(command)")), paddingX: 1, paddingY: 0)
+        let header = Text(theme.fg(colorKey, theme.bold("$ \(command)")), paddingX: outputPad, paddingY: 0)
         contentContainer.addChild(header)
 
         if !availableLines.isEmpty {
             if expanded {
                 let displayText = availableLines.map { theme.fg(.muted, $0) }.joined(separator: "\n")
-                contentContainer.addChild(Text("\n" + displayText, paddingX: 1, paddingY: 0))
+                contentContainer.addChild(Text("\n" + displayText, paddingX: outputPad, paddingY: 0))
             } else {
                 let styledOutput = previewLogicalLines.map { theme.fg(.muted, $0) }.joined(separator: "\n")
-                let result = truncateToVisualLines("\n" + styledOutput, maxVisualLines: previewLines, width: ui.terminal.columns, paddingX: 1)
-                contentContainer.addChild(StaticLines(result.visualLines))
+                contentContainer.addChild(BashOutputPreview(text: "\n" + styledOutput, paddingX: outputPad))
             }
         }
 
@@ -131,7 +140,7 @@ public final class BashExecutionComponent: Container {
         }
 
         if !statusParts.isEmpty {
-            contentContainer.addChild(Text("\n" + statusParts.joined(separator: "\n"), paddingX: 1, paddingY: 0))
+            contentContainer.addChild(Text("\n" + statusParts.joined(separator: "\n"), paddingX: outputPad, paddingY: 0))
         }
     }
 
@@ -148,15 +157,23 @@ private func stripAnsi(_ text: String) -> String {
     text.replacingOccurrences(of: "\u{001B}\\[[0-9;]*[mGKHJ]", with: "", options: .regularExpression)
 }
 
-private final class StaticLines: Component {
-    private let lines: [String]
+@MainActor
+private final class BashOutputPreview: Component {
+    private let text: String
+    private let paddingX: Int
+    private var cachedWidth: Int?
+    private var cachedLines: [String] = []
 
-    init(_ lines: [String]) {
-        self.lines = lines
+    init(text: String, paddingX: Int) {
+        self.text = text
+        self.paddingX = paddingX
     }
 
     func render(width: Int) -> [String] {
-        _ = width
-        return lines
+        if cachedWidth != width {
+            cachedLines = truncateToVisualLines(text, maxVisualLines: previewLines, width: width, paddingX: paddingX).visualLines
+            cachedWidth = width
+        }
+        return cachedLines
     }
 }

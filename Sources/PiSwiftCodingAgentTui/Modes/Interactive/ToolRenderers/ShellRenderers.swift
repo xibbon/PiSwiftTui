@@ -89,7 +89,10 @@ public func createShellRenderers(prompt: String) -> ToolRenderers {
                 }
                 component.addChild(Text("\n" + theme.fg(.warning, "[\(warnings.joined(separator: ". "))]"), paddingX: 0, paddingY: 0))
             }
-            if let startedAt = state.startedAt {
+            if !options.isPartial, let durationMs = context.durationMs {
+                let duration = formatShellDuration(Double(durationMs) / 1000)
+                component.addChild(Text("\n" + theme.fg(.muted, "Took \(duration)"), paddingX: 0, paddingY: 0))
+            } else if let startedAt = state.startedAt {
                 let duration = formatShellDuration((state.endedAt ?? Date()).timeIntervalSince(startedAt))
                 let label = options.isPartial && !context.isError ? "Elapsed" : "Took"
                 component.addChild(Text("\n" + theme.fg(.muted, "\(label) \(duration)"), paddingX: 0, paddingY: 0))

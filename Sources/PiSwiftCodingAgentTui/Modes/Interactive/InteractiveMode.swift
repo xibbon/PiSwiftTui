@@ -266,6 +266,12 @@ public final class InteractiveMode {
     private var session: AgentSession?
     var crashLog = CrashLog()
     private var tui: TUI?
+    lazy var programStatus = ProgramStatusReporter(
+        send: { [weak self] status in self?.tui?.setProgramStatus(status) },
+        getSessionName: { [weak self] in self?.session?.sessionManager.getSessionName() }
+    )
+    // Swift also settles idle manual compaction. Keep its result until the next run.
+    private var reportingManualCompaction = false
     private var altScreenRenderer: AltScreenRenderer?
     var clipboardCopy: (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard
     var clipboardFiles: () throws -> [String]? = readClipboardFilePaths
@@ -679,6 +685,7 @@ public final class InteractiveMode {
         defaultEditor.onAction(.exit) { [weak self] in self?.handleCtrlD() }
         defaultEditor.onSubmit = { [weak self] text in self?.handleStartupSubmit(text) }
         tui.start()
+        programStatus.report()
         guard !isShuttingDown else { return }
 
         themeController?.applyFromSettings()
@@ -804,7 +811,8 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func updateTerminalTitle() {
+    func updateTerminalTitle() {
+        programStatus.handleEvent(.sessionInfoChanged)
         guard let tui else { return }
         let cwdBase = FileManager.default.currentDirectoryPath.split(separator: "/").last.map(String.init)
             ?? FileManager.default.currentDirectoryPath
@@ -1204,6 +1212,9 @@ public final class InteractiveMode {
         }
         // v0.87.1: the session is canonical; rebuild agent state from it (includes setup entries).
         session.refreshContext()
+        reportingManualCompaction = false
+        programStatus.reset()
+        altScreenRenderer?.resetTextSelection()
 
         chatContainer.clear()
         pendingMessagesContainer?.clear()
@@ -1228,6 +1239,8 @@ public final class InteractiveMode {
                 return HookCommandResult(cancelled: true)
             }
 
+            reportingManualCompaction = false
+            programStatus.reset()
             chatContainer.clear()
             renderInitialMessages()
             editor?.setText(result.selectedText)
@@ -1268,8 +1281,11 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func showHookSelector(_ title: String, _ options: [String]) async -> String? {
-        await withCheckedContinuation { continuation in
+    func showHookSelector(_ title: String, _ options: [String], blocked: BlockedStatus? = nil) async -> String? {
+        guard editorContainer != nil, tui != nil else { return nil }
+        programStatus.setBlocked(source: "extension-dialog", status: blocked ?? BlockedStatus(kind: .question, message: title))
+        defer { programStatus.setBlocked(source: "extension-dialog", status: nil) }
+        return await withCheckedContinuation { continuation in
             showSelector { done in
                 let selector = HookSelectorComponent(
                     title: title,
@@ -1292,38 +1308,55 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func showHookConfirm(_ title: String, _ message: String) async -> Bool {
-        let choice = await showHookSelector("\(title)\n\(message)", ["Yes", "No"])
+    func showHookConfirm(_ title: String, _ message: String) async -> Bool {
+        let choice = await showHookSelector("\(title)\n\(message)", ["Yes", "No"], blocked: BlockedStatus(kind: .permission, message: title))
         return choice == "Yes"
     }
 
     @MainActor
-    private func showHookInput(_ title: String, _ placeholder: String?) async -> String? {
-        await withCheckedContinuation { continuation in
-            showSelector { done in
-                let input = HookInputComponent(
-                    title: title,
-                    placeholder: placeholder,
-                    onSubmit: { [weak self] value in
+    func showHookInput(_ title: String, _ placeholder: String?) async -> String? {
+        guard editorContainer != nil, tui != nil, !Task.isCancelled else { return nil }
+        @MainActor final class InputWait {
+            var cancel: (() -> Void)?
+        }
+        let wait = InputWait()
+        programStatus.setBlocked(source: "extension-dialog", status: BlockedStatus(kind: .question, message: title))
+        defer { programStatus.setBlocked(source: "extension-dialog", status: nil) }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                showSelector { done in
+                    var completed = false
+                    let finish: (String?) -> Void = { [weak self] value in
+                        guard !completed else { return }
+                        completed = true
+                        wait.cancel = nil
                         self?.hookInput = nil
                         done()
                         continuation.resume(returning: value)
-                    },
-                    onCancel: { [weak self] in
-                        self?.hookInput = nil
-                        done()
-                        continuation.resume(returning: nil)
                     }
-                )
-                self.hookInput = input
-                return (component: input, focus: input)
+                    let input = HookInputComponent(
+                        title: title,
+                        placeholder: placeholder,
+                        onSubmit: { finish($0) },
+                        onCancel: { finish(nil) }
+                    )
+                    wait.cancel = { finish(nil) }
+                    self.hookInput = input
+                    return (component: input, focus: input)
+                }
+                if Task.isCancelled { wait.cancel?() }
             }
+        } onCancel: {
+            Task { @MainActor in wait.cancel?() }
         }
     }
 
     @MainActor
-    private func showHookEditor(_ title: String, _ prefill: String?) async -> String? {
-        await withCheckedContinuation { continuation in
+    func showHookEditor(_ title: String, _ prefill: String?) async -> String? {
+        guard editorContainer != nil, tui != nil else { return nil }
+        programStatus.setBlocked(source: "extension-dialog", status: BlockedStatus(kind: .question, message: title))
+        defer { programStatus.setBlocked(source: "extension-dialog", status: nil) }
+        return await withCheckedContinuation { continuation in
             guard let tui else {
                 continuation.resume(returning: nil)
                 return
@@ -1945,6 +1978,12 @@ public final class InteractiveMode {
 
     @MainActor
     func handleSessionEvent(_ event: AgentSessionEvent) {
+        if case .agent(.agentStart) = event { reportingManualCompaction = false }
+        if case .agentSettled = event, reportingManualCompaction {
+            programStatus.handleEvent(ProgramStatusInput.ignored)
+        } else {
+            programStatus.handleEvent(event)
+        }
         footer?.invalidate()
 
         switch event {
@@ -1966,7 +2005,7 @@ public final class InteractiveMode {
                 scheduleRender()
             case .custom(let entry):
                 if let renderer = session?.hookRunner?.getEntryRenderer(entry.customType) {
-                    let component = CustomEntryComponent(entry: entry, renderer: renderer)
+                    let component = CustomEntryComponent(entry: entry, renderer: renderer, outputPad: tuiConfiguration.outputPad)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                     scheduleRender()
@@ -2004,7 +2043,7 @@ public final class InteractiveMode {
                 }
                 renderInitialMessages(entries: Array(entries.dropFirst()))
                 let compactionMessage = CompactionSummaryMessage(summary: result.summary, tokensBefore: result.tokensBefore, timestamp: Int64(Date().timeIntervalSince1970 * 1000))
-                let component = CompactionSummaryMessageComponent(message: compactionMessage)
+                let component = CompactionSummaryMessageComponent(message: compactionMessage, outputPad: tuiConfiguration.outputPad)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 if let usage = result.usage { addSummaryCostNotice(usage) }
@@ -2090,7 +2129,7 @@ public final class InteractiveMode {
                                 toolName: call.name,
                                 toolCallId: call.id,
                                 args: toolArgumentsWithOrder(call.arguments, argumentsJSON: call.argumentsJSON),
-                                options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
+                                options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells(), outputPad: tuiConfiguration.outputPad),
                                 renderers: resolvedToolRenderers(call.name, session: session, fallback: customTools[call.name]?.tool),
                                 ui: tui
                             )
@@ -2134,7 +2173,7 @@ public final class InteractiveMode {
                     toolName: toolName,
                     toolCallId: toolCallId,
                     args: args,
-                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
+                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells(), outputPad: tuiConfiguration.outputPad),
                     renderers: resolvedToolRenderers(toolName, session: session, fallback: customTools[toolName]?.tool),
                     ui: tui
                 )
@@ -2162,14 +2201,15 @@ public final class InteractiveMode {
                 scheduleRender()
             }
 
-        case .toolExecutionEnd(let toolCallId, let toolName, let result, let isError, _):
+        case .toolExecutionEnd(let toolCallId, let toolName, let result, let isError, let durationMs):
             if let component = pendingTools[toolCallId] {
                 let message = ToolResultMessage(
                     toolCallId: toolCallId,
                     toolName: toolName,
                     content: result.content,
                     details: result.details,
-                    isError: isError
+                    isError: isError,
+                    durationMs: durationMs
                 )
                 component.updateResult(message, isPartial: false)
                 pendingTools.removeValue(forKey: toolCallId)
@@ -2202,6 +2242,7 @@ public final class InteractiveMode {
 
     @MainActor
     func renderInitialMessages(entries suppliedEntries: [SessionEntry]? = nil) {
+        altScreenRenderer?.resetTextSelection()
         guard let session, let tui else { return }
         let resourceOptions = pendingResourceDisplayOptions
         pendingResourceDisplayOptions = nil
@@ -2235,7 +2276,7 @@ public final class InteractiveMode {
                     toolName: toolInfo?.name ?? toolResult.toolName,
                     toolCallId: toolResult.toolCallId,
                     args: toolInfo?.args ?? [:],
-                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells()),
+                    options: ToolExecutionOptions(showImages: session.settingsManager.getShowImages(), imageWidthCells: session.settingsManager.getImageWidthCells(), outputPad: tuiConfiguration.outputPad),
                     renderers: resolvedToolRenderers(toolInfo?.name ?? toolResult.toolName, session: session,
                         fallback: customTools[toolInfo?.name ?? toolResult.toolName]?.tool),
                     ui: tui
@@ -2250,12 +2291,12 @@ public final class InteractiveMode {
                     chatContainer.addChild(ThemedText({ theme.fg(.warning, formatCacheMissNotice(miss)) }, paddingX: 1, paddingY: 0))
                 }
             case .compaction(let entry):
-                let component = CompactionSummaryMessageComponent(message: CompactionSummaryMessage(summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: 0))
+                let component = CompactionSummaryMessageComponent(message: CompactionSummaryMessage(summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: 0), outputPad: tuiConfiguration.outputPad)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 if let usage = entry.usage { addSummaryCostNotice(usage) }
             case .branchSummary(let entry):
-                let component = BranchSummaryMessageComponent(message: BranchSummaryMessage(summary: entry.summary, fromId: entry.fromId, timestamp: 0))
+                let component = BranchSummaryMessageComponent(message: BranchSummaryMessage(summary: entry.summary, fromId: entry.fromId, timestamp: 0), outputPad: tuiConfiguration.outputPad)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 if let usage = entry.usage { addSummaryCostNotice(usage, branch: true) }
@@ -2263,7 +2304,7 @@ public final class InteractiveMode {
                 addMessageToChat(makeHookAgentMessage(HookMessage(customType: entry.customType, content: entry.content, display: entry.display, details: entry.details, timestamp: 0)))
             case .custom(let entry):
                 if let renderer = session.hookRunner?.getEntryRenderer(entry.customType) {
-                    let component = CustomEntryComponent(entry: entry, renderer: renderer)
+                    let component = CustomEntryComponent(entry: entry, renderer: renderer, outputPad: tuiConfiguration.outputPad)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
@@ -2333,7 +2374,7 @@ public final class InteractiveMode {
             case "bashExecution":
                 if let bash = decodeBashExecutionMessage(custom) {
                     if let tui {
-                        let component = BashExecutionComponent(command: bash.command, ui: tui)
+                        let component = BashExecutionComponent(command: bash.command, ui: tui, excludeFromContext: bash.excludeFromContext ?? false, outputPad: tuiConfiguration.outputPad)
                         component.appendOutput(bash.output)
                         let truncation = bash.truncated ? truncateTail(bash.output) : nil
                         component.setComplete(exitCode: bash.exitCode, cancelled: bash.cancelled, truncationResult: truncation, fullOutputPath: bash.fullOutputPath)
@@ -2343,20 +2384,20 @@ public final class InteractiveMode {
                 }
             case "branchSummary":
                 if let summary = decodeBranchSummaryMessage(custom) {
-                    let component = BranchSummaryMessageComponent(message: summary)
+                    let component = BranchSummaryMessageComponent(message: summary, outputPad: tuiConfiguration.outputPad)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
             case "compactionSummary":
                 if let summary = decodeCompactionSummaryMessage(custom) {
-                    let component = CompactionSummaryMessageComponent(message: summary)
+                    let component = CompactionSummaryMessageComponent(message: summary, outputPad: tuiConfiguration.outputPad)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
             case "hookMessage":
                 if let hook = decodeHookMessage(custom), hook.display {
                     let renderer = session?.hookRunner?.getMessageRenderer(hook.customType)
-                    let component = HookMessageComponent(message: hook, customRenderer: renderer)
+                    let component = HookMessageComponent(message: hook, customRenderer: renderer, outputPad: tuiConfiguration.outputPad)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
@@ -3277,7 +3318,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleEditorSubmit(_ text: String) async {
+    func handleEditorSubmit(_ text: String) async {
         guard let session, let editor else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -3569,7 +3610,7 @@ public final class InteractiveMode {
         }
 
         if let result = eventResult?.result {
-            let component = BashExecutionComponent(command: command, ui: tui)
+            let component = BashExecutionComponent(command: command, ui: tui, excludeFromContext: excludeFromContext, outputPad: tuiConfiguration.outputPad)
             bashComponent = component
 
             let deferDisplay = session.isStreaming
@@ -3586,14 +3627,15 @@ public final class InteractiveMode {
             let truncation = result.truncated ? truncateTail(result.output) : nil
             component.setComplete(exitCode: result.exitCode, cancelled: result.cancelled, truncationResult: truncation, fullOutputPath: result.fullOutputPath)
 
-            if !excludeFromContext {
+            do {
                 let message = BashExecutionMessage(
                     command: command,
                     output: result.output,
                     exitCode: result.exitCode,
                     cancelled: result.cancelled,
                     truncated: result.truncated,
-                    fullOutputPath: result.fullOutputPath
+                    fullOutputPath: result.fullOutputPath,
+                    excludeFromContext: excludeFromContext ? true : nil
                 )
                 if deferDisplay {
                     pendingBashMessages.append(message)
@@ -3611,7 +3653,7 @@ public final class InteractiveMode {
         }
 
         let operations = eventResult?.operations ?? DefaultBashOperations()
-        let component = BashExecutionComponent(command: command, ui: tui)
+        let component = BashExecutionComponent(command: command, ui: tui, excludeFromContext: excludeFromContext, outputPad: tuiConfiguration.outputPad)
         bashComponent = component
 
         let deferDisplay = session.isStreaming
@@ -3643,14 +3685,15 @@ public final class InteractiveMode {
             let truncation = result.truncated ? truncateTail(result.output) : nil
             component.setComplete(exitCode: result.exitCode, cancelled: result.cancelled, truncationResult: truncation, fullOutputPath: result.fullOutputPath)
 
-            if !excludeFromContext {
+            do {
                 let message = BashExecutionMessage(
                     command: command,
                     output: result.output,
                     exitCode: result.exitCode,
                     cancelled: result.cancelled,
                     truncated: result.truncated,
-                    fullOutputPath: result.fullOutputPath
+                    fullOutputPath: result.fullOutputPath,
+                    excludeFromContext: excludeFromContext ? true : nil
                 )
 
                 if deferDisplay {
@@ -3859,7 +3902,14 @@ public final class InteractiveMode {
                 onOutputPadChange: { [weak self] padding in
                     settingsManager.setOutputPad(padding)
                     self?.tuiConfiguration.outputPad = padding == 0 ? 0 : 1
-                    self?.refreshMarkdownRendering()
+                    if let self {
+                        for container in [self.chatContainer, self.pendingMessagesContainer].compactMap({ $0 }) {
+                            for child in container.children {
+                                (child as? OutputPaddingSetting)?.setOutputPad(self.tuiConfiguration.outputPad)
+                            }
+                        }
+                        self.refreshMarkdownRendering()
+                    }
                 },
                 onCancel: { done() },
                 onModelThinkingLevelChange: { [weak self] provider, modelId, level in
@@ -4257,6 +4307,8 @@ public final class InteractiveMode {
                             self.scheduleRender()
                             return
                         }
+                        self.reportingManualCompaction = false
+                        self.programStatus.reset()
                         self.chatContainer.clear()
                         self.renderInitialMessages()
                         self.editor?.setText(result.selectedText)
@@ -4349,7 +4401,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleResumeSession(_ sessionPath: String) async {
+    func handleResumeSession(_ sessionPath: String) async {
         guard let session else { return }
 
         if let loadingAnimation {
@@ -4373,6 +4425,8 @@ public final class InteractiveMode {
             return
         }
 
+        reportingManualCompaction = false
+        programStatus.reset()
         chatContainer.clear()
         renderInitialMessages()
         showStatus("Resumed session")
@@ -4592,7 +4646,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func showApiKeyLoginDialog(_ option: AuthSelectorProvider, onBack: (() -> Void)?) async {
+    func showApiKeyLoginDialog(_ option: AuthSelectorProvider, onBack: (() -> Void)?) async {
         guard let session, let tui else { return }
         let needsDefaultSelection = !session.modelRegistry.hasConfiguredAuth(session.agent.state.model)
         let dialog = LoginDialogComponent(tui: tui, providerId: option.id, providerName: option.name) { _, _ in }
@@ -4621,7 +4675,11 @@ public final class InteractiveMode {
             }
         }, signal: dialog.signal)
         do {
-            try await session.modelRegistry.loginApiKey(option.id, interaction: interaction)
+            programStatus.setBlocked(source: "login", status: BlockedStatus(kind: .auth, message: "Log in to \(option.name)"))
+            do {
+                defer { programStatus.setBlocked(source: "login", status: nil) }
+                try await session.modelRegistry.loginApiKey(option.id, interaction: interaction)
+            }
             try await synchronizeProviderAuthentication(option.id, operation: .login)
             await session.refreshActiveModel()
             restoreEditor()
@@ -4710,7 +4768,11 @@ public final class InteractiveMode {
         )
 
         do {
-            try await authStorage.login(provider, callbacks: callbacks)
+            programStatus.setBlocked(source: "login", status: BlockedStatus(kind: .auth, message: "Log in to \(providerName)"))
+            do {
+                defer { programStatus.setBlocked(source: "login", status: nil) }
+                try await authStorage.login(provider, callbacks: callbacks)
+            }
             // Local credential consistency first — this must be synchronous so the session picks
             // up the new credential immediately.
             try await synchronizeProviderAuthentication(provider.rawValue, operation: .login)
@@ -5254,10 +5316,13 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleNewSessionCommand() {
+    func handleNewSessionCommand() {
         guard let session else { return }
         _ = session.sessionManager.newSession()
         session.refreshContext()
+        reportingManualCompaction = false
+        programStatus.reset()
+        altScreenRenderer?.resetTextSelection()
         chatContainer.clear()
         showStatus("New session started")
         scheduleRender()
@@ -5272,6 +5337,8 @@ public final class InteractiveMode {
             do {
                 let success = try await session.cloneAtLeaf()
                 if success {
+                    reportingManualCompaction = false
+                    programStatus.reset()
                     chatContainer.clear()
                     renderInitialMessages()
                     showStatus("Cloned to new session")
@@ -5290,12 +5357,15 @@ public final class InteractiveMode {
         loadingAnimation = nil
         clearWorkingIndicator()
         if session.settingsManager.getShowTerminalProgress() { tui?.terminal.setProgress(true) }
+        reportingManualCompaction = true
+        programStatus.handleEvent(.compactionStart)
         showStatus("Compacting...")
         setTransientStatus("Compacting")
         Task { @MainActor in
             defer { tui?.terminal.setProgress(false); setTransientStatus(nil) }
             do {
                 _ = try await session.compact(customInstructions: customInstructions)
+                finishManualCompactionReporting(aborted: false, errorMessage: nil)
                 var entries = interactiveContextEntries(session.sessionManager)
                 if let first = entries.first, case .compaction = first {
                     entries.removeFirst()
@@ -5303,8 +5373,20 @@ public final class InteractiveMode {
                 }
                 renderInitialMessages(entries: entries)
                 showStatus("Compaction complete")
-            } catch { showError(error.localizedDescription) }
+            } catch {
+                let aborted: Bool
+                if case AgentSessionError.compactionCancelled = error { aborted = true }
+                else { aborted = error is CancellationError }
+                finishManualCompactionReporting(aborted: aborted, errorMessage: aborted ? nil : "Compaction failed: \(error.localizedDescription)")
+                showError(error.localizedDescription)
+            }
         }
+    }
+
+    private func finishManualCompactionReporting(aborted: Bool, errorMessage: String?) {
+        // End any earlier run while compaction still has status priority. Then report its result.
+        programStatus.handleEvent(ProgramStatusInput.agentSettled(aborted: true))
+        programStatus.handleEvent(.compactionEnd(manual: true, aborted: aborted, errorMessage: errorMessage))
     }
 
     @MainActor
@@ -5381,7 +5463,7 @@ private func decodeBashExecutionMessage(_ custom: AgentCustomMessage) -> BashExe
     let cancelled = payload["cancelled"] as? Bool ?? false
     let truncated = payload["truncated"] as? Bool ?? false
     let fullOutputPath = payload["fullOutputPath"] as? String
-    return BashExecutionMessage(command: command, output: output, exitCode: exitCode, cancelled: cancelled, truncated: truncated, fullOutputPath: fullOutputPath, timestamp: custom.timestamp)
+    return BashExecutionMessage(command: command, output: output, exitCode: exitCode, cancelled: cancelled, truncated: truncated, fullOutputPath: fullOutputPath, timestamp: custom.timestamp, excludeFromContext: payload["excludeFromContext"] as? Bool)
 }
 
 private func decodeBranchSummaryMessage(_ custom: AgentCustomMessage) -> BranchSummaryMessage? {

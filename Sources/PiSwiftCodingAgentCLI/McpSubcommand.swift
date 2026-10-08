@@ -453,11 +453,14 @@ private func loginMcpCommand(_ entry: McpServerEntry, connection: McpServerConne
             presenter = try makeMcpMacOSSignInPresenter(settings: settings, callbackTimeoutSeconds: timeout,
                 pasteRedirectURL: paste, openAuthorizationURL: open)
         }
-        try await signInMcpServer(name: name, serverURL: url, credentials: credentials, settings: settings,
-            challenge: await connection.challenge, presenter: presenter,
-            clientMetadataDocumentURL: piSwiftClientMetadataDocumentURL, http: options.oauthHTTP)
+        let challenge = await connection.challenge
+        try await withMcpSignInDeadline(seconds: timeout) {
+            try await signInMcpServer(name: name, serverURL: url, credentials: credentials, settings: settings,
+                challenge: challenge, presenter: presenter,
+                clientMetadataDocumentURL: piSwiftClientMetadataDocumentURL, http: options.oauthHTTP)
+        }
     } catch {
-        if error is CancellationError || error is McpCLIInputCancelled || error.localizedDescription == "MCP sign-in timed out" {
+        if Task.isCancelled || error is CancellationError || error is McpCLIInputCancelled || error.localizedDescription == "MCP sign-in timed out" {
             options.error("Sign-in to MCP server \"\(name)\" was cancelled or not completed within \(mcpTimeoutText(timeout)) seconds.")
         } else { options.error("Sign-in to MCP server \"\(name)\" failed: \(error.localizedDescription)") }
         return 1
@@ -467,6 +470,49 @@ private func loginMcpCommand(_ entry: McpServerEntry, connection: McpServerConne
     catch { options.error("Signed in, but \(error.localizedDescription)"); return 1 }
     options.log("Signed in to MCP server \"\(name)\" (\(await connection.tools.count) tools).")
     return 0
+}
+
+// Split long intervals before conversion to Duration to retain large timeout support.
+private func waitForMcpSignInDeadline(seconds: Double) async throws {
+    var pending = [seconds]
+    while let interval = pending.popLast() {
+        try Task.checkCancellation()
+        if interval > 86_400 {
+            let half = interval / 2
+            pending.append(interval - half)
+            pending.append(half)
+        } else {
+            try await Task.sleep(for: .seconds(interval))
+        }
+    }
+    try Task.checkCancellation()
+}
+
+private func withMcpSignInDeadline(seconds: Double,
+                                   operation: @escaping @Sendable () async throws -> Void) async throws {
+    try Task.checkCancellation()
+    let signIn = Task { try await operation() }
+    let deadline = Task {
+        do {
+            try await waitForMcpSignInDeadline(seconds: seconds)
+            signIn.cancel()
+        } catch {}
+    }
+    do {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await signIn.value
+            try Task.checkCancellation()
+        } onCancel: { signIn.cancel() }
+        deadline.cancel()
+        await deadline.value
+    } catch {
+        signIn.cancel()
+        deadline.cancel()
+        _ = await signIn.result
+        await deadline.value
+        throw error
+    }
 }
 
 private struct McpCLIInputCancelled: Error {}

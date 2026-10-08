@@ -24,9 +24,11 @@ public struct ToolRenderContext {
     public var isPartial: Bool
     public var expanded: Bool
     public var showImages: Bool
+    public var durationMs: Int?
+    public var outputPad: Int
     public var isError: Bool
 
-    public init(args: [String: AnyCodable] = [:], toolCallId: String = "", invalidate: @escaping () -> Void = {}, lastComponent: Component? = nil, state: ToolRenderState = ToolRenderState(), cwd: String = FileManager.default.currentDirectoryPath, executionStarted: Bool = false, argsComplete: Bool = false, isPartial: Bool = true, expanded: Bool = false, showImages: Bool = true, isError: Bool = false) {
+    public init(args: [String: AnyCodable] = [:], toolCallId: String = "", invalidate: @escaping () -> Void = {}, lastComponent: Component? = nil, state: ToolRenderState = ToolRenderState(), cwd: String = FileManager.default.currentDirectoryPath, executionStarted: Bool = false, argsComplete: Bool = false, isPartial: Bool = true, expanded: Bool = false, showImages: Bool = true, isError: Bool = false, durationMs: Int? = nil, outputPad: Int = 1) {
         self.args = args
         self.toolCallId = toolCallId
         self.invalidate = invalidate
@@ -39,6 +41,8 @@ public struct ToolRenderContext {
         self.expanded = expanded
         self.showImages = showImages
         self.isError = isError
+        self.durationMs = durationMs
+        self.outputPad = outputPad
     }
 }
 

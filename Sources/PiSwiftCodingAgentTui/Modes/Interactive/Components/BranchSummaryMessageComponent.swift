@@ -2,14 +2,18 @@ import Foundation
 import MiniTui
 import PiSwiftCodingAgent
 
-public final class BranchSummaryMessageComponent: Box {
+public final class BranchSummaryMessageComponent: Box, OutputPaddingSetting {
     private var expanded = false
     private let message: BranchSummaryMessage
 
-    public init(message: BranchSummaryMessage) {
+    public init(message: BranchSummaryMessage, outputPad: Int = 1) {
         self.message = message
-        super.init(paddingX: 1, paddingY: 1, bgFn: { theme.bg(.customMessageBg, $0) })
+        super.init(paddingX: outputPad, paddingY: 1, bgFn: { theme.bg(.customMessageBg, $0) })
         updateDisplay()
+    }
+
+    public func setOutputPad(_ outputPad: Int) {
+        setPaddingX(outputPad)
     }
 
     public func setExpanded(_ expanded: Bool) {
