@@ -2162,7 +2162,7 @@ public final class InteractiveMode {
                 scheduleRender()
             }
 
-        case .toolExecutionEnd(let toolCallId, let toolName, let result, let isError):
+        case .toolExecutionEnd(let toolCallId, let toolName, let result, let isError, _):
             if let component = pendingTools[toolCallId] {
                 let message = ToolResultMessage(
                     toolCallId: toolCallId,
