@@ -131,7 +131,7 @@ struct V104ToolsCLITests {
         // The order keeps the CLI's four fallback tools. The SDK also defaults to subagent.
         var sdkDefaults = Settings()
         sdkDefaults.defaultTools = ["read", "bash", "edit", "write"]
-        let sdk = await createAgentSession(CreateAgentSessionOptions(
+        let sdk = try await createAgentSession(CreateAgentSessionOptions(
             cwd: directory.path, agentDir: directory.path, authStorage: auth, model: model, offline: true,
             toolNames: args.tools, excludeTools: args.excludeTools,
             noTools: args.noTools == true ? .all : (args.noBuiltinTools == true ? .builtin : nil),

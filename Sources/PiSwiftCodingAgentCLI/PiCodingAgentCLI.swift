@@ -611,6 +611,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             skillsSettings: skillsSettings,
             eventBus: eventBus,
             usesDefaultTools: toolSelection.usesDefaultTools,
+            defaultToolModifiers: toolSelection.defaultToolModifiers,
             excludedToolNames: toolSelection.excludedToolNames,
             allowedToolNames: toolSelection.allowedToolNames,
             toolRegistry: toolRegistry,
@@ -712,8 +713,40 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             fputs("Error: \(modeError)\n", stderr)
             Darwin.exit(1)
         }
+        if let toolsError = Self.toolsArgumentError(arguments) {
+            fputs("Error: \(toolsError)\n", stderr)
+            Darwin.exit(1)
+        }
         let processed = Self.preprocessArguments(arguments)
         await self.main(processed)
+    }
+
+    // Read raw arguments so diagnostics keep the user's flag spelling.
+    static func toolsArgumentError(_ arguments: [String]) -> String? {
+        var index = 0
+        while index < arguments.count {
+            let argument = arguments[index]
+            if argument == "--" { break }
+            let flag = argument.split(separator: "=", maxSplits: 1).first.map(String.init) ?? argument
+            if flag == "--tools" || flag == "-t" {
+                let value: String
+                if let separator = argument.firstIndex(of: "=") {
+                    value = String(argument[argument.index(after: separator)...])
+                    index += 1
+                } else {
+                    guard index + 1 < arguments.count else { return nil }
+                    value = arguments[index + 1]
+                    index += 2
+                }
+                let entries = value.split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                if let problem = getToolListError(entries) { return "\(flag): \(problem)" }
+                continue
+            }
+            index += valueOptions.contains(argument) && index + 1 < arguments.count ? 2 : 1
+        }
+        return nil
     }
 
     static func modeArgumentError(_ arguments: [String]) -> String? {
@@ -721,6 +754,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         while index < arguments.count {
             let argument = arguments[index]
             if argument == "--" { break }
+            if ["--tools", "-t", "--exclude-tools", "-xt"].contains(argument) {
+                index += 2
+                continue
+            }
             if argument == "--mode" {
                 guard index + 1 < arguments.count,
                       !arguments[index + 1].hasPrefix("-") else {
@@ -750,9 +787,12 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
 Usage: \(APP_NAME) [options] [--] [@files...] [messages...]
 
 Options:
-  --tools <tools>           Comma-separated allowlist of tool names or patterns (*) to enable
+  --no-tools, -nt           Disable all tools by default (built-in and extension)
+  --no-builtin-tools, -nbt   Disable built-in tools by default but keep extension/custom tools enabled
+  --tools, -t <tools>       Comma-separated allowlist of tool names or patterns (*) to enable
                             Keeps MCP tools unless an entry starts with mcp__
-  --exclude-tools <tools>   Comma-separated denylist of tool names or patterns (*) to disable
+                            Only +name/-name entries add to or remove from the defaults
+  --exclude-tools, -xt <tools> Comma-separated denylist of tool names or patterns (*) to disable
                             Applies to all tools, MCP tools included
   -e, --extension <path>     Load an extension file or builtin:<name>
   -ne, --no-extensions       Disable extension discovery and built-in extensions
@@ -796,6 +836,9 @@ Examples:
 
   # Read-only mode (no file modifications possible)
   \(APP_NAME) --tools read,grep,find,ls -p "Review the code in src/"
+
+  # Add codemode to the default tools
+  \(APP_NAME) --tools +codemode
 
   # Codemode with only the tools of one MCP server
   \(APP_NAME) --tools read,bash,codemode,'mcp__radius__*'
@@ -862,6 +905,21 @@ Built-in Tool Names:
                 result.append(contentsOf: args[i...])
                 break
             }
+            if ["--tools", "-t", "--exclude-tools", "-xt"].contains(arg) {
+                result.append(arg == "-t" ? "--tools" : (arg == "-xt" ? "--exclude-tools" : arg))
+                if i + 1 < args.count {
+                    result.append(args[i + 1])
+                    i += 2
+                } else {
+                    i += 1
+                }
+                continue
+            }
+            if arg == "-nt" || arg == "-nbt" {
+                result.append(arg == "-nt" ? "--no-tools" : "--no-builtin-tools")
+                i += 1
+                continue
+            }
             if arg == "-ne" {
                 result.append("--no-extensions")
                 i += 1
@@ -874,11 +932,6 @@ Built-in Tool Names:
             }
             if arg == "-np" {
                 result.append("--no-prompt-templates")
-                i += 1
-                continue
-            }
-            if arg == "-xt" {
-                result.append("--exclude-tools")
                 i += 1
                 continue
             }
@@ -912,14 +965,16 @@ Built-in Tool Names:
         return moveLeadingSubcommandToFront(result)
     }
 
+    private static let valueOptions: Set<String> = [
+        "--provider", "--model", "--api-key", "--system-prompt",
+        "--append-system-prompt", "--mode", "--tui-mode", "--thinking", "--session",
+        "--session-id", "--session-dir", "--models", "-m", "--tools", "-t",
+        "--exclude-tools", "-xt", "--hook", "--tool", "--export", "--skills",
+        "--extension", "-e", "--skill", "--prompt-template",
+        "--theme", "--use-theme", "--name", "-n", "--list-models-search",
+    ]
+
     private static func moveLeadingSubcommandToFront(_ args: [String]) -> [String] {
-        let valueOptions: Set<String> = [
-            "--provider", "--model", "--api-key", "--system-prompt",
-            "--append-system-prompt", "--mode", "--tui-mode", "--thinking", "--session",
-            "--session-id", "--session-dir", "--models", "-m", "--tools",
-            "--exclude-tools", "--hook", "--tool", "--export", "--skills",
-            "--theme", "--use-theme", "--name", "--list-models-search",
-        ]
         var index = 0
         while index < args.count {
             let argument = args[index]

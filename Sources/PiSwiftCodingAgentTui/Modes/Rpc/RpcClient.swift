@@ -232,6 +232,9 @@ public struct RpcAgentEvent: Sendable {
     public var isError: Bool?
     /// v0.99.0: set on `tool_execution_*` events of nested calls made through `ctx.executeTool()`.
     public var parentToolCallId: String?
+    public var aborted: Bool?
+    public var durationMs: Int?
+    public var errorMessage: String?
 
     public init(
         type: String,
@@ -251,7 +254,10 @@ public struct RpcAgentEvent: Sendable {
         result: AgentToolResult? = nil,
         isError: Bool? = nil,
         parentToolCallId: String? = nil,
-        assistantMessageToolCall: ToolCall? = nil
+        assistantMessageToolCall: ToolCall? = nil,
+        aborted: Bool? = nil,
+        durationMs: Int? = nil,
+        errorMessage: String? = nil
     ) {
         self.type = type
         self.message = message
@@ -271,6 +277,9 @@ public struct RpcAgentEvent: Sendable {
         self.isError = isError
         self.parentToolCallId = parentToolCallId
         self.assistantMessageToolCall = assistantMessageToolCall
+        self.aborted = aborted
+        self.durationMs = durationMs
+        self.errorMessage = errorMessage
     }
 }
 
@@ -958,7 +967,11 @@ private func decodeHookUIRequest(_ dict: [String: Any]) -> RpcHookUIRequest? {
 func decodeAgentEvent(_ dict: [String: Any], ordered: OrderedJSON? = nil) -> RpcAgentEvent? {
     guard let type = dict["type"] as? String else { return nil }
     switch type {
-    case "agent_start", "agent_settled", "turn_start", "auto_compaction_start", "auto_compaction_end", "auto_retry_start", "auto_retry_end":
+    case "agent_settled":
+        return RpcAgentEvent(type: type, aborted: dict["aborted"] as? Bool)
+    case "auto_compaction_end":
+        return RpcAgentEvent(type: type, errorMessage: dict["errorMessage"] as? String)
+    case "agent_start", "turn_start", "auto_compaction_start", "auto_retry_start", "auto_retry_end":
         return RpcAgentEvent(type: type)
     case "agent_end":
         let messages = (dict["messages"] as? [[String: Any]] ?? []).enumerated().compactMap { index, message in
@@ -1029,7 +1042,7 @@ func decodeAgentEvent(_ dict: [String: Any], ordered: OrderedJSON? = nil) -> Rpc
         let toolName = dict["toolName"] as? String ?? ""
         let result = (dict["result"] as? [String: Any]).map { decodeAgentToolResult($0, ordered: ordered?["result"]) }
         let isError = dict["isError"] as? Bool ?? false
-        return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, result: result, isError: isError, parentToolCallId: dict["parentToolCallId"] as? String)
+        return RpcAgentEvent(type: type, toolCallId: toolCallId, toolName: toolName, result: result, isError: isError, parentToolCallId: dict["parentToolCallId"] as? String, durationMs: dict["durationMs"] as? Int)
     default:
         return nil
     }
@@ -1090,11 +1103,13 @@ private func decodeToolResultMessage(_ dict: [String: Any], ordered: OrderedJSON
         toolName: toolName,
         content: contentBlocks,
         details: details,
+        usage: (dict["usage"] as? [String: Any]).map(decodeUsage),
         nestedCalls: (dict["nestedCalls"] as? [String: Any]).flatMap {
             nestedToolCallsFromJSONObject($0, ordered: ordered?["nestedCalls"])
         },
         isError: isError,
-        timestamp: timestamp
+        timestamp: timestamp,
+        durationMs: dict["durationMs"] as? Int
     )
 }
 

@@ -1992,7 +1992,7 @@ public final class InteractiveMode {
             renderInitialMessages()
         case .autoCompactionStart:
             setTransientStatus("Compacting")
-        case .autoCompactionEnd(let result, let aborted, _):
+        case .autoCompactionEnd(let result, let aborted, _, _):
             setTransientStatus(nil)
             if aborted {
                 showStatus("Auto-compaction cancelled")

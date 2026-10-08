@@ -22,6 +22,7 @@ struct StartupToolSelection: Sendable {
     let allowedToolNames: Set<String>?
     let excludedToolNames: Set<String>
     let usesDefaultTools: Bool
+    let defaultToolModifiers: [String]
 }
 
 func selectStartupTools(
@@ -31,17 +32,19 @@ func selectStartupTools(
 ) -> StartupToolSelection {
     let noTools: NoToolsMode? = args.noTools == true ? .all : (args.noBuiltinTools == true ? .builtin : nil)
     let excludeTools = args.excludeTools ?? []
+    let initial = selectInitialTools(
+        registeredTools: registeredTools,
+        toolNames: args.tools,
+        excludeTools: excludeTools,
+        noTools: noTools,
+        defaultToolNames: settingsManager.getDefaultTools() ?? ["read", "bash", "edit", "write"]
+    )
     return StartupToolSelection(
-        initial: selectInitialTools(
-            registeredTools: registeredTools,
-            toolNames: args.tools,
-            excludeTools: excludeTools,
-            noTools: noTools,
-            defaultToolNames: settingsManager.getDefaultTools() ?? ["read", "bash", "edit", "write"]
-        ),
-        allowedToolNames: args.tools.map(Set.init) ?? (noTools == .all ? [] : nil),
+        initial: initial,
+        allowedToolNames: initial.allowedToolNames,
         excludedToolNames: Set(excludeTools),
-        usesDefaultTools: args.tools == nil && noTools == nil
+        usesDefaultTools: initial.usesDefaultTools,
+        defaultToolModifiers: initial.defaultToolModifiers ?? []
     )
 }
 

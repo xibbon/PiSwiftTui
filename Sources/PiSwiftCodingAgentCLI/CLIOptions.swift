@@ -63,17 +63,17 @@ struct CLIOptions: ParsableArguments {
     @Option(name: [.customShort("m"), .customLong("models")], help: "Comma-separated model patterns for Ctrl+P cycling")
     var models: String?
 
-    @Option(name: .customLong("tools"), help: "Comma-separated allowlist of tool names or patterns (*) to enable\nKeeps MCP tools unless an entry starts with mcp__")
+    @Option(name: [.customLong("tools"), .customShort("t")], parsing: .unconditional, help: "Comma-separated allowlist of tool names or patterns (*) to enable\nKeeps MCP tools unless an entry starts with mcp__\nOnly +name/-name entries add to or remove from the defaults")
     var tools: String?
 
-    @Option(name: .customLong("exclude-tools"), help: "Comma-separated denylist of tool names or patterns (*) to disable\nApplies to all tools, MCP tools included")
+    @Option(name: .customLong("exclude-tools"), parsing: .unconditional, help: "Comma-separated denylist of tool names or patterns (*) to disable\nApplies to all tools, MCP tools included")
     var excludeTools: String?
 
-    @Flag(name: .customLong("no-tools"), help: "Disable all built-in tools")
+    @Flag(name: .customLong("no-tools"), help: "Disable all tools by default (built-in and extension)")
     var noTools: Bool = false
 
     /// v0.68.0 / v0.70.0: disable only built-in default tools, keep extension/custom tools.
-    @Flag(name: .customLong("no-builtin-tools"), help: "Disable only built-in tools (keep extension/custom tools)")
+    @Flag(name: .customLong("no-builtin-tools"), help: "Disable built-in tools by default but keep extension/custom tools enabled")
     var noBuiltinTools: Bool = false
 
     /// v0.67.4: skip AGENTS.md / CLAUDE.md auto-discovery for clean runs.
@@ -204,13 +204,13 @@ extension CLIOptions {
         }
         if let tools {
             result.tools = tools.split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         }
         if let excludeTools {
             result.excludeTools = excludeTools
                 .split(separator: ",")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         }
         if noTools {
