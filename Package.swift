@@ -28,6 +28,9 @@ let package = Package(
         .target(
             name: "PiSwiftCodingAgentTui",
             dependencies: [
+                .product(name: "PiSwiftCodingAgentDurable", package: "PiSwift"),
+                .product(name: "PiSwiftDurable", package: "PiSwift"),
+                .product(name: "PiSwiftChord", package: "PiSwift"),
                 .product(name: "PiSwiftAI", package: "PiSwift"),
                 .product(name: "PiSwiftAgent", package: "PiSwift"),
                 .product(name: "PiSwiftCodingAgent", package: "PiSwift"),
@@ -39,6 +42,9 @@ let package = Package(
         .executableTarget(
             name: "PiSwiftCodingAgentCLI",
             dependencies: [
+                .product(name: "PiSwiftCodingAgentDurable", package: "PiSwift"),
+                .product(name: "PiSwiftDurable", package: "PiSwift"),
+                .product(name: "PiSwiftChord", package: "PiSwift"),
                 .product(name: "PiSwiftAI", package: "PiSwift"),
                 .product(name: "PiSwiftAgent", package: "PiSwift"),
                 .product(name: "PiSwiftCodingAgent", package: "PiSwift"),
@@ -52,6 +58,7 @@ let package = Package(
         .testTarget(
             name: "PiSwiftCodingAgentTuiTests",
             dependencies: [
+                .product(name: "PiSwiftDurableTesting", package: "PiSwift"),
                 .product(name: "PiSwiftAI", package: "PiSwift"),
                 .product(name: "PiSwiftAgent", package: "PiSwift"),
                 .product(name: "PiSwiftCodingAgent", package: "PiSwift"),

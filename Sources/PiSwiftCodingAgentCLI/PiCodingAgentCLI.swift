@@ -63,6 +63,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             AuthSubcommand.self,
             McpSubcommand.self,
             UpdateSubcommand.self,
+            DurableSubcommand.self,
         ],
         defaultSubcommand: SessionSubcommand.self
     )
@@ -991,7 +992,7 @@ Built-in Tool Names:
         }
 
         guard index < args.count,
-              ["package", "config", "auth", "mcp", "update"].contains(args[index]),
+              ["package", "config", "auth", "mcp", "update", "durable"].contains(args[index]),
               index > 0 else {
             return args
         }
