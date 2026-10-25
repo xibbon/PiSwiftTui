@@ -35,20 +35,27 @@ final class DurableNestedTools {
         self.cwd = cwd
     }
 
-    func apply(_ live: LiveState, expanded: Bool) {
+    func apply(_ live: LiveState, expanded: Bool, completedParents: Set<DurableNestedToolParent> = []) {
         let nested = live.nestedTools ?? []
         let all = Dictionary(nested.map { ($0.taskId, $0) }, uniquingKeysWith: { _, newest in newest })
-        var settled = Set((live.tools ?? []).filter { $0.status == .done }.compactMap(\.taskId))
+        var settled = Set((live.tools ?? []).filter { $0.status == .done }.compactMap { slot in
+            slot.taskId.map { DurableNestedToolParent(taskId: $0, callId: slot.callId) }
+        })
+        // The transcript result can arrive before the live document is cleared.
+        settled.formUnion(completedParents)
         // Do not retain descendants of a caller that has finished.
-        settled.formUnion(nested.filter { $0.status == .done }.map(\.taskId))
+        settled.formUnion(nested.filter { $0.status == .done }.map {
+            DurableNestedToolParent(taskId: $0.taskId, callId: $0.callId)
+        })
         var hidden: Set<TaskID> = []
         for slot in nested {
-            var parent = slot.parentTaskId
+            var parent = DurableNestedToolParent(taskId: slot.parentTaskId, callId: slot.parentCallId)
             var visited: Set<TaskID> = [slot.taskId]
-            while visited.insert(parent).inserted {
+            while visited.insert(parent.taskId).inserted {
                 if settled.contains(parent) { hidden.insert(slot.taskId); break }
-                guard let ancestor = all[parent] else { break }
-                parent = ancestor.parentTaskId
+                guard let ancestor = all[parent.taskId],
+                      ancestor.callId.utf8.elementsEqual(parent.callId.utf8) else { break }
+                parent = DurableNestedToolParent(taskId: ancestor.parentTaskId, callId: ancestor.parentCallId)
             }
         }
         let visible = all.filter { !hidden.contains($0.key) }

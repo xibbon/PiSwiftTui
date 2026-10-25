@@ -18,7 +18,7 @@ struct DurableTuiHandlers {
 
 @MainActor
 final class DurableTui {
-    private static let renderers = createAllToolRenderers()
+    private static let renderers = createDurableToolRenderers()
     let ui: TUI
     let renderer: AltScreenRenderer
     let layoutRoot = VStack()
@@ -38,6 +38,10 @@ final class DurableTui {
     private(set) var cards: [ToolExecutionComponent] = []
     private var cardCalls: [(String, String)] = []
     private var streamingCalls: Set<String> = []
+    private var completedCalls: Set<[UInt8]> = []
+    private var unclaimedLiveCalls: Set<[UInt8]> = []
+    private var liveParents: [[UInt8]: DurableNestedToolParent] = [:]
+    private var conversationId: ConversationID?
     private(set) var summaries: [CompactionComponent] = []
     private(set) var expanded = false
     private var renderedEntryIds: [EntryID] = []
@@ -113,6 +117,9 @@ final class DurableTui {
         cardCalls.removeAll()
         tools.removeAll()
         streamingCalls.removeAll()
+        completedCalls.removeAll()
+        unclaimedLiveCalls.removeAll()
+        liveParents.removeAll()
     }
     func mount(_ component: any Component) {
         editorContainer.clear()
@@ -138,8 +145,14 @@ final class DurableTui {
             agent = nil
             showError("Cannot decode pi.agent: \(error)")
         }
-        syncTranscript(view.conversation.entries)
+        // The first view keeps what is already shown; only a later switch rebuilds.
+        let previous = conversationId
+        conversationId = view.conversation.conversation.id
+        if let previous, previous != view.conversation.conversation.id {
+            rebuild(view.conversation.entries)
+        } else { syncTranscript(view.conversation.entries) }
         if let live { syncLive(live, entries: view.conversation.entries) }
+        else { nestedTools.clear() }
         syncTasks(view.tasks)
         do {
             let inbox = try view.conversation.docs["pi.inbox"].map { try JSONValue.object($0).decode(InboxState.self) } ?? InboxState()
@@ -183,19 +196,27 @@ final class DurableTui {
         if message == nil, streaming != nil { rebuild(entries) }
         if let message { syncStreaming(message) }
         for slot in live.tools ?? [] where slot.status != .pending {
+            let callId = Array(slot.callId.utf8)
+            if let taskId = slot.taskId, liveParents[callId] == nil {
+                liveParents[callId] = DurableNestedToolParent(taskId: taskId, callId: slot.callId)
+            }
+            guard !completedCalls.contains(callId) else { continue }
+            let needsAssistant = tools[slot.callId] == nil
             let component = tool(slot.name, callId: slot.callId)
+            if needsAssistant { unclaimedLiveCalls.insert(callId) }
             component.setArgsComplete()
             guard slot.status == .running else { continue }
             component.markExecutionStarted()
             let child = slot.details?.objectValue?["conversationId"]?.numberValue
             let output = slot.output ?? child.map { "Subagent \(Int($0)) is working. /agents switches to it." }
-            if let output {
+            if output != nil || slot.name == "codemode" {
                 component.updateResult(ToolResultMessage(toolCallId: slot.callId, toolName: slot.name,
-                    content: [.text(TextContent(text: output))],
+                    content: output.map { [.text(TextContent(text: $0))] } ?? [],
                     details: slot.details.flatMap { try? AnyCodable(foundationJSON(from: $0)) }, isError: false), isPartial: true)
             }
         }
-        nestedTools.apply(live, expanded: expanded)
+        let completedParents = Set(completedCalls.compactMap { liveParents[$0] })
+        nestedTools.apply(live, expanded: expanded, completedParents: completedParents)
         if let failure = live.compactionFailure {
             showError("Compaction failed (\(failure.reason.rawValue), task #\(failure.taskId.rawValue)): \(failure.error)")
         }
@@ -277,6 +298,7 @@ final class DurableTui {
     private func rebuild(_ entries: [EntryRecord]) {
         chat.clear()
         discardTools()
+        nestedTools.clear()
         summaries.removeAll()
         rebuilt = true
         renderedEntryIds.removeAll()
@@ -301,7 +323,9 @@ final class DurableTui {
             for case .toolCall(let call) in message.content {
                 let streamed = streamingCalls.contains(call.id)
                 if !ran && !streamed { continue }
-                let card = tool(call.name, callId: call.id, args: call.arguments, fresh: !streamed)
+                let card = tool(call.name, callId: call.id, args: call.arguments,
+                                fresh: !streamed && !unclaimedLiveCalls.contains(Array(call.id.utf8)))
+                unclaimedLiveCalls.remove(Array(call.id.utf8))
                 card.setArgsComplete()
                 if !ran {
                     card.updateResult(ToolResultMessage(toolCallId: call.id, toolName: call.name,
@@ -311,6 +335,7 @@ final class DurableTui {
             streamingCalls.removeAll()
         case ("pi.tool-result", .toolResult(let result)):
             tool(result.toolName, callId: result.toolCallId).updateResult(result)
+            completedCalls.insert(Array(result.toolCallId.utf8))
         case ("pi.compaction", _):
             let text: String
             if case .user(let user) = message { text = userText(user.content) } else { text = "" }
@@ -335,7 +360,9 @@ final class DurableTui {
         streaming?.setStreaming(true)
         streaming?.updateContent(message)
         for case .toolCall(let call) in message.content {
-            _ = tool(call.name, callId: call.id, args: call.arguments, fresh: !streamingCalls.contains(call.id))
+            _ = tool(call.name, callId: call.id, args: call.arguments,
+                     fresh: !streamingCalls.contains(call.id) && !unclaimedLiveCalls.contains(Array(call.id.utf8)))
+            unclaimedLiveCalls.remove(Array(call.id.utf8))
             streamingCalls.insert(call.id)
         }
     }
@@ -345,6 +372,8 @@ final class DurableTui {
             return existing
         }
         let component = ToolExecutionComponent(toolName: name, toolCallId: callId, args: args ?? [:], renderers: Self.renderers[name], ui: ui, cwd: cwd)
+        completedCalls.remove(Array(callId.utf8))
+        if fresh { liveParents.removeValue(forKey: Array(callId.utf8)) }
         component.setExpanded(expanded)
         chat.addChild(component)
         cards.append(component)
