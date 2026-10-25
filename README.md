@@ -6,7 +6,7 @@ the mobile-safe agent libraries remain in the sibling `../PiSwift` package.
 
 It depends on the sibling `../PiSwift` and `../MiniTui` packages.
 
-For `pi durable`, see the [PiSwiftCodingAgentDurable README](../PiSwift/Sources/PiSwiftCodingAgentDurable/README.md).
+For `pi durable`, see the [PiSwiftCodingAgentDurable README](https://github.com/xibbon/PiSwift/blob/main/Sources/PiSwiftCodingAgentDurable/README.md).
 
 Run the moved test suites with:
 
