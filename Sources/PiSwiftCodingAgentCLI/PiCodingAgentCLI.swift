@@ -90,7 +90,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         let startupSettingsDiagnostics = collectSettingsDiagnostics(startupSettingsManager)
         applyStartupTerminalSettings(startupSettingsManager)
         let authStorage = AuthStorage.create(getAuthPath())
-        let modelRegistry = ModelRegistry(authStorage, agentDir)
+        let clientIdentityPolicy = CLIClientIdentityPolicy(startupSettingsManager)
+        let modelRegistry = ModelRegistry(authStorage, agentDir, clientIdentityProvider: {
+            clientIdentityPolicy.identity()
+        })
         let eventBus = createEventBus()
         time("discoverModels")
 
@@ -148,6 +151,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         )
         let trust = trustContext.trust
         let settingsManager = trustContext.settingsManager
+        clientIdentityPolicy.useSettings(settingsManager)
         var runtimeDiagnostics: [ResourceDiagnostic] = []
         if isInteractive, let useTheme = cli.useTheme {
             var overrides = Settings()
@@ -441,7 +445,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 hasPendingMessages: { (session?.pendingMessageCount ?? 0) > 0 },
                 abort: { Task { await session?.abort() } },
                 events: eventBus,
-                sendMessage: { message, options in handler(message, options) }
+                sendMessage: { message, options in handler(message, options) },
+                clientIdentityProvider: { clientIdentityPolicy.resolve(modelRegistry) }
             )
         }
 
@@ -543,8 +548,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 return await authStorage.getApiKey(provider)
             },
             getModelAuth: { model in
-                let auth = await modelRegistry.getApiKeyAndHeaders(model)
-                return AgentModelAuth(apiKey: auth.apiKey, headers: auth.headers, baseUrl: auth.baseUrl)
+                await resolveCLIModelAuth(registry: modelRegistry, model: model,
+                    sessionId: sessionManager.getSessionId(), hookRunner: hookRunner)
             },
             timeoutMs: settingsManager.getHttpIdleTimeoutMs(),
             websocketConnectTimeoutMs: settingsManager.getWebSocketConnectTimeoutMs(),
@@ -552,6 +557,19 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             afterToolCall: hookRunner.map(makeHookRunnerAfterToolCallHook)
         ))
         agentBox.withLock { $0 = createdAgent }
+        let cacheWarmer = CacheWarmer(
+            stream: makeCLICacheReplay(registry: modelRegistry, policy: clientIdentityPolicy,
+                hookRunner: hookRunner),
+            sessionManager: sessionManager,
+            getMode: { settingsManager.getCacheWarmingMode() },
+            decide: { event in
+                guard let hookRunner, hookRunner.hasHandlers(event.type) else { return event.action }
+                return await hookRunner.emitCacheWarmingDecision(event)
+            },
+            onWarmed: { entry in sessionBox.withLock { $0 }?.emitCacheWarmed(entry) }
+        )
+        createdAgent.streamFn = makeCLIAgentStream(registry: modelRegistry, policy: clientIdentityPolicy,
+            sessionManager: sessionManager, agentBox: agentBox, cacheWarmer: cacheWarmer)
 
         if initialThinking != .off && !createdAgent.state.model.reasoning {
             createdAgent.thinkingLevel = .off
@@ -613,6 +631,7 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             hookRunner: hookRunner,
             customTools: customToolsResult.tools,
             modelRegistry: modelRegistry,
+            cacheWarmer: cacheWarmer,
             skillsSettings: skillsSettings,
             eventBus: eventBus,
             usesDefaultTools: toolSelection.usesDefaultTools,
@@ -629,7 +648,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 let wrapped = wrapCustomTools(defs, getCustomToolContext)
                     .filter { !disableCustomTools && !excludedTools.matches($0.name) }
                 return hookRunner.map { wrapToolsWithHooks(wrapped, $0) } ?? wrapped
-            }
+            },
+            clientIdentityProvider: { clientIdentityPolicy.resolve(modelRegistry) }
         ))
         sessionBox.withLock { $0 = createdSession }
         let sendMessageHandler: HookSendMessageHandler = { [weak createdSession] message, options in

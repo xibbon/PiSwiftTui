@@ -89,7 +89,10 @@ func handlePackageCommand(
     let cwd = FileManager.default.currentDirectoryPath
     let agentDir = getAgentDir()
     let authStorage = AuthStorage.create(getAuthPath())
-    let modelRegistry = ModelRegistry(authStorage, agentDir)
+    let clientIdentityPolicy = CLIClientIdentityPolicy(SettingsManager.create(cwd, agentDir, projectTrusted: false))
+    let modelRegistry = ModelRegistry(authStorage, agentDir, clientIdentityProvider: {
+        clientIdentityPolicy.identity()
+    })
     let trustChoice = projectTrustChoice(approve: approve, noApprove: noApprove)
     let trustContext = await resolveProjectTrustForCLI(
         cwd: cwd,
@@ -103,6 +106,7 @@ func handlePackageCommand(
         hasUI: false
     )
     let settingsManager = trustContext.settingsManager
+    clientIdentityPolicy.useSettings(settingsManager)
     for error in settingsManager.drainErrors() {
         fputs("Warning (package command, \(error.scope) settings): \(error.message)\n", stderr)
     }

@@ -74,7 +74,10 @@ private func runConfigSubcommand(_ cli: CLIOptions) async throws {
         isInteractive: true
     )
     let authStorage = AuthStorage.create(getAuthPath())
-    let modelRegistry = ModelRegistry(authStorage, agentDir)
+    let clientIdentityPolicy = CLIClientIdentityPolicy(startupSettingsManager)
+    let modelRegistry = ModelRegistry(authStorage, agentDir, clientIdentityProvider: {
+        clientIdentityPolicy.identity()
+    })
     let trustChoice = projectTrustChoice(approve: cli.approve, noApprove: cli.noApprove)
     let trustContext = await resolveProjectTrustForCLI(
         cwd: cwd,
@@ -88,6 +91,7 @@ private func runConfigSubcommand(_ cli: CLIOptions) async throws {
         hasUI: true
     )
     let settingsManager = trustContext.settingsManager
+    clientIdentityPolicy.useSettings(settingsManager)
     reportSubcommandSettingsErrors(settingsManager, context: "config command")
     let packageManager = DefaultPackageManager(
         cwd: cwd,

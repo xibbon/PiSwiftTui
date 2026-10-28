@@ -307,9 +307,12 @@ public final class InteractiveMode {
     private var customFooter: Component?
     private var footerDataProvider: FooterDataProvider?
     private var footerBranchUnsubscribe: (() -> Void)?
-    private var hookSelector: HookSelectorComponent?
-    private var hookInput: HookInputComponent?
-    private var hookEditor: HookEditorComponent?
+    private var extensionDialogs: [ExtensionDialog] = []
+    private var extensionDialogWaiters: [UUID: () -> Void] = [:]
+    private var extensionDialogOverlays: [ExtensionDialogOverlay] = []
+    // An overlay can retain a closed inline dialog as its previous focus target.
+    private var removedExtensionDialogComponents: Set<ObjectIdentifier> = []
+    private var activeSelector: SelectorCloseBox?
     private var hookWidgets: [String: Component] = [:]
     private var hookWidgetOrder: [String] = []
     private var baseSlashCommands: [SlashCommand] = []
@@ -530,11 +533,7 @@ public final class InteractiveMode {
                 return true
             }
             if self.keybindings.matches(data, .clear) {
-                if let selectorCancel = self.selectorCancel {
-                    selectorCancel()
-                } else {
-                    self.handleCtrlC()
-                }
+                self.handleGlobalClear()
                 return true
             }
             return false
@@ -1282,29 +1281,111 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    func showHookSelector(_ title: String, _ options: [String], blocked: BlockedStatus? = nil) async -> String? {
-        guard editorContainer != nil, tui != nil else { return nil }
-        programStatus.setBlocked(source: "extension-dialog", status: blocked ?? BlockedStatus(kind: .question, message: title))
-        defer { programStatus.setBlocked(source: "extension-dialog", status: nil) }
-        return await withCheckedContinuation { continuation in
-            showSelector { done in
-                let selector = HookSelectorComponent(
-                    title: title,
-                    options: options,
-                    onSelect: { [weak self] option in
-                        self?.hookSelector = nil
-                        done()
-                        continuation.resume(returning: option)
-                    },
-                    onCancel: { [weak self] in
-                        self?.hookSelector = nil
-                        done()
-                        continuation.resume(returning: nil)
+    private func pushExtensionDialog(_ dialog: ExtensionDialog) {
+        activeSelector?.closeOnce()
+        activeSelector = nil
+        extensionDialogs.append(dialog)
+        showTopExtensionDialog()
+    }
+
+    @MainActor
+    private func removeExtensionDialog(_ id: UUID) {
+        guard let index = extensionDialogs.firstIndex(where: { $0.id == id }) else { return }
+        if !extensionDialogOverlays.isEmpty {
+            removedExtensionDialogComponents.insert(ObjectIdentifier(extensionDialogs[index].component))
+        }
+        extensionDialogs.remove(at: index)
+        if index == extensionDialogs.count { showTopExtensionDialog() }
+    }
+
+    @MainActor
+    private func showTopExtensionDialog() {
+        let top = extensionDialogs.last
+        selectorCancel = top?.cancel
+        if let editorContainer, let component = top?.component ?? editor {
+            editorContainer.clear()
+            editorContainer.addChild(component)
+            tui?.setFocus(component)
+        }
+        if top == nil, let tui,
+           let overlay = extensionDialogOverlays.last(where: {
+               !$0.handle.isHidden() && $0.options?.nonCapturing != true &&
+                   ($0.options?.visible?(tui.terminal.columns, tui.terminal.rows) ?? true)
+           }) {
+            tui.setFocus(overlay.component)
+        }
+        programStatus.setBlocked(source: "extension-dialog", status: top?.blocked)
+        ui.requestRender()
+    }
+
+    @MainActor
+    func handleGlobalClear() {
+        if let tui, tui.isOverlayFocused(), let focused = tui.getFocusedComponent(),
+           let overlay = extensionDialogOverlays.last(where: { $0.component === focused }) {
+            extensionDialogWaiters[overlay.id]?()
+        } else if let selectorCancel {
+            selectorCancel()
+        } else {
+            handleCtrlC()
+        }
+    }
+
+    /// Include custom factories that have not yet installed a component and overlay waits.
+    @MainActor
+    func resetExtensionDialogs() {
+        let cancel = Array(extensionDialogWaiters.values)
+        for finish in cancel { finish() }
+        if !cancel.isEmpty { showTopExtensionDialog() }
+    }
+
+    @MainActor
+    private func waitForExtensionDialog<Value: Sendable>(
+        _ install: (ExtensionDialogWait<Value>) -> Void
+    ) async -> Value? {
+        guard editorContainer != nil, tui != nil, !isShuttingDown, !Task.isCancelled else { return nil }
+        let wait = ExtensionDialogWait<Value>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                wait.completion = { [weak self, weak wait] value in
+                    if let wait {
+                        self?.extensionDialogWaiters.removeValue(forKey: wait.id)
+                        wait.overlayHandle?.hide()
+                        self?.extensionDialogOverlays.removeAll { $0.id == wait.id }
+                        if let self, let focused = self.tui?.getFocusedComponent(),
+                           self.removedExtensionDialogComponents.contains(ObjectIdentifier(focused)) {
+                            self.showTopExtensionDialog()
+                        }
+                        if self?.extensionDialogOverlays.isEmpty == true {
+                            self?.removedExtensionDialogComponents.removeAll()
+                        }
+                        self?.removeExtensionDialog(wait.id)
+                        (wait.component as? HookDisposableComponent)?.dispose()
+                        wait.component = nil
+                        wait.overlayHandle = nil
                     }
-                )
-                self.hookSelector = selector
-                return (component: selector, focus: selector)
+                    continuation.resume(returning: value)
+                }
+                extensionDialogWaiters[wait.id] = { wait.finish(nil) }
+                if Task.isCancelled {
+                    wait.finish(nil)
+                } else {
+                    install(wait)
+                }
             }
+        } onCancel: {
+            Task { @MainActor in wait.finish(nil) }
+        }
+    }
+
+    @MainActor
+    func showHookSelector(_ title: String, _ options: [String], blocked: BlockedStatus? = nil) async -> String? {
+        await waitForExtensionDialog { wait in
+            let selector = HookSelectorComponent(title: title, options: options,
+                onSelect: { wait.finish($0) }, onCancel: { wait.finish(nil) })
+            wait.component = selector
+            pushExtensionDialog(ExtensionDialog(id: wait.id, component: selector,
+                blocked: blocked ?? BlockedStatus(kind: .question, message: title),
+                cancel: { wait.finish(nil) }))
         }
     }
 
@@ -1316,71 +1397,24 @@ public final class InteractiveMode {
 
     @MainActor
     func showHookInput(_ title: String, _ placeholder: String?) async -> String? {
-        guard editorContainer != nil, tui != nil, !Task.isCancelled else { return nil }
-        @MainActor final class InputWait {
-            var cancel: (() -> Void)?
-        }
-        let wait = InputWait()
-        programStatus.setBlocked(source: "extension-dialog", status: BlockedStatus(kind: .question, message: title))
-        defer { programStatus.setBlocked(source: "extension-dialog", status: nil) }
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                showSelector { done in
-                    var completed = false
-                    let finish: (String?) -> Void = { [weak self] value in
-                        guard !completed else { return }
-                        completed = true
-                        wait.cancel = nil
-                        self?.hookInput = nil
-                        done()
-                        continuation.resume(returning: value)
-                    }
-                    let input = HookInputComponent(
-                        title: title,
-                        placeholder: placeholder,
-                        onSubmit: { finish($0) },
-                        onCancel: { finish(nil) }
-                    )
-                    wait.cancel = { finish(nil) }
-                    self.hookInput = input
-                    return (component: input, focus: input)
-                }
-                if Task.isCancelled { wait.cancel?() }
-            }
-        } onCancel: {
-            Task { @MainActor in wait.cancel?() }
+        await waitForExtensionDialog { wait in
+            let input = HookInputComponent(title: title, placeholder: placeholder,
+                onSubmit: { wait.finish($0) }, onCancel: { wait.finish(nil) })
+            wait.component = input
+            pushExtensionDialog(ExtensionDialog(id: wait.id, component: input,
+                blocked: BlockedStatus(kind: .question, message: title), cancel: { wait.finish(nil) }))
         }
     }
 
     @MainActor
     func showHookEditor(_ title: String, _ prefill: String?) async -> String? {
-        guard editorContainer != nil, tui != nil else { return nil }
-        programStatus.setBlocked(source: "extension-dialog", status: BlockedStatus(kind: .question, message: title))
-        defer { programStatus.setBlocked(source: "extension-dialog", status: nil) }
-        return await withCheckedContinuation { continuation in
-            guard let tui else {
-                continuation.resume(returning: nil)
-                return
-            }
-            showSelector { done in
-                let editor = HookEditorComponent(
-                    tui: tui,
-                    title: title,
-                    prefill: prefill,
-                    onSubmit: { [weak self] value in
-                        self?.hookEditor = nil
-                        done()
-                        continuation.resume(returning: value)
-                    },
-                    onCancel: { [weak self] in
-                        self?.hookEditor = nil
-                        done()
-                        continuation.resume(returning: nil)
-                    }
-                )
-                self.hookEditor = editor
-                return (component: editor, focus: editor)
-            }
+        guard let tui else { return nil }
+        return await waitForExtensionDialog { wait in
+            let editor = HookEditorComponent(tui: tui, title: title, prefill: prefill,
+                onSubmit: { wait.finish($0) }, onCancel: { wait.finish(nil) })
+            wait.component = editor
+            pushExtensionDialog(ExtensionDialog(id: wait.id, component: editor,
+                blocked: BlockedStatus(kind: .question, message: title), cancel: { wait.finish(nil) }))
         }
     }
 
@@ -1389,55 +1423,42 @@ public final class InteractiveMode {
         _ factory: @escaping HookCustomFactory,
         options: HookCustomOptions?
     ) async -> HookCustomResult? {
-        guard let tui, let editor, let editorContainer else { return nil }
+        guard let tui, let editor else { return nil }
         let savedText = editor.getText()
         let isOverlay = options?.overlay ?? false
-
-        func restoreEditor() {
-            editorContainer.clear()
-            editorContainer.addChild(editor)
-            editor.setText(savedText)
-            tui.setFocus(editor)
-            tui.requestRender()
-        }
-
-        return await withCheckedContinuation { continuation in
-            var component: Component?
-            var overlayHandle: HookOverlayHandle?
-            var closed = false
-
-            let close: HookCustomClose = { result in
-                guard !closed else { return }
-                closed = true
-                if let disposable = component as? HookDisposableComponent {
-                    disposable.dispose()
-                }
-                if isOverlay {
-                    overlayHandle?.hide()
-                    tui.requestRender()
-                } else {
-                    restoreEditor()
-                }
-                continuation.resume(returning: result.map(HookCustomResult.init))
+        return await waitForExtensionDialog { wait in
+            wait.beforeFinish = {
+                if !isOverlay { editor.setText(savedText) }
             }
-
-            Task { @MainActor in
-                let created = await factory(tui, theme, keybindings, close)
-                guard !closed else { return }
-                guard let createdComponent = created as? Component else { return }
-                component = createdComponent
+            let close: HookCustomClose = { result in
+                guard !wait.completed else { return }
+                wait.finish(result.map(HookCustomResult.init))
+                tui.requestRender()
+            }
+            Task { @MainActor [weak self] in
+                let created = await factory(tui, theme, self?.keybindings ?? .inMemory(), close)
+                guard !wait.completed else {
+                    (created as? HookDisposableComponent)?.dispose()
+                    return
+                }
+                guard let self else { wait.finish(nil); return }
+                guard let component = created as? Component else {
+                    showHookError("custom", "Custom UI factory did not return a terminal component.")
+                    wait.finish(nil)
+                    return
+                }
+                wait.component = component
                 if isOverlay {
-                    let resolvedOptions = resolveOverlayOptions(options?.overlayOptions)
-                    let handle = tui.showOverlay(createdComponent, options: resolvedOptions)
-                    let wrapper = TuiOverlayHandle(handle)
-                    overlayHandle = wrapper
-                    options?.onHandle?(wrapper)
+                    let resolved = resolveOverlayOptions(options?.overlayOptions)
+                    let handle = TuiOverlayHandle(tui.showOverlay(component, options: resolved))
+                    wait.overlayHandle = handle
+                    extensionDialogOverlays.append(ExtensionDialogOverlay(id: wait.id,
+                        component: component, handle: handle, options: resolved))
+                    options?.onHandle?(handle)
                     tui.requestRender()
                 } else {
-                    editorContainer.clear()
-                    editorContainer.addChild(createdComponent)
-                    tui.setFocus(createdComponent)
-                    tui.requestRender()
+                    pushExtensionDialog(ExtensionDialog(id: wait.id, component: component,
+                        blocked: nil, cancel: { close(nil) }))
                 }
             }
         }
@@ -2934,6 +2955,7 @@ public final class InteractiveMode {
     func performShutdown(fromSignal: Bool = false) async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
+        resetExtensionDialogs()
         mcpUi?.cancelManager()
         loadingAnimation?.stop()
         loadingAnimation = nil
@@ -3718,7 +3740,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func showSelector(_ builder: (_ done: @escaping () -> Void) -> (component: Component, focus: Component)) {
+    func showSelector(_ builder: (_ done: @escaping () -> Void) -> (component: Component, focus: Component)) {
         guard let editorContainer, let tui else { return }
 
         // Holds the component so `done` can tear down its background work. Every exit path
@@ -3728,16 +3750,14 @@ public final class InteractiveMode {
 
         let done: () -> Void = { [weak self] in
             guard let self else { return }
+            guard self.activeSelector === closable else { return }
             closable.closeOnce()
-            self.selectorCancel = nil
-            editorContainer.clear()
-            if let editor = self.editor {
-                editorContainer.addChild(editor)
-                tui.setFocus(editor)
-            }
-            self.scheduleRender()
+            self.activeSelector = nil
+            self.showTopExtensionDialog()
         }
 
+        activeSelector?.closeOnce()
+        activeSelector = closable
         selectorCancel = done
         let result = builder(done)
         closable.component = result.component as? SelectorClosable
@@ -5241,6 +5261,7 @@ public final class InteractiveMode {
             return
         }
 
+        resetExtensionDialogs()
         let loader = BorderedLoader(tui: tui, theme: theme, message: "Reloading skills, prompts, themes, extensions...")
         let previousEditor = currentEditor
 
