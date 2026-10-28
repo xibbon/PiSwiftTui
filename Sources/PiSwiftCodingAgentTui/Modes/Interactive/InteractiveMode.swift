@@ -4842,14 +4842,18 @@ public final class InteractiveMode {
                 let available = await session.modelRegistry.getAvailable().filter { $0.provider == providerId }
                 if let model = await selectDefaultModel(available: available, registry: session.modelRegistry) {
                     guard self.canApplyPostLoginSelection(session, previousModel: modelAtStart, revision: selectionRevision) else { return }
-                    do {
-                        try await session.setModel(model, options: ModelMutationOptions(persist: true))
-                        self.updateEditorBorderColor()
-                    } catch { self.showError(error.localizedDescription) }
+                    await self.applyPostLoginDefaultModel(model, session: session, actionLabel: actionLabel)
                 } else if self.canApplyPostLoginSelection(session, previousModel: modelAtStart, revision: selectionRevision) {
-                    let detail = available.isEmpty
-                        ? "no models are available for that provider"
-                        : "its default model is not available"
+                    let detail: String
+                    // Upstream v1.4.0 interactive-mode.ts checks the provider default first.
+                    switch defaultModelId(forProvider: providerId) {
+                    case nil:
+                        detail = "no default model is configured for provider \"\(providerId)\""
+                    case .some(_) where available.isEmpty:
+                        detail = "no models are available for that provider"
+                    case .some(let id):
+                        detail = "its default model \"\(id)\" is not available"
+                    }
                     self.showError("\(actionLabel), but \(detail). Use /model to select a model.")
                 }
             } else {
@@ -4857,6 +4861,16 @@ public final class InteractiveMode {
             }
             self.footer?.invalidate()
             self.ui.requestRender()
+        }
+    }
+
+    @MainActor
+    func applyPostLoginDefaultModel(_ model: Model, session: AgentSession, actionLabel: String) async {
+        do {
+            try await session.setModel(model, options: ModelMutationOptions(persist: true))
+            updateEditorBorderColor()
+        } catch {
+            showError("\(actionLabel), but selecting its default model failed: \(error.localizedDescription). Use /model to select a model.")
         }
     }
 
