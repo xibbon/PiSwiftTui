@@ -1,3 +1,4 @@
+import Foundation
 import MiniTui
 import PiSwiftAI
 import PiSwiftChord
@@ -83,6 +84,9 @@ func describeTask(_ node: TaskGraphNode) -> String {
     let status: String
     switch node.state {
     case .waiting(_, let on, _): status = "waiting on " + on.map { String($0.rawValue) }.joined(separator: ", ")
+    case .sleeping(let phase, let until):
+        let time = Date(timeIntervalSince1970: until / 1000).ISO8601Format()
+        status = "sleeping \(phase) until \(time)"
     case .completing(let outcome): status = "completing (\(outcome))"
     case .pending(let phase), .running(let phase): status = "\(node.state.status) \(phase)"
     }
