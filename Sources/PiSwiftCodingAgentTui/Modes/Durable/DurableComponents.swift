@@ -98,14 +98,15 @@ func describeBlockedReason(_ reason: TaskBlockedReason, restarts: Double? = nil)
 func describeNotice(_ notice: Notice) -> String {
     let task = notice.taskId.map { " #\($0.rawValue)" } ?? ""
     let kind = notice.taskKind.map { " (\($0))" } ?? ""
+    let source = notice.extensionName.map { " [extension: \($0)]" } ?? ""
     switch notice.category {
-    case .operation: return notice.message
-    case .report: return "Runtime report\(task)\(kind): \(notice.message)"
+    case .operation, .sessionFailed: return notice.displayMessage
+    case .report: return "Runtime report\(task)\(kind)\(source): \(notice.message)"
     case .taskParked:
         let actions = notice.taskId.map { "; " + taskActions($0) } ?? ""
-        return "Task parked\(task)\(kind): \(notice.message)\(actions)"
-    case .taskFault: return "Task fault\(task)\(kind): \(notice.message)"
-    case .sessionFailed: return "Session failed: \(notice.message)"
+        return "Task parked\(task)\(kind)\(source): \(notice.message)\(actions)"
+    case .taskFault: return "Task fault\(task)\(kind)\(source): \(notice.message)"
+    case .extensionError: return "Extension error\(task)\(kind)\(source): \(notice.message)"
     }
 }
 

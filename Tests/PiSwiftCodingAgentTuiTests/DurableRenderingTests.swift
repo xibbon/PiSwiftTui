@@ -577,6 +577,52 @@ extension DurableRenderingTests {
         #expect(describeNotice(.init(id: 5, level: .info, message: "Task waits", category: .taskParked)) == "Task parked: Task waits")
     }
 
+    @Test(arguments: [false, true], [false, true])
+    func extensionErrorNoticesShowOptionalSources(_ hasExtension: Bool, _ hasTask: Bool) throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let task = hasTask ? ReportTask(id: try TaskID(2), kind: "pi.tool", conversationId: rootConversationID) : nil
+        let name = hasExtension ? "coding-agent" : nil
+        let info = ReportInfo.extensionError(extension: name, task: task, conversationId: rootConversationID)
+        let notice = Notice(id: 1, level: .error, message: "Hook failed", category: .extensionError,
+                            taskId: task?.id, taskKind: task?.kind, reportType: info.type,
+                            extensionName: name, conversationId: rootConversationID, reportInfo: info)
+        tui.apply(workView(notices: [notice]))
+        let taskText = hasTask ? " #2 (pi.tool)" : ""
+        let sourceText = hasExtension ? " [extension: coding-agent]" : ""
+        let expected = "Extension error\(taskText)\(sourceText): Hook failed"
+        #expect(describeNotice(notice) == expected)
+        #expect(text(tui.notices).contains(expected))
+        #expect(!text(tui.notices).contains("Session failed"))
+        #expect(tui.terminalState == nil)
+    }
+
+    @Test(arguments: [
+        (Notice.Category.operation, "Message", "Message"),
+        (.report, "Runtime report: Message", "Runtime report #2 (pi.tool): Message"),
+        (.taskParked, "Task parked: Message", "Task parked #2 (pi.tool): Message; /retry 2 or /abort 2"),
+        (.taskFault, "Task fault: Message", "Task fault #2 (pi.tool): Message"),
+        (.sessionFailed, "Session failed: Message", "Session failed: Message")
+    ])
+    func existingNoticeCategoriesKeepTheirText(_ category: Notice.Category, _ withoutTask: String, _ withTask: String) throws {
+        #expect(describeNotice(.init(id: 1, level: .error, message: "Message", category: category)) == withoutTask)
+        #expect(describeNotice(.init(id: 2, level: .error, message: "Message", category: category,
+                                    taskId: try TaskID(2), taskKind: "pi.tool")) == withTask)
+    }
+
+    @Test(arguments: [
+        (Notice.Category.report, "Runtime report #2 (pi.tool) [extension: tools]: Message"),
+        (.taskParked, "Task parked #2 (pi.tool) [extension: tools]: Message; /retry 2 or /abort 2"),
+        (.taskFault, "Task fault #2 (pi.tool) [extension: tools]: Message")
+    ])
+    func taskReportNoticesShowTheirExtension(_ category: Notice.Category, _ expected: String) throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let notice = Notice(id: 1, level: .warning, message: "Message", category: category,
+                            taskId: try TaskID(2), taskKind: "pi.tool", extensionName: "tools")
+        tui.apply(workView(notices: [notice]))
+        #expect(text(tui.notices).contains(expected))
+        #expect(tui.terminalState == nil)
+    }
+
     @Test(arguments: [DurableSessionTerminal.closed, .failed(message: "Storage failed")])
     func terminalStatusWinsOverTaskActivityAndRetainedLiveWork(_ terminal: DurableSessionTerminal) throws {
         let tui = makeTui(); defer { tui.stop() }
