@@ -24,6 +24,7 @@ final class DurableTui {
     let layoutRoot = VStack()
     let chat = Container()
     let nestedTools: DurableNestedTools
+    let status = Container()
     let tasks = Container()
     let queue = Container()
     let notices = Container()
@@ -46,7 +47,7 @@ final class DurableTui {
     private(set) var expanded = false
     private var renderedEntryIds: [EntryID] = []
     private var streaming: AssistantMessageComponent?
-    private var indicator: WorkingStatusIndicator?
+    private(set) var indicator: WorkingStatusIndicator?
     private var statusText = ""
     private var rebuilt = false
     private(set) var terminalState: DurableSessionTerminal?
@@ -89,10 +90,10 @@ final class DurableTui {
         editorContainer.addChild(editor)
         footer.addChild(footerStats)
         footer.addChild(footerHints)
-        let dock = VStack(children: [tasks, queue, notices, editorContainer, footer].map {
+        let dock = VStack(children: [status, tasks, queue, notices, editorContainer, footer].map {
             .entry(StackEntry($0, options: StackEntryOptions(shrink: 1, minSize: $0 === editorContainer ? 3 : 0)))
         })
-        for component in [chat, tasks, queue, notices, editorContainer, footer] { ui.addChild(component) }
+        for component in [chat, status, tasks, queue, notices, editorContainer, footer] { ui.addChild(component) }
         layoutRoot.addChild(transcript, options: StackEntryOptions(basis: .points(0), grow: 1, shrink: 1, minSize: 1))
         layoutRoot.addChild(dock, options: StackEntryOptions(basis: .auto, grow: 0, shrink: 1, minSize: 1))
         renderer.setLayoutRoot(layoutRoot)
@@ -136,7 +137,6 @@ final class DurableTui {
         do { live = try decodeLiveOf(view.conversation) }
         catch {
             live = nil
-            syncStatus(nil)
             showError("Cannot decode pi.live: \(error)")
         }
         let agent: PiSwiftDurable.AgentState?
@@ -153,18 +153,20 @@ final class DurableTui {
         } else { syncTranscript(view.conversation.entries) }
         if let live { syncLive(live, entries: view.conversation.entries) }
         else { nestedTools.clear() }
-        syncTasks(view.tasks)
+        syncStatus(view, live: live)
+        syncTasks(view.tasks, blocked: view.blockedTasks)
         do {
             let inbox = try view.conversation.docs["pi.inbox"].map { try JSONValue.object($0).decode(InboxState.self) } ?? InboxState()
-            syncQueue(inbox)
+            syncQueue(inbox, inputs: view.queuedInputs, runActive: live?.run != nil)
         } catch {
-            queue.clear()
+            syncQueue(InboxState(), inputs: view.queuedInputs, runActive: live?.run != nil)
             showError("Cannot decode pi.inbox: \(error)")
         }
         for item in view.notices.suffix(4) {
-            if case .failed(let message) = terminalState, item.message == message { continue }
+            if case .failed(let message) = terminalState,
+               item.category == .sessionFailed || (item.category == .operation && item.message == message) { continue }
             let color: ThemeColor = item.level == .error ? .error : item.level == .warning ? .warning : .muted
-            notices.addChild(TruncatedText(theme.fg(color, item.message), paddingX: 1, paddingY: 0))
+            notices.addChild(Text(theme.fg(color, describeNotice(item)), paddingX: 1, paddingY: 0))
         }
         if case .failed(let message) = terminalState {
             showError("Session failed: \(message)")
@@ -179,7 +181,6 @@ final class DurableTui {
             footerStats.setText(theme.fg(.error, "Cannot read agent state"))
             footerHints.setText(view.session.cwd)
         }
-        if terminalState != nil { syncStatus(nil) }
         if rebuilt { transcript.scrollToEnd() }
         // The dock height changes when queue items and notices arrive.
         layoutRoot.invalidate()
@@ -187,8 +188,10 @@ final class DurableTui {
         rebuilt = false
     }
 
-    private func showError(_ message: String) {
+    func showError(_ message: String) {
         notices.addChild(Text(theme.fg(.error, message), paddingX: 1, paddingY: 0))
+        layoutRoot.invalidate()
+        ui.requestRender()
     }
 
     private func syncLive(_ live: LiveState, entries: [EntryRecord]) {
@@ -220,10 +223,9 @@ final class DurableTui {
         if let failure = live.compactionFailure {
             showError("Compaction failed (\(failure.reason.rawValue), task #\(failure.taskId.rawValue)): \(failure.error)")
         }
-        syncStatus(live)
     }
 
-    private func syncTasks(_ graph: TaskGraph?) {
+    private func syncTasks(_ graph: TaskGraph?, blocked: [DurableBlockedTask]) {
         tasks.clear()
         guard let graph else { return }
         // JavaScript Object.values orders decimal ID keys numerically.
@@ -231,17 +233,25 @@ final class DurableTui {
         var lines = [theme.fg(.accent, "Tasks (\(nodes.count) live, /tasks to hide)")]
         let owned = Set(nodes.flatMap(\.conversations))
         func visit(_ node: TaskGraphNode, depth: Int) {
-            lines.append(String(repeating: "  ", count: depth + 1) + describeTask(node))
+            lines.append(String(repeating: "  ", count: depth + 1) + describeTask(node, blocked: blocked.first { $0.id == node.id }))
             for child in nodes where child.owner == node.id || (child.owner == nil && node.conversations.contains(child.conversationId)) {
                 visit(child, depth: depth + 1)
             }
         }
         for node in nodes where node.owner == nil && !owned.contains(node.conversationId) { visit(node, depth: 0) }
-        for line in lines { tasks.addChild(TruncatedText(theme.fg(.muted, line), paddingX: 1, paddingY: 0)) }
+        for line in lines { tasks.addChild(Text(theme.fg(.muted, line), paddingX: 1, paddingY: 0)) }
     }
-    private func syncQueue(_ inbox: InboxState) {
+    private func syncQueue(_ inbox: InboxState, inputs: [InboxItem], runActive: Bool) {
         queue.clear()
-        for item in inbox.items {
+        var items = inbox.items
+        for input in inputs {
+            if let index = items.firstIndex(where: { $0.id == input.id }) { items[index] = input }
+            else { items.append(input) }
+        }
+        if !runActive, items.contains(where: { $0.mode != .write }) {
+            queue.addChild(Text(theme.fg(.muted, "Queued inputs (no active run):"), paddingX: 1, paddingY: 0))
+        }
+        for item in items {
             let text: String
             if let entry = item.entry {
                 text = applicationEntryText(kind: entry.kind, data: entry.data, model: entry.model)
@@ -251,9 +261,24 @@ final class DurableTui {
             queue.addChild(TruncatedText(theme.fg(.muted, "[\(item.mode.rawValue)] \(text)"), paddingX: 1, paddingY: 0))
         }
     }
-    private func syncStatus(_ live: LiveState?) {
+    private func syncStatus(_ view: DurableView, live: LiveState?) {
+        status.clear()
         var text = ""
-        if let live {
+        if terminalState == nil {
+            let parked = view.parkedTasks
+            for task in parked + view.blockedTasks.filter({ $0.reason != .restartLimit }) {
+                let message = "\(task.kind) #\(task.id.rawValue): " +
+                    describeBlockedReason(task.reason, restarts: task.restarts) + "; " + taskActions(task.id)
+                status.addChild(Text(theme.fg(.warning, message), paddingX: 1, paddingY: 0))
+            }
+            for task in view.sleepingTasks {
+                let time = Date(timeIntervalSince1970: task.until / 1000).ISO8601Format()
+                status.addChild(Text(theme.fg(.muted, "\(task.kind) #\(task.id.rawValue): waiting until \(time) (\(task.phase))"), paddingX: 1, paddingY: 0))
+            }
+        }
+        let canProgress = terminalState == nil && (view.activity == .progressing ||
+            (view.activity == .idle && view.blockedTasks.isEmpty && view.sleepingTasks.isEmpty))
+        if canProgress, let live {
             if let retry = live.generation?.retry {
                 text = "Retrying (attempt \((live.generation?.attempt ?? 0) + 1)): \(retry.error)"
             } else if live.generation?.deferred != nil { text = "Waiting for deferred response..." }
@@ -262,6 +287,7 @@ final class DurableTui {
             } else if let tool = live.tools?.first(where: { $0.status == .running }) { text = "Running \(tool.name)... (esc to abort)" }
             else if live.run != nil { text = "Working... (esc to abort)" }
         }
+        if canProgress, view.activity == .progressing, text.isEmpty { text = "Working... (esc to abort)" }
         guard text != statusText else { return }
         statusText = text
         indicator?.dispose()
@@ -286,7 +312,7 @@ final class DurableTui {
         let model = agent.model.map { "\($0.provider)/\($0.modelId)" } ?? "no model"
         let label = view.conversations.first { $0.id == view.conversation.conversation.id }?.label ?? "conversation \(view.conversation.conversation.id.rawValue)"
         footerHints.setText(theme.fg(label == "main" ? .dim : .accent, label) + theme.fg(.dim,
-            " · \(model) · thinking:\(agent.thinkingLevel?.rawValue ?? "off") (\(keyText(.cycleThinkingLevel))) · \(keyText(.selectModel)) or /model · /agents · /compact · /tasks · \(keyText(.followUp)) follow-up · \(keyText(.clear)) exit"))
+            " · \(model) · thinking:\(agent.thinkingLevel?.rawValue ?? "off") (\(keyText(.cycleThinkingLevel))) · \(keyText(.selectModel)) or /model · /agents · /compact · /tasks · /retry [id] · /abort [id] · \(keyText(.followUp)) follow-up · \(keyText(.clear)) exit"))
     }
     private func syncTranscript(_ entries: [EntryRecord]) {
         if renderedEntryIds.enumerated().contains(where: { index, id in index >= entries.count || entries[index].id != id }) { rebuild(entries) }

@@ -80,6 +80,7 @@ final class DurableTuiSession {
         guard acceptsInput else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        if taskCommand(trimmed) { return }
         if trimmed == "/model" { selectModel(); return }
         if trimmed == "/tasks" { perform { await $0.toggleTasks() }; return }
         if trimmed == "/agents" { selectConversation(); return }
@@ -89,6 +90,24 @@ final class DurableTuiSession {
             return
         }
         perform { await $0.submit(trimmed, whenBusy: .steer) }
+    }
+    private func taskCommand(_ text: String) -> Bool {
+        let parts = text.split(whereSeparator: \.isWhitespace)
+        guard let command = parts.first, command == "/retry" || command == "/abort" else { return false }
+        let parked = source.current().parkedTasks
+        let id: TaskID
+        if parts.count == 1, parked.count == 1 {
+            id = parked[0].id
+        } else if parts.count == 2, parts[1].allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let number = Int64(parts[1]), let parsed = try? TaskID(number) {
+            id = parsed
+        } else {
+            tui.showError("Use \(command) <id>. Omit the ID only when one task is parked.")
+            return true
+        }
+        if command == "/retry" { perform { await $0.retryTask(id) } }
+        else { perform { await $0.abortTask(id) } }
+        return true
     }
     private func selectModel() {
         guard acceptsInput else { return }

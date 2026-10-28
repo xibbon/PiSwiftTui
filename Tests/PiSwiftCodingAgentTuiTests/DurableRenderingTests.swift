@@ -444,3 +444,161 @@ private final class DurableRenderTerminal: Terminal {
         #expect(text(tui.chat).contains("showing 2 of 75 lines"))
     }
 }
+
+extension DurableRenderingTests {
+    private func workView(docs: [String: JSONObject] = [:], graph: TaskGraph? = nil,
+                          blocked: [DurableBlockedTask] = [], sleeping: [DurableSleepingTask] = [],
+                          activity: DurableActivity = .idle, inputs: [InboxItem] = [],
+                          notices: [Notice] = [], terminal: DurableSessionTerminal? = nil) -> DurableView {
+        let base = view(docs: docs, graph: graph, notices: notices)
+        return DurableView(session: base.session, conversation: base.conversation,
+            conversations: base.conversations, models: base.models, notices: notices, tasks: graph,
+            terminal: terminal, blockedTasks: blocked, sleepingTasks: sleeping,
+            activity: activity, queuedInputs: inputs)
+    }
+
+    @Test(arguments: ["pi.generation", "pi.tool"])
+    func hiddenParkedTaskStopsWorkingWithLiveRunAndTool(_ kind: String) throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let live: JSONObject = ["run": ["taskId": 2, "inputs": []],
+            "tools": [["callId": "parked", "name": "read", "status": "running"]]]
+        tui.apply(workView(docs: ["pi.live": live], activity: .progressing))
+        #expect(tui.indicator != nil)
+        let task = DurableBlockedTask(id: try TaskID(2), kind: kind, reason: .restartLimit, restarts: 5)
+        let parked = workView(docs: ["pi.live": live], blocked: [task], activity: .parked)
+        tui.apply(parked)
+        #expect(parked.tasks == nil)
+        #expect(text(tui.tasks).isEmpty)
+        #expect(text(tui.status).contains("\(kind) #2: parked after 5 restarts; /retry 2 or /abort 2"))
+        #expect(tui.indicator == nil)
+        #expect(!text(tui.editor).contains("Working"))
+        #expect(!text(tui.editor).contains("Running read"))
+        #expect(try decodeLiveOf(parked.conversation).run?.taskId == TaskID(2))
+        let frame = renderLayoutFrame(root: tui.layoutRoot, width: 100, height: 24, requestRender: {})
+        let rendered = frame.lines.map(stripTerminalSequences).joined(separator: "\n")
+        #expect(rendered.contains("parked after 5 restarts"))
+        #expect(rendered.contains("/retry 2 or /abort 2"))
+    }
+
+    @Test(arguments: [
+        ("missing_task", "blocked: task definition is missing"),
+        ("task_too_old", "blocked: saved task version is too old"),
+        ("migration_failed", "blocked: task migration failed"),
+        ("restart_limit", "parked after 7 restarts")
+    ])
+    func blockedReasonsShowTextAndTaskActions(_ raw: String, _ expected: String) throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let reason = try #require(TaskBlockedReason(rawValue: raw))
+        let node: JSONValue = ["id": 2, "kind": "app.task", "conversationId": 1,
+            "background": false, "abortRequested": false, "state": ["status": "pending", "phase": "execute"],
+            "blocked": .string(raw), "conversations": []]
+        let decoded = try node.decode(TaskGraphNode.self)
+        let task = DurableBlockedTask(id: try TaskID(2), kind: "app.task", reason: reason, restarts: 7)
+        #expect(describeTask(decoded, blocked: task).contains(expected))
+        #expect(describeTask(decoded).contains(raw == "restart_limit" ? "parked at restart limit" : expected))
+        tui.apply(workView(docs: ["pi.live": ["run": ["taskId": 2, "inputs": []]]],
+            blocked: [task], activity: raw == "restart_limit" ? .parked : .blocked))
+        #expect(text(tui.status).contains(expected))
+        #expect(text(tui.status).contains("/retry 2 or /abort 2"))
+        #expect(tui.indicator == nil)
+        tui.apply(workView(graph: TaskGraph(tasks: ["2": decoded]), blocked: [task], activity: .blocked))
+        #expect(text(tui.tasks).contains("Tasks (1 live, /tasks to hide)"))
+        #expect(text(tui.tasks).contains(expected))
+        #expect(text(tui.tasks).contains("/retry 2 or /abort 2"))
+    }
+
+    @Test func independentProgressKeepsParkedAndBlockedTasksVisible() throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let parked = DurableBlockedTask(id: try TaskID(2), kind: "pi.tool", reason: .restartLimit, restarts: 5)
+        let blocked = DurableBlockedTask(id: try TaskID(3), kind: "app.task", reason: .missingTask)
+        tui.apply(workView(docs: ["pi.live": ["run": ["taskId": 4, "inputs": []]]],
+            blocked: [parked, blocked], activity: .progressing))
+        #expect(tui.indicator != nil)
+        #expect(text(tui.editor).contains("Working... (esc to abort)"))
+        #expect(text(tui.status).contains("pi.tool #2: parked after 5 restarts"))
+        #expect(text(tui.status).contains("/retry 2 or /abort 2"))
+        #expect(text(tui.status).contains("app.task #3: blocked: task definition is missing"))
+        #expect(text(tui.status).contains("/retry 3 or /abort 3"))
+        #expect(text(tui.tasks).isEmpty)
+        tui.apply(workView(blocked: [parked], activity: .progressing))
+        #expect(tui.indicator != nil)
+        #expect(text(tui.editor).contains("Working... (esc to abort)"))
+        #expect(text(tui.status).contains("/retry 2 or /abort 2"))
+    }
+
+    @Test func queuedInputsAfterFailedRunKeepModeContentAndWrites() throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let inputs = [InboxItem(id: try SubmissionID(8), mode: .steer, content: "Check the failure",
+                               inputEntry: InputEntry(kind: "app.request", data: ["ticket": 42])),
+                      InboxItem(id: try SubmissionID(9), mode: .followUp,
+                               content: [["type": "text", "text": "Then run tests"]])]
+        let failure: JSONObject = ["generation": ["attempt": 1, "message": answer("Request failed", stop: "error")]]
+        tui.apply(workView(docs: ["pi.live": failure,
+            "pi.inbox": ["items": [["id": 10, "mode": "write", "entry": ["kind": "app.note", "data": "Saved note"]]]]],
+            inputs: inputs))
+        let rendered = text(tui.queue)
+        #expect(rendered.contains("Queued inputs (no active run):"))
+        #expect(rendered.contains("[steer] <app.request> Check the failure"))
+        #expect(rendered.contains("ticket"))
+        #expect(rendered.contains("[followUp] Then run tests"))
+        #expect(try #require(rendered.range(of: "Check the failure")).lowerBound < #require(rendered.range(of: "Then run tests")).lowerBound)
+        #expect(rendered.contains("[write] <app.note>"))
+        #expect(rendered.contains("Saved note"))
+        #expect(tui.indicator == nil)
+    }
+
+    @Test func queueSummaryDoesNotDuplicateInboxInputs() throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let item = InboxItem(id: try SubmissionID(8), mode: .steer, content: "Queued once")
+        let inbox = try #require(JSONValue(encoding: InboxState(items: [item])).objectValue)
+        tui.apply(workView(docs: ["pi.inbox": inbox, "pi.live": ["run": ["taskId": 2, "inputs": []]]], inputs: [item]))
+        #expect(text(tui.queue).components(separatedBy: "Queued once").count == 2)
+        #expect(!text(tui.queue).contains("no active run"))
+    }
+
+    @Test func taskNoticesAndSessionFailureHaveDistinctText() throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let id = try TaskID(2)
+        let items: [Notice] = [
+            .init(id: 1, level: .warning, message: "Cut off 5 times", category: .taskParked, taskId: id, taskKind: "pi.tool"),
+            .init(id: 2, level: .error, message: "Tool failed", category: .taskFault, taskId: id, taskKind: "pi.tool"),
+            .init(id: 3, level: .warning, message: "Check runtime", category: .report, taskId: id, taskKind: "pi.tool"),
+            .init(id: 4, level: .error, message: "Storage failed", category: .sessionFailed)
+        ]
+        tui.apply(workView(notices: Array(items.prefix(3))))
+        #expect(tui.terminalState == nil)
+        #expect(!text(tui.notices).contains("Session failed"))
+        tui.apply(workView(notices: items))
+        let rendered = text(tui.notices)
+        #expect(rendered.contains("Task parked #2 (pi.tool): Cut off 5 times; /retry 2 or /abort 2"))
+        #expect(rendered.contains("Task fault #2 (pi.tool): Tool failed"))
+        #expect(rendered.contains("Runtime report #2 (pi.tool): Check runtime"))
+        #expect(rendered.contains("Session failed: Storage failed"))
+        #expect(describeNotice(.init(id: 5, level: .info, message: "Task waits", category: .taskParked)) == "Task parked: Task waits")
+    }
+
+    @Test(arguments: [DurableSessionTerminal.closed, .failed(message: "Storage failed")])
+    func terminalStatusWinsOverTaskActivityAndRetainedLiveWork(_ terminal: DurableSessionTerminal) throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let parked = DurableBlockedTask(id: try TaskID(2), kind: "pi.tool", reason: .restartLimit, restarts: 5)
+        let docs: [String: JSONObject] = ["pi.live": ["run": ["taskId": 3, "inputs": []]]]
+        tui.apply(workView(docs: docs, activity: .progressing))
+        #expect(tui.indicator != nil)
+        let items: [Notice] = terminal == .closed ? [] : [
+            .init(id: 1, level: .error, message: "Storage failed", category: .sessionFailed),
+            .init(id: 2, level: .error, message: "Storage failed", category: .taskFault, taskId: parked.id, taskKind: parked.kind)
+        ]
+        tui.apply(workView(docs: docs, blocked: [parked], activity: .progressing, notices: items, terminal: terminal))
+        #expect(tui.indicator == nil)
+        #expect(text(tui.status).isEmpty)
+        #expect(!text(tui.editor).contains("Working"))
+        if terminal == .closed { #expect(text(tui.notices).contains("Session closed")) }
+        else {
+            #expect(text(tui.notices).components(separatedBy: "Session failed: Storage failed").count == 2)
+            #expect(text(tui.notices).contains("Task fault #2 (pi.tool): Storage failed"))
+        }
+        tui.apply(workView(docs: docs, blocked: [parked], activity: .progressing))
+        #expect(tui.indicator == nil)
+        #expect(text(tui.status).isEmpty)
+    }
+}

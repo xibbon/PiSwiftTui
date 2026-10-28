@@ -3,6 +3,7 @@ import MiniTui
 import PiSwiftAI
 import PiSwiftChord
 import PiSwiftCodingAgent
+import PiSwiftCodingAgentDurable
 import PiSwiftDurable
 
 /// A filtered list that replaces the editor.
@@ -80,8 +81,36 @@ final class CompactionComponent: Box {
     }
 }
 
-func describeTask(_ node: TaskGraphNode) -> String {
-    let status: String
+func taskActions(_ id: TaskID) -> String {
+    "/retry \(id.rawValue) or /abort \(id.rawValue)"
+}
+
+func describeBlockedReason(_ reason: TaskBlockedReason, restarts: Double? = nil) -> String {
+    switch reason {
+    case .missingTask: "blocked: task definition is missing"
+    case .taskTooOld: "blocked: saved task version is too old"
+    case .migrationFailed: "blocked: task migration failed"
+    case .restartLimit:
+        restarts.map { "parked after \($0.formatted(.number.grouping(.never))) restarts" } ?? "parked at restart limit"
+    }
+}
+
+func describeNotice(_ notice: Notice) -> String {
+    let task = notice.taskId.map { " #\($0.rawValue)" } ?? ""
+    let kind = notice.taskKind.map { " (\($0))" } ?? ""
+    switch notice.category {
+    case .operation: return notice.message
+    case .report: return "Runtime report\(task)\(kind): \(notice.message)"
+    case .taskParked:
+        let actions = notice.taskId.map { "; " + taskActions($0) } ?? ""
+        return "Task parked\(task)\(kind): \(notice.message)\(actions)"
+    case .taskFault: return "Task fault\(task)\(kind): \(notice.message)"
+    case .sessionFailed: return "Session failed: \(notice.message)"
+    }
+}
+
+func describeTask(_ node: TaskGraphNode, blocked: DurableBlockedTask? = nil) -> String {
+    var status: String
     switch node.state {
     case .waiting(_, let on, _): status = "waiting on " + on.map { String($0.rawValue) }.joined(separator: ", ")
     case .sleeping(let phase, let until):
@@ -89,6 +118,9 @@ func describeTask(_ node: TaskGraphNode) -> String {
         status = "sleeping \(phase) until \(time)"
     case .completing(let outcome): status = "completing (\(outcome))"
     case .pending(let phase), .running(let phase): status = "\(node.state.status) \(phase)"
+    }
+    if let reason = blocked?.reason ?? node.blocked {
+        status = describeBlockedReason(reason, restarts: blocked?.restarts) + "; " + taskActions(node.id)
     }
     let flags = [node.background ? "background" : "", node.abortRequested ? "aborting" : ""].filter { !$0.isEmpty }
     let owned = node.conversations.isEmpty ? "" : " owns conversation " + node.conversations.map { String($0.rawValue) }.joined(separator: ", ")
