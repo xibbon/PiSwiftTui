@@ -1150,6 +1150,8 @@ private func decodeUsage(_ dict: [String: Any]) -> Usage {
         usage.cost.cacheRead = cost["cacheRead"] as? Double ?? 0
         usage.cost.cacheWrite = cost["cacheWrite"] as? Double ?? 0
         usage.cost.total = cost["total"] as? Double ?? 0
+        // v1.5.2 A-COST: whether the total is what the provider billed (absent: an estimate).
+        usage.cost.totalFromProvider = cost["totalFromProvider"] as? Bool
     }
     return usage
 }
