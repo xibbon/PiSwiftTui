@@ -4,6 +4,14 @@ import Foundation
 import PiSwiftCodingAgent
 import Synchronization
 
+private func pt3SignalTrace(_ message: String) {
+    guard ProcessInfo.processInfo.environment["PT3_SIGNAL_TRACE"] == "1" else { return }
+    let line = String(format: "%.6f %@\n", Date().timeIntervalSince1970, message)
+    line.withCString { pointer in
+        _ = Darwin.write(STDERR_FILENO, pointer, strlen(pointer))
+    }
+}
+
 /// The CLI owns its session. Taking it from the lock makes every exit path dispose it once.
 final class SessionRunLifecycle: Sendable {
     private struct State {
@@ -35,13 +43,24 @@ final class SessionRunLifecycle: Sendable {
             guard let value = current.session else { return nil }
             current.session = nil
             let shutdown = Task {
+                pt3SignalTrace("lifecycle abort begin")
                 await value.abort()
+                pt3SignalTrace("lifecycle abort end; hook begin")
                 if let hookRunner = value.hookRunner {
                     _ = await hookRunner.emit(SessionShutdownEvent())
                 }
+                pt3SignalTrace("lifecycle hook end; custom tools begin")
                 await value.emitCustomToolSessionEvent(.shutdown)
+                pt3SignalTrace("lifecycle custom tools end; dispose begin")
+                let registry = value.modelRegistry
                 value.dispose()
+                pt3SignalTrace("lifecycle dispose end; credentials begin")
+                // v1.5.2 b2cb62923: a refresh may already have replaced a credential.
+                // Wait for its disk write before ending the process-wide shells.
+                await registry.settleCredentialWrites()
+                pt3SignalTrace("lifecycle credentials end; shells begin")
                 killTrackedDetachedChildren()
+                pt3SignalTrace("lifecycle shells end")
             }
             current.shutdown = shutdown
             return shutdown
@@ -62,19 +81,33 @@ func registerNonInteractiveSignalHandlers(onSignal: @escaping @Sendable () async
         signal(entry.signal, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: entry.signal, queue: signalQueue)
         source.setEventHandler {
+            let deliveries = max(1, Int(source.data))
+            pt3SignalTrace("signal callback signal=\(entry.signal) data=\(deliveries)")
             let count = signalCount.withLock { value in
-                value += 1
+                // A dispatch source can report several deliveries in one callback.
+                value += deliveries
                 return value
             }
+            pt3SignalTrace("signal callback count=\(count)")
+            if count == 1, let marker = ProcessInfo.processInfo.environment["PT3_FIRST_SIGNAL"] {
+                try? Data("handled".utf8).write(to: URL(fileURLWithPath: marker))
+            }
             if count > 1 {
+                pt3SignalTrace("forced exit shells begin")
                 killTrackedDetachedChildren()
+                pt3SignalTrace("forced exit restore begin")
                 restoreStdoutAfterMachineReadableOutput()
+                pt3SignalTrace("forced exit call code=\(entry.exitCode)")
                 Darwin.exit(entry.exitCode)
             }
             Task {
+                pt3SignalTrace("first signal lifecycle begin")
                 await onSignal()
+                pt3SignalTrace("first signal lifecycle end; shells begin")
                 killTrackedDetachedChildren()
+                pt3SignalTrace("first signal restore begin")
                 restoreStdoutAfterMachineReadableOutput()
+                pt3SignalTrace("first signal exit call code=\(entry.exitCode)")
                 Darwin.exit(entry.exitCode)
             }
         }

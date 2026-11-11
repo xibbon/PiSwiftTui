@@ -72,6 +72,17 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         markCodingAgentEnvironment()
         time("start")
 
+        guard let cwdPointer = getcwd(nil, 0) else {
+            let code = errno
+            if code == ENOENT {
+                fputs("Error: The current working directory no longer exists. Change to an existing directory and try again.\n", stderr)
+                Darwin.exit(1)
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        let cwd = String(cString: cwdPointer)
+        free(cwdPointer)
+
         let migrationResult = runMigrations()
         let migratedProviders = migrationResult.migratedAuthProviders
         time("runMigrations")
@@ -84,7 +95,6 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         let appMode = resolveAppMode(parsed, stdinIsTTY: stdinIsTTY, stdoutIsTTY: stdoutIsTTY)
         let isInteractive = appMode == .interactive
 
-        let cwd = FileManager.default.currentDirectoryPath
         let agentDir = getAgentDir()
         let startupSettingsManager = SettingsManager.create(cwd, agentDir, projectTrusted: false)
         let startupSettingsDiagnostics = collectSettingsDiagnostics(startupSettingsManager)
@@ -217,7 +227,20 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 resolvedSessionDirArgs.sessionDir = settingsDir
             }
         }
-        let sessionManager = try createSessionManager(resolvedSessionDirArgs, cwd: cwd, resumeSession: resumeSession)
+        var selectedSessionManager = try createSessionManager(resolvedSessionDirArgs, cwd: cwd, resumeSession: resumeSession)
+        if let issue = getMissingSessionCwdIssue(selectedSessionManager, fallbackCwd: cwd),
+           issue.sessionFile != nil {
+            if isInteractive {
+                let choice = await selectMissingSessionCwd(issue, settingsManager: startupSettingsManager)
+                guard let opened = try openMissingSessionCwdChoice(choice, issue: issue,
+                    sessionDir: resolvedSessionDirArgs.sessionDir) else { return }
+                selectedSessionManager = opened
+            } else {
+                fputs(issue.errorMessage + "\n", stderr)
+                Darwin.exit(1)
+            }
+        }
+        let sessionManager = selectedSessionManager
         if let name = cli.sessionName.flatMap(normalizeSessionName) {
             sessionManager.appendSessionInfo(name)
         }
@@ -244,6 +267,10 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             }
         }
         defer {
+            if !isInteractive {
+                fflush(stdout)
+                restoreStdoutAfterMachineReadableOutput()
+            }
             if !nonInteractiveSignalSources.isEmpty {
                 unregisterNonInteractiveSignalHandlers(nonInteractiveSignalSources)
             }
@@ -720,6 +747,9 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                     tuiMode: cli.parsedTuiModeOverride,
                     startupDiagnostics: startupDiagnostics,
                     initialThemeSetting: cli.useTheme,
+                    shutdownSession: {
+                        await sessionLifecycle.shutdownAndDispose()
+                    },
                     exitProcess: { status in
                         sessionLifecycle.disposeOnce()
                         Darwin.exit(status)

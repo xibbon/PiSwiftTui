@@ -392,8 +392,12 @@ public final class InteractiveMode {
     private var sigcontSource: DispatchSourceSignal?
     private var isShuttingDown = false
     private var hasExitedForTerminalError = false
+    private var sessionWriteWarning: String?
+    private var sessionWriteWarningSessionID: String?
     /// The CLI exits the process. Tests can record the status instead.
     var exitProcess: @MainActor (Int32) -> Void = { Darwin.exit($0) }
+    private var shutdownSession: (@MainActor () async -> Void)?
+    private var shutdownSignalCount = 0
     /// v0.70.5: signal sources for SIGHUP/SIGTERM that drive a clean shutdown so extensions
     /// receive `session_shutdown` and detached children get killed before the process exits.
     private var shutdownSignalSources: [DispatchSourceSignal] = []
@@ -423,6 +427,7 @@ public final class InteractiveMode {
         startupDiagnostics: [ResourceDiagnostic] = [],
         initialThemeSetting: String? = nil,
         terminal: Terminal? = nil,
+        shutdownSession: (@MainActor () async -> Void)? = nil,
         exitProcess: @escaping @MainActor (Int32) -> Void = { Darwin.exit($0) }
     ) {
         self.init(
@@ -435,6 +440,7 @@ public final class InteractiveMode {
         self.initialThemeSetting = initialThemeSetting
         self.injectedTerminal = terminal
         self.exitProcess = exitProcess
+        self.shutdownSession = shutdownSession
         self.session = session
         self.version = version
         self.changelogMarkdown = changelogMarkdown
@@ -1231,6 +1237,9 @@ public final class InteractiveMode {
                 guard let self else { return HookCommandResult(cancelled: true) }
                 return await self.handleHookNavigateTree(targetId, options: options)
             },
+            reloadHandler: { [weak self] in
+                await self?.handleReloadCommand()
+            },
             isIdle: { [weak session] in
                 session?.isIdle ?? false
             },
@@ -1332,18 +1341,20 @@ public final class InteractiveMode {
     @MainActor
     private func handleHookNavigateTree(_ targetId: String, options: HookNavigateTreeOptions?) async -> HookCommandResult {
         guard let session else { return HookCommandResult(cancelled: true) }
-        guard !session.isCompacting else { return HookCommandResult(cancelled: true) }
         if options?.summarize == true { setTransientStatus("Summarizing branch") }
         defer { if transientStatusMessage == "Summarizing branch" { setTransientStatus(nil) } }
 
-        let result = await session.navigateTree(
+        let result: (editorText: String?, cancelled: Bool, aborted: Bool?, summaryEntry: BranchSummaryEntry?)
+        do { result = try await session.navigateTreeChecked(
             targetId,
             summarize: options?.summarize ?? false,
             customInstructions: options?.customInstructions,
             replaceInstructions: options?.replaceInstructions,
             label: options?.label
-        )
-        guard !session.isCompacting else { return HookCommandResult(cancelled: true) }
+        ) } catch {
+            showError(error.localizedDescription)
+            return HookCommandResult(cancelled: true)
+        }
         if result.cancelled {
             return HookCommandResult(cancelled: true)
         }
@@ -2167,6 +2178,22 @@ public final class InteractiveMode {
                 showError("Retry failed after \(attempt) attempts: \(finalError ?? "Unknown error")")
             }
         }
+        reportSessionWriteErrorOnce()
+    }
+
+    @MainActor
+    private func reportSessionWriteErrorOnce() {
+        guard let session else { return }
+        let id = session.sessionManager.getSessionId()
+        if sessionWriteWarningSessionID != id {
+            sessionWriteWarningSessionID = id
+            sessionWriteWarning = nil
+        }
+        guard sessionWriteWarning == nil,
+              let error = session.sessionManager.getLastWriteError() else { return }
+        let message = "Session file could not be written: \(error)"
+        sessionWriteWarning = message
+        showWarning(message)
     }
 
     /// The `/bug` hint is shown at most once per session so error output stays readable.
@@ -2353,6 +2380,10 @@ public final class InteractiveMode {
     func renderInitialMessages(entries suppliedEntries: [SessionEntry]? = nil) {
         altScreenRenderer?.resetTextSelection()
         guard let session, let tui else { return }
+        if sessionWriteWarningSessionID != session.sessionManager.getSessionId() {
+            sessionWriteWarningSessionID = session.sessionManager.getSessionId()
+            sessionWriteWarning = nil
+        }
         let resourceOptions = pendingResourceDisplayOptions
         pendingResourceDisplayOptions = nil
         chatContainer.clear()
@@ -2432,6 +2463,8 @@ public final class InteractiveMode {
             let times = compactionCount == 1 ? "1 time" : "\(compactionCount) times"
             showStatus("Session compacted \(times)")
         }
+
+        if let sessionWriteWarning { showWarning(sessionWriteWarning) }
 
         scheduleRender()
     }
@@ -3067,14 +3100,15 @@ public final class InteractiveMode {
         loadingAnimation = nil
         clearWorkingIndicator()
         if !fromSignal { tui?.terminal.setProgress(false) }
-        unregisterShutdownSignalHandlers()
-
         if fromSignal {
-            killTrackedDetachedChildren()
-            await emitSessionShutdownEvents()
+            if let shutdownSession {
+                await shutdownSession()
+            } else {
+                await emitSessionShutdownEvents()
+                killTrackedDetachedChildren()
+            }
             guard !hasExitedForTerminalError else { return }
             tui?.terminal.setProgress(false)
-            themeController?.dispose()
         }
 
         unsubscribeFromAgent()
@@ -3092,9 +3126,14 @@ public final class InteractiveMode {
         guard !hasExitedForTerminalError else { return }
 
         if !fromSignal {
-            await emitSessionShutdownEvents()
+            if let shutdownSession {
+                await shutdownSession()
+            } else {
+                await emitSessionShutdownEvents()
+            }
         }
         guard !hasExitedForTerminalError else { return }
+        unregisterShutdownSignalHandlers()
         tui?.setIOErrorHandler(nil)
 
         if let continuation = exitContinuation {
@@ -3209,7 +3248,13 @@ public final class InteractiveMode {
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             source.setEventHandler { [weak self] in
                 Task { @MainActor in
-                    await self?.performShutdown(fromSignal: true)
+                    guard let self else { return }
+                    self.shutdownSignalCount += 1
+                    if self.shutdownSignalCount > 1 {
+                        self.exitProcess(sig == SIGHUP ? 129 : 143)
+                    } else if !self.isShuttingDown {
+                        await self.performShutdown(fromSignal: true)
+                    }
                 }
             }
             source.resume()
@@ -4473,9 +4518,9 @@ public final class InteractiveMode {
                     done()
                     Task {
                         guard let self else { return }
-                        guard !session.isCompacting else { return }
-                        let result = await session.navigateTree(entryId, summarize: false, customInstructions: nil)
-                        guard !session.isCompacting else { return }
+                        let result: (editorText: String?, cancelled: Bool, aborted: Bool?, summaryEntry: BranchSummaryEntry?)
+                        do { result = try await session.navigateTreeChecked(entryId, summarize: false, customInstructions: nil) }
+                        catch { self.showError(error.localizedDescription); return }
                         if result.cancelled {
                             self.showStatus("Navigation cancelled")
                             return
@@ -5399,7 +5444,13 @@ public final class InteractiveMode {
             self.ui.requestRender()
         }
 
-        await session.reload()
+        do {
+            try await session.reloadChecked()
+        } catch {
+            restoreEditor(previousEditor)
+            showWarning(error.localizedDescription)
+            return
+        }
         let extensionResult = await session.reloadExtensions()
         refreshHostSettingsAfterReload()
         setWorkingMessage(nil)
