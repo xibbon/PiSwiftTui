@@ -9,7 +9,10 @@ private let OSC133_ZONE_FINAL = "\u{001B}]133;C\u{0007}"
 public final class UserMessageComponent: Container {
     public init(
         text: String,
-        markdownConfiguration: InteractiveTuiConfiguration = InteractiveTuiConfiguration()
+        markdownConfiguration: InteractiveTuiConfiguration = InteractiveTuiConfiguration(),
+        markdownRunner: HookRunner? = nil,
+        messageId: String? = nil,
+        messageTimestamp: String? = nil
     ) {
         super.init()
         addChild(Spacer(1))
@@ -17,13 +20,15 @@ public final class UserMessageComponent: Container {
             color: { theme.fg(.userMessageText, $0) },
             bgColor: { theme.bg(.userMessageBg, $0) }
         )
+        let transforms = hostMarkdownTransform(runner: markdownRunner, type: .user,
+            messageId: messageId, timestamp: messageTimestamp).map { [$0] } ?? []
         addChild(Markdown(
             text,
             paddingX: markdownConfiguration.outputPad,
             paddingY: 1,
             theme: getMarkdownTheme(),
             defaultTextStyle: style,
-            options: MarkdownOptions(renderLatex: markdownConfiguration.latexEnabled)
+            options: MarkdownOptions(renderLatex: markdownConfiguration.latexEnabled, sourceTransforms: transforms)
         ))
     }
 

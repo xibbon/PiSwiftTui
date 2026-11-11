@@ -43,6 +43,7 @@ public final class ToolExecutionComponent: Container, OutputPaddingSetting {
     private var isPartial = true
     private var executionStarted = false
     private var argsComplete = false
+    private var argsPending = false
     private let renderers: ToolRenderers?
     private let ui: TUI
     private let cwd: String
@@ -96,11 +97,13 @@ public final class ToolExecutionComponent: Container, OutputPaddingSetting {
             executionStarted: executionStarted, argsComplete: argsComplete,
             isPartial: isPartial, expanded: expanded, showImages: showImages,
             isError: result?.isError ?? false,
-            durationMs: isPartial ? nil : result?.durationMs, outputPad: outputPad
+            durationMs: isPartial ? nil : result?.durationMs, outputPad: outputPad,
+            keybindingHints: hostKeybindingHints()
         )
     }
 
     public override func render(width: Int) -> [String] {
+        if argsPending { updateDisplay() }
         if hideComponent { return [] }
         if renderers != nil, renderShell == .self {
             let contentLines = selfRenderContainer.render(width: width)
@@ -127,7 +130,8 @@ public final class ToolExecutionComponent: Container, OutputPaddingSetting {
 
     public func updateArgs(_ args: [String: AnyCodable]) {
         self.args = args
-        updateDisplay()
+        argsPending = true
+        ui.requestRender()
     }
 
     public func markExecutionStarted() {
@@ -217,6 +221,7 @@ public final class ToolExecutionComponent: Container, OutputPaddingSetting {
     }
 
     private func updateDisplay() {
+        argsPending = false
         guard !updatingDisplay else { displayInvalidated = true; return }
         updatingDisplay = true
         defer {

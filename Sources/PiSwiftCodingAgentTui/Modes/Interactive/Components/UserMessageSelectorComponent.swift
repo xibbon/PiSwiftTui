@@ -9,6 +9,7 @@ private struct UserMessageItem {
 }
 
 private final class UserMessageList: Component {
+    var capturesViewportInput: Bool { true }
     private let messages: [UserMessageItem]
     private var selectedIndex: Int
     var onSelect: ((String) -> Void)?
@@ -57,6 +58,11 @@ private final class UserMessageList: Component {
     }
 
     func handleInput(_ keyData: String) {
+        if let index = getSelectPageIndex(keybindings: getKeybindings(), data: keyData, selectedIndex: selectedIndex, itemCount: messages.count, pageSize: maxVisible) {
+            guard !messages.isEmpty else { return }
+            selectedIndex = index
+            return
+        }
         if isArrowUp(keyData) {
             selectedIndex = selectedIndex == 0 ? messages.count - 1 : selectedIndex - 1
             return
@@ -78,6 +84,8 @@ private final class UserMessageList: Component {
 }
 
 public final class UserMessageSelectorComponent: Container {
+    public override var capturesViewportInput: Bool { true }
+    public override func handleInput(_ data: String) { messageList.handleInput(data) }
     private let messageList: UserMessageList
 
     public init(messages: [(id: String, text: String, timestamp: String?)], onSelect: @escaping (String) -> Void, onCancel: @escaping () -> Void) {

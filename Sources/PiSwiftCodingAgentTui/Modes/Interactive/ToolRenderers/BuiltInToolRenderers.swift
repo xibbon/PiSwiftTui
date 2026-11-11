@@ -31,12 +31,21 @@ private func builtInToolRenderers(_ toolName: String, _ definition: CustomTool?,
 private func applyingRendererSlots(_ value: CustomToolRenderers, to builtIn: ToolRenderers?) -> ToolRenderers {
     var merged = builtIn ?? ToolRenderers()
     if let shell = value.renderShell { merged.renderShell = shell }
-    if let call = value.renderCall {
+    if let call = value.renderCallWithContext {
+        merged.renderCall = { args, theme, context in
+            try call(args, theme, HookToolRenderContext(keybindingHints: context.keybindingHints)) as? Component ?? Text("", paddingX: 0, paddingY: 0)
+        }
+    } else if let call = value.renderCall {
         merged.renderCall = { args, theme, _ in
             try call(args, theme) as? Component ?? Text("", paddingX: 0, paddingY: 0)
         }
     }
-    if let result = value.renderResult {
+    if let result = value.renderResultWithContext {
+        merged.renderResult = { value, options, theme, context in
+            let options = RenderResultOptions(expanded: options.expanded, isPartial: options.isPartial, durationMs: context.durationMs, outputPad: context.outputPad)
+            return try result(value, options, theme, HookToolRenderContext(keybindingHints: context.keybindingHints)) as? Component ?? Text("", paddingX: 0, paddingY: 0)
+        }
+    } else if let result = value.renderResult {
         merged.renderResult = { value, options, theme, context in
             let options = RenderResultOptions(expanded: options.expanded, isPartial: options.isPartial, durationMs: context.durationMs, outputPad: context.outputPad)
             return try result(value, options, theme) as? Component ?? Text("", paddingX: 0, paddingY: 0)

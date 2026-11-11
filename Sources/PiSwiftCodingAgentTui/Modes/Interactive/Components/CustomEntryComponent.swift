@@ -41,7 +41,7 @@ public final class CustomEntryComponent: Container, OutputPaddingSetting {
             self.renderedComponent = nil
         }
         guard let renderer,
-              let component = renderer(entry, EntryRenderOptions(expanded: expanded), theme) as? Component
+              let component = renderer(entry, EntryRenderOptions(expanded: expanded, keybindingHints: hostKeybindingHints()), theme) as? Component
         else {
             return
         }

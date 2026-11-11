@@ -696,7 +696,9 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 print("Migrated auth providers: \(list)")
             }
 
-            if let modelScope = startupModelScopeMessage(
+            let startupMode = InteractiveTuiConfiguration(settingsManager: settingsManager,
+                modeOverride: cli.parsedTuiModeOverride).mode
+            if startupMode != .fullscreen, let modelScope = startupModelScopeMessage(
                 scopedModels, quietStartup: settingsManager.getQuietStartup(), verbose: parsed.verbose == true
             ) {
                 print(modelScope)
@@ -1100,6 +1102,11 @@ private func getChangelogForDisplay(_ parsed: Args, _ settingsManager: SettingsM
         settingsManager.setLastChangelogVersion(VERSION)
         return nil
     } else if let lastVersion {
+        if lastVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+            .range(of: #"^v?\d+\.\d+\.\d+"#, options: .regularExpression) == nil {
+            settingsManager.setLastChangelogVersion(VERSION)
+            return nil
+        }
         let newEntries = getNewEntries(entries, lastVersion: lastVersion)
         if !newEntries.isEmpty {
             settingsManager.setLastChangelogVersion(VERSION)

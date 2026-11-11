@@ -83,7 +83,9 @@ public func createCodemodeRenderers() -> ToolRenderers {
         component.addChild(Text(title, paddingX: 0, paddingY: 0))
         if !code.isEmpty {
             let normalized = normalizeDisplayText(code).replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
-            let highlighted = highlightCode(replaceTabs(normalized), lang: "javascript").joined(separator: "\n")
+            let highlighter = context.state.values["codemodeScriptHighlighter"] as? ToolCodeHighlighter ?? ToolCodeHighlighter()
+            context.state.values["codemodeScriptHighlighter"] = highlighter
+            let highlighted = highlighter.highlight(replaceTabs(normalized), lang: "javascript").joined(separator: "\n")
             if context.expanded {
                 component.addChild(Text(highlighted, paddingX: 0, paddingY: 0))
             } else {

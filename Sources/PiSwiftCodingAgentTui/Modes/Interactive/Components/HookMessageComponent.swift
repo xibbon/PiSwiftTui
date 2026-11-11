@@ -10,12 +10,20 @@ public final class HookMessageComponent: Container, OutputPaddingSetting {
     private var customComponent: Component?
     private var expanded = false
     private var outputPad: Int
+    private let markdownRunner: HookRunner?
+    private let messageId: String?
+    private let messageTimestamp: String?
 
-    public init(message: HookMessage, customRenderer: HookMessageRenderer? = nil, outputPad: Int = 1) {
+    public init(message: HookMessage, customRenderer: HookMessageRenderer? = nil, outputPad: Int = 1,
+                markdownRunner: HookRunner? = nil, messageId: String? = nil,
+                messageTimestamp: String? = nil) {
         self.message = message
         self.customRenderer = customRenderer
         self.box = Box(paddingX: outputPad, paddingY: 1, bgFn: { theme.bg(.customMessageBg, $0) })
         self.outputPad = outputPad
+        self.markdownRunner = markdownRunner
+        self.messageId = messageId
+        self.messageTimestamp = messageTimestamp
         super.init()
 
         addChild(Spacer(1))
@@ -47,7 +55,7 @@ public final class HookMessageComponent: Container, OutputPaddingSetting {
         removeChild(box)
 
         if let customRenderer {
-            let rendered = customRenderer(message, HookMessageRenderOptions(expanded: expanded, outputPad: outputPad), theme)
+            let rendered = customRenderer(message, HookMessageRenderOptions(expanded: expanded, outputPad: outputPad, keybindingHints: hostKeybindingHints()), theme)
             if let component = rendered as? Component {
                 customComponent = component
                 addChild(component)
@@ -76,15 +84,10 @@ public final class HookMessageComponent: Container, OutputPaddingSetting {
             }.joined(separator: "\n")
         }
 
-        var displayText = text
-        if !expanded {
-            let lines = displayText.split(separator: "\n", omittingEmptySubsequences: false)
-            if lines.count > 5 {
-                displayText = lines.prefix(5).joined(separator: "\n") + "\n..."
-            }
-        }
-
         let style = DefaultTextStyle(color: { theme.fg(.customMessageText, $0) })
-        box.addChild(Markdown(displayText, paddingX: 0, paddingY: 0, theme: getMarkdownTheme(), defaultTextStyle: style))
+        let transforms = hostMarkdownTransform(runner: markdownRunner, type: .custom,
+            messageId: messageId, timestamp: messageTimestamp).map { [$0] } ?? []
+        box.addChild(Markdown(text, paddingX: 0, paddingY: 0, theme: getMarkdownTheme(),
+            defaultTextStyle: style, options: MarkdownOptions(sourceTransforms: transforms)))
     }
 }

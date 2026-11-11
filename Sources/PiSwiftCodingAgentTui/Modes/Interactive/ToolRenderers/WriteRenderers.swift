@@ -4,7 +4,7 @@ import PiSwiftAI
 import PiSwiftAgent
 import PiSwiftCodingAgent
 
-private struct WriteHighlightCache {
+struct WriteHighlightCache {
     var rawPath: String?
     var lang: String
     var rawContent: String
@@ -12,8 +12,9 @@ private struct WriteHighlightCache {
     var highlightedLines: [String]
 }
 
-private final class WriteCallRenderComponent: Text {
+final class WriteCallRenderComponent: Text {
     var cache: WriteHighlightCache?
+    let highlighter = ToolCodeHighlighter()
     init() { super.init("", paddingX: 0, paddingY: 0) }
 }
 
@@ -27,7 +28,7 @@ private func highlightWriteLine(_ line: String, lang: String) -> String {
     highlightCode(line, lang: lang).first ?? ""
 }
 
-private func updateWriteHighlightCache(_ old: WriteHighlightCache?, rawPath: String?, content: String) -> WriteHighlightCache? {
+private func updateWriteHighlightCache(_ old: WriteHighlightCache?, rawPath: String?, content: String, highlighter: ToolCodeHighlighter) -> WriteHighlightCache? {
     guard let rawPath, !rawPath.isEmpty, let lang = getLanguageFromPath(rawPath) else { return nil }
     guard var cache = old, cache.lang == lang, cache.rawPath == rawPath, content.utf8.starts(with: cache.rawContent.utf8) else {
         return rebuildWriteHighlightCache(rawPath, content: content)
@@ -48,7 +49,7 @@ private func updateWriteHighlightCache(_ old: WriteHighlightCache?, rawPath: Str
         cache.highlightedLines.append(highlightWriteLine(segment, lang: lang))
     }
     let prefixCount = min(50, cache.normalizedLines.count)
-    let prefix = highlightCode(cache.normalizedLines.prefix(prefixCount).joined(separator: "\n"), lang: lang)
+    let prefix = highlighter.highlight(cache.normalizedLines.prefix(prefixCount).joined(separator: "\n"), lang: lang)
     for index in 0..<prefixCount {
         cache.highlightedLines[index] = index < prefix.count ? prefix[index] : highlightWriteLine(cache.normalizedLines[index], lang: lang)
     }
@@ -61,8 +62,8 @@ public func createWriteRenderers() -> ToolRenderers {
         let rawPath = str(toolPathArgument(args))
         let content = str(args["content"])
         let component = context.lastComponent as? WriteCallRenderComponent ?? WriteCallRenderComponent()
-        if let content {
-            component.cache = context.argsComplete ? rebuildWriteHighlightCache(rawPath, content: content) : updateWriteHighlightCache(component.cache, rawPath: rawPath, content: content)
+        if let content, !context.argsComplete {
+            component.cache = updateWriteHighlightCache(component.cache, rawPath: rawPath, content: content, highlighter: component.highlighter)
         } else {
             component.cache = nil
         }
@@ -72,7 +73,7 @@ public func createWriteRenderers() -> ToolRenderers {
                 let lang = rawPath.flatMap { $0.isEmpty ? nil : getLanguageFromPath($0) }
                 let rendered: [String]
                 if let lang {
-                    rendered = component.cache?.highlightedLines ?? highlightCode(replaceTabs(normalizeDisplayText(content)), lang: lang)
+                    rendered = component.cache?.highlightedLines ?? component.highlighter.highlight(replaceTabs(normalizeDisplayText(content)), lang: lang)
                 } else {
                     rendered = normalizeDisplayText(content).components(separatedBy: "\n")
                 }

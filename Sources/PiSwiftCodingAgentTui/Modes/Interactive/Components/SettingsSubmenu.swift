@@ -4,12 +4,15 @@ import PiSwiftCodingAgent
 @MainActor
 func isSelectNavigation(_ data: String) -> Bool {
     let kb = getKeybindings()
-    return [TUIKeybinding.selectUp, TUIKeybinding.selectDown, TUIKeybinding.selectConfirm, TUIKeybinding.selectCancel]
+    return [TUIKeybinding.selectUp, TUIKeybinding.selectDown,
+            TUIKeybinding.selectPageUp, TUIKeybinding.selectPageDown,
+            TUIKeybinding.selectConfirm, TUIKeybinding.selectCancel]
         .contains { kb.matches(data, $0) }
 }
 
 @MainActor
 public final class SelectSubmenu: Container, MouseFocusOwner, SystemCursorAware, Focusable {
+    public override var capturesViewportInput: Bool { true }
     public var usesSystemCursor: Bool {
         get { searchInput?.usesSystemCursor ?? false }
         set { searchInput?.usesSystemCursor = newValue }
@@ -96,6 +99,7 @@ public struct SteppedSubmenuStep {
 
 @MainActor
 public final class SteppedSubmenu: Container, MouseFocusOwner, SystemCursorAware, Focusable {
+    public override var capturesViewportInput: Bool { active?.capturesViewportInput ?? false }
     public var usesSystemCursor = false { didSet { active?.usesSystemCursor = usesSystemCursor } }
     public var focused = false { didSet { active?.focused = focused } }
     private let steps: [SteppedSubmenuStep]

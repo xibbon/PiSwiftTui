@@ -321,6 +321,7 @@ private func relativePath(from baseDir: String, to fullPath: String) -> String {
 }
 
 private final class ResourceList: Component, SystemCursorAware {
+    var capturesViewportInput: Bool { true }
     private var groups: [ResourceGroup]
     private var projectMode: Bool
     private var flatItems: [FlatEntry] = []
@@ -500,7 +501,8 @@ private final class ResourceList: Component, SystemCursorAware {
             return
         }
         if kb.matches(data, TUIKeybinding.selectPageUp) {
-            var target = max(0, selectedIndex - maxVisible)
+            guard !filteredItems.isEmpty else { return }
+            var target = getSelectPageIndex(keybindings: kb, data: data, selectedIndex: selectedIndex, itemCount: filteredItems.count, pageSize: maxVisible) ?? selectedIndex
             while target < filteredItems.count, !filteredItems[target].isItem {
                 target += 1
             }
@@ -510,7 +512,8 @@ private final class ResourceList: Component, SystemCursorAware {
             return
         }
         if kb.matches(data, TUIKeybinding.selectPageDown) {
-            var target = min(filteredItems.count - 1, selectedIndex + maxVisible)
+            guard !filteredItems.isEmpty else { return }
+            var target = getSelectPageIndex(keybindings: kb, data: data, selectedIndex: selectedIndex, itemCount: filteredItems.count, pageSize: maxVisible) ?? selectedIndex
             while target >= 0, !filteredItems[target].isItem {
                 target -= 1
             }
@@ -689,6 +692,8 @@ private final class ResourceList: Component, SystemCursorAware {
 }
 
 public final class ConfigSelectorComponent: Container {
+    public override var capturesViewportInput: Bool { true }
+    public override func handleInput(_ data: String) { resourceList.handleInput(data) }
     private let resourceList: ResourceList
     private let header: ConfigSelectorHeader
     private var projectMode: Bool

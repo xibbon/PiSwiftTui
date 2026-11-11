@@ -27,8 +27,9 @@ public struct ToolRenderContext {
     public var durationMs: Int?
     public var outputPad: Int
     public var isError: Bool
+    public var keybindingHints: HookKeybindingHints
 
-    public init(args: [String: AnyCodable] = [:], toolCallId: String = "", invalidate: @escaping () -> Void = {}, lastComponent: Component? = nil, state: ToolRenderState = ToolRenderState(), cwd: String = FileManager.default.currentDirectoryPath, executionStarted: Bool = false, argsComplete: Bool = false, isPartial: Bool = true, expanded: Bool = false, showImages: Bool = true, isError: Bool = false, durationMs: Int? = nil, outputPad: Int = 1) {
+    public init(args: [String: AnyCodable] = [:], toolCallId: String = "", invalidate: @escaping () -> Void = {}, lastComponent: Component? = nil, state: ToolRenderState = ToolRenderState(), cwd: String = FileManager.default.currentDirectoryPath, executionStarted: Bool = false, argsComplete: Bool = false, isPartial: Bool = true, expanded: Bool = false, showImages: Bool = true, isError: Bool = false, durationMs: Int? = nil, outputPad: Int = 1, keybindingHints: HookKeybindingHints = .init()) {
         self.args = args
         self.toolCallId = toolCallId
         self.invalidate = invalidate
@@ -43,6 +44,7 @@ public struct ToolRenderContext {
         self.isError = isError
         self.durationMs = durationMs
         self.outputPad = outputPad
+        self.keybindingHints = keybindingHints
     }
 }
 

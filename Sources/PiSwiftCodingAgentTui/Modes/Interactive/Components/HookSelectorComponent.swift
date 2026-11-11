@@ -3,6 +3,7 @@ import MiniTui
 import PiSwiftCodingAgent
 
 public final class HookSelectorComponent: Container {
+    public override var capturesViewportInput: Bool { true }
     private let options: [String]
     private var selectedIndex = 0
     private let listContainer: Container
@@ -43,23 +44,36 @@ public final class HookSelectorComponent: Container {
 
     private func updateList() {
         listContainer.clear()
-        for (index, option) in options.enumerated() {
+        let maxVisible = 10
+        let start = max(0, min(selectedIndex - maxVisible / 2, options.count - maxVisible))
+        let end = min(start + maxVisible, options.count)
+        for index in start..<end {
+            let option = options[index]
             let isSelected = index == selectedIndex
             let line = isSelected
                 ? theme.fg(.accent, "→ ") + theme.fg(.accent, option)
                 : "  \(theme.fg(.text, option))"
             listContainer.addChild(Text(line, paddingX: 1, paddingY: 0))
         }
+        if start > 0 || end < options.count {
+            listContainer.addChild(Text(theme.fg(.muted, "  (\(selectedIndex + 1)/\(options.count))"), paddingX: 0, paddingY: 0))
+        }
     }
 
     public override func handleInput(_ keyData: String) {
+        if let index = getSelectPageIndex(keybindings: getKeybindings(), data: keyData,
+            selectedIndex: selectedIndex, itemCount: options.count, pageSize: 10) {
+            selectedIndex = index
+            updateList()
+            return
+        }
         if isArrowUp(keyData) || keyData == "k" {
             selectedIndex = max(0, selectedIndex - 1)
             updateList()
             return
         }
         if isArrowDown(keyData) || keyData == "j" {
-            selectedIndex = min(options.count - 1, selectedIndex + 1)
+            selectedIndex = min(max(0, options.count - 1), selectedIndex + 1)
             updateList()
             return
         }

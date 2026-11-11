@@ -14,6 +14,9 @@ private final class TreeList: Component {
     private var filteredNodes: [FlatNode]
     private var selectedIndex = 0
     private var searchQuery = ""
+    var capturesViewportInput: Bool { true }
+    private let pageSize: Int
+    func getSearchQuery() -> String { searchQuery }
     private var labels: [String: String?] = [:]
     private var toolCalls: [String: ToolCall] = [:]
     private var currentLeafId: String?
@@ -47,10 +50,10 @@ private final class TreeList: Component {
             }
         }
 
+        self.pageSize = maxVisibleLines
         self.lastSelectedId = currentLeafId
         applyFilter(preserveSelectionSnapshot: false)
 
-        _ = maxVisibleLines
     }
 
     func updateNodeLabel(_ entryId: String, _ label: String?) {
@@ -84,6 +87,11 @@ private final class TreeList: Component {
     }
 
     func handleInput(_ keyData: String) {
+        if let index = getSelectPageIndex(keybindings: getKeybindings(), data: keyData, selectedIndex: selectedIndex, itemCount: filteredNodes.count, pageSize: pageSize) {
+            guard !filteredNodes.isEmpty else { return }
+            selectedIndex = index
+            return
+        }
         if isArrowUp(keyData) {
             selectedIndex = max(0, selectedIndex - 1)
             return
@@ -259,7 +267,9 @@ private final class TreeList: Component {
     }
 }
 
-private final class LabelInput: Container {
+private final class LabelInput: Container, Focusable, SystemCursorAware {
+    var focused: Bool { get { input.focused } set { input.focused = newValue } }
+    var usesSystemCursor: Bool { get { input.usesSystemCursor } set { input.usesSystemCursor = newValue } }
     private let input: Input
     let entryId: String
     var onSubmit: ((String, String?) -> Void)?
@@ -294,20 +304,34 @@ private final class LabelInput: Container {
     }
 }
 
-private final class SearchLine: Component {
+private final class SearchLine: Component, Focusable, SystemCursorAware {
     private let list: TreeList
-
-    init(_ list: TreeList) {
-        self.list = list
-    }
-
+    private let input = Input(options: InputOptions(prompt: ""))
+    var focused: Bool { get { input.focused } set { input.focused = newValue } }
+    var usesSystemCursor: Bool { get { input.usesSystemCursor } set { input.usesSystemCursor = newValue } }
+    init(_ list: TreeList) { self.list = list }
     func render(width: Int) -> [String] {
-        _ = list
-        return [truncateToWidth(theme.fg(.muted, "  Search:"), maxWidth: width, ellipsis: "")]
+        let prefix = theme.fg(.muted, "  Search: ")
+        guard focused || usesSystemCursor else {
+            return [truncateToWidth(prefix + theme.fg(.accent, list.getSearchQuery()), maxWidth: width, ellipsis: "")]
+        }
+        input.setValue("")
+        input.handleInput(list.getSearchQuery())
+        return input.render(width: max(1, width - 10)).map { prefix + $0 }
     }
 }
 
-public final class TreeSelectorComponent: Container {
+public final class TreeSelectorComponent: Container, Focusable, SystemCursorAware {
+    public override var capturesViewportInput: Bool { labelInput == nil }
+    private let searchLine: SearchLine
+    public var focused = false { didSet { updateInputFocus() } }
+    public var usesSystemCursor = false { didSet { updateInputFocus() } }
+    private func updateInputFocus() {
+        searchLine.focused = focused && labelInput == nil
+        searchLine.usesSystemCursor = usesSystemCursor && labelInput == nil
+        labelInput?.focused = focused
+        labelInput?.usesSystemCursor = usesSystemCursor
+    }
     private let treeList: TreeList
     private var labelInput: LabelInput?
     private let labelInputContainer: Container
@@ -324,6 +348,7 @@ public final class TreeSelectorComponent: Container {
     ) {
         let maxVisible = max(5, terminalHeight / 2)
         self.treeList = TreeList(tree: tree, currentLeafId: currentLeafId, maxVisibleLines: maxVisible)
+        self.searchLine = SearchLine(treeList)
         self.labelInputContainer = Container()
         self.treeContainer = Container()
         self.onLabelChangeCallback = onLabelChange
@@ -342,7 +367,7 @@ public final class TreeSelectorComponent: Container {
         addChild(DynamicBorder())
         addChild(Text(theme.bold("  Session Tree"), paddingX: 1, paddingY: 0))
         addChild(TruncatedText(theme.fg(.muted, "  ↑/↓: move. enter: select. l: label. Type to search"), paddingX: 0, paddingY: 0))
-        addChild(SearchLine(treeList))
+        addChild(searchLine)
         addChild(DynamicBorder())
         addChild(Spacer(1))
         addChild(treeContainer)
@@ -367,6 +392,7 @@ public final class TreeSelectorComponent: Container {
         }
 
         self.labelInput = labelInput
+        updateInputFocus()
         treeContainer.clear()
         labelInputContainer.clear()
         labelInputContainer.addChild(labelInput)
@@ -374,6 +400,7 @@ public final class TreeSelectorComponent: Container {
 
     private func hideLabelInput() {
         labelInput = nil
+        updateInputFocus()
         labelInputContainer.clear()
         treeContainer.clear()
         treeContainer.addChild(treeList)

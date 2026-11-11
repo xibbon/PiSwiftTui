@@ -16,19 +16,36 @@ public final class AssistantMessageComponent: Container {
     private var hasToolCalls: Bool = false
     private var markdownConfiguration: InteractiveTuiConfiguration
     private var isStreaming: Bool
+    private let markdownRunner: HookRunner?
+    private let messageId: String?
+    private let messageTimestamp: String?
+    private let markdownStreamingState: LockedState<Bool>
+    private struct MarkdownSlot {
+        enum Kind { case text, thinking }
+        let kind: Kind
+        let markdown: Markdown
+    }
+    private var markdownSlots: [MarkdownSlot] = []
 
     public init(
         message: AssistantMessage? = nil,
         hideThinkingBlock: Bool = false,
         hiddenThinkingLabel: String? = nil,
         markdownConfiguration: InteractiveTuiConfiguration = InteractiveTuiConfiguration(),
-        isStreaming: Bool = false
+        isStreaming: Bool = false,
+        markdownRunner: HookRunner? = nil,
+        messageId: String? = nil,
+        messageTimestamp: String? = nil
     ) {
         self.contentContainer = Container()
         self.hideThinkingBlock = hideThinkingBlock
         self.hiddenThinkingLabel = hiddenThinkingLabel
         self.markdownConfiguration = markdownConfiguration
         self.isStreaming = isStreaming
+        self.markdownRunner = markdownRunner
+        self.messageId = messageId
+        self.messageTimestamp = messageTimestamp
+        self.markdownStreamingState = LockedState(isStreaming)
         super.init()
         addChild(contentContainer)
         if let message {
@@ -67,6 +84,7 @@ public final class AssistantMessageComponent: Container {
     public func setStreaming(_ streaming: Bool) {
         guard isStreaming != streaming else { return }
         isStreaming = streaming
+        markdownStreamingState.withLock { $0 = streaming }
         if let lastMessage {
             updateContent(lastMessage)
         }
@@ -74,20 +92,27 @@ public final class AssistantMessageComponent: Container {
 
     public func setMarkdownConfiguration(_ configuration: InteractiveTuiConfiguration) {
         markdownConfiguration = configuration
+        markdownSlots.removeAll()
         if let lastMessage {
             updateContent(lastMessage)
         }
     }
 
-    private func markdownOptions(includeMermaid: Bool) -> MarkdownOptions {
+    private func markdownOptions(type: MarkdownMessageType, includeMermaid: Bool) -> MarkdownOptions {
         var transforms: [MarkdownSourceTransform] = []
+        if let transform = hostMarkdownTransform(runner: markdownRunner, type: type,
+            streamingState: markdownStreamingState, messageId: messageId, timestamp: messageTimestamp) {
+            transforms.append(transform)
+        }
         if includeMermaid && markdownConfiguration.mermaidEnabled {
-            transforms.append(createMermaidMarkdownTransform(options: MermaidMarkdownTransformOptions(
-                enabled: true,
-                renderWhileStreaming: markdownConfiguration.mermaidRenderWhileStreaming,
-                isStreaming: isStreaming,
-                theme: theme
-            )))
+            let state = markdownStreamingState
+            let renderWhileStreaming = markdownConfiguration.mermaidRenderWhileStreaming
+            transforms.append { source, width in
+                let transform = createMermaidMarkdownTransform(options: MermaidMarkdownTransformOptions(
+                    enabled: true, renderWhileStreaming: renderWhileStreaming,
+                    isStreaming: state.withLock { $0 }, theme: theme))
+                return transform(source, width)
+            }
         }
         return MarkdownOptions(
             renderLatex: markdownConfiguration.latexEnabled,
@@ -98,13 +123,24 @@ public final class AssistantMessageComponent: Container {
     public func updateContent(_ message: AssistantMessage) {
         lastMessage = message
         contentContainer.clear()
+        let previousSlots = markdownSlots
+        markdownSlots = []
+        func markdownBlock(_ kind: MarkdownSlot.Kind, text: String, create: () -> Markdown) -> Markdown {
+            let slot = markdownSlots.count < previousSlots.count ? previousSlots[markdownSlots.count] : nil
+            let markdown = slot?.kind == kind ? slot!.markdown : create()
+            markdown.setText(text)
+            markdownSlots.append(MarkdownSlot(kind: kind, markdown: markdown))
+            return markdown
+        }
 
         let hasContent = message.content.contains { block in
             switch block {
             case .text(let text):
                 return !text.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             case .thinking(let thinking):
-                return !thinking.thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                return !thinking.thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                    (!hideThinkingBlock || !(hiddenThinkingLabel ?? "Thinking...").isEmpty ||
+                     thinkingVisibilityOverrides.values.contains(false))
             default:
                 return false
             }
@@ -122,13 +158,13 @@ public final class AssistantMessageComponent: Container {
             case .text(let textContent):
                 let trimmed = textContent.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
-                    contentContainer.addChild(Markdown(
+                    contentContainer.addChild(markdownBlock(.text, text: trimmed) { Markdown(
                         trimmed,
                         paddingX: markdownConfiguration.outputPad,
                         paddingY: 0,
                         theme: getMarkdownTheme(),
-                        options: markdownOptions(includeMermaid: true)
-                    ))
+                        options: markdownOptions(type: .assistant, includeMermaid: true)
+                    ) })
                 }
                 index += 1
             case .thinking:
@@ -149,7 +185,8 @@ public final class AssistantMessageComponent: Container {
                     case .text(let text):
                         return !text.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     case .thinking(let thinking):
-                        return !thinking.thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        return !thinking.thinking.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                            (!hideThinkingBlock || !(hiddenThinkingLabel ?? "Thinking...").isEmpty)
                     default:
                         return false
                     }
@@ -158,18 +195,20 @@ public final class AssistantMessageComponent: Container {
                 let runIndex = thinkingRunIndex
                 thinkingRunIndex += 1
                 let hidden = thinkingVisibilityOverrides[runIndex] ?? hideThinkingBlock
+                if hidden && (hiddenThinkingLabel ?? "Thinking...").isEmpty { continue }
                 let thinkingComponent: Component
                 if hidden {
                     thinkingComponent = Text(
                         theme.italic(theme.fg(.thinkingText, hiddenThinkingLabel ?? "Thinking...")),
                         paddingX: markdownConfiguration.outputPad, paddingY: 0)
                 } else {
-                    thinkingComponent = Markdown(
-                        thinkingBlocks.joined(separator: "\n\n"),
+                    let thinkingText = thinkingBlocks.joined(separator: "\n\n")
+                    thinkingComponent = markdownBlock(.thinking, text: thinkingText) { Markdown(
+                        thinkingText,
                         paddingX: markdownConfiguration.outputPad, paddingY: 0,
                         theme: getMarkdownTheme(),
                         defaultTextStyle: DefaultTextStyle(color: { theme.fg(.thinkingText, $0) }, italic: true),
-                        options: markdownOptions(includeMermaid: false))
+                        options: markdownOptions(type: .assistantThinking, includeMermaid: false)) }
                 }
                 contentContainer.addChild(MouseRegion(child: thinkingComponent) { [weak self] event in
                     guard let self, event.type == .click, event.button == .left else { return nil }

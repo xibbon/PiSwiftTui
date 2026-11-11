@@ -41,7 +41,8 @@ private final class SkillDiagnosticsResources: ResourceLoader {
     let mode = InteractiveMode(session: session, version: VERSION)
     mode.showLoadedResources(.init(extensionPaths: [], force: true))
     let output = stripTerminalSequences(mode.loadedResourcesContainer.render(width: 160).joined(separator: "\n"))
-    #expect(output.contains("[Skill conflicts]"))
+    // v1.5.2 PT1: interactive-mode.ts:2046 labels skill diagnostics as warnings.
+    #expect(output.contains("[Skill warnings]"))
     #expect(output.contains("\"xogot\" collision:"))
     #expect(output.contains("✓ auto (user) \(resources.winner)"))
     #expect(output.contains("✗ \(resources.loser) (skipped)"))

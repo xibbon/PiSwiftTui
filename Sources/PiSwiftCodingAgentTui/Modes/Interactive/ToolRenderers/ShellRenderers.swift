@@ -31,9 +31,9 @@ public func createShellRenderers(prompt: String) -> ToolRenderers {
             let truncation = details["truncation"] as? [String: Any] ?? [:]
             let truncated = truncation["truncated"] as? Bool == true
             let fullOutputPath = details["fullOutputPath"] as? String
-            if !options.isPartial, let fullOutputPath, output.hasSuffix("]"),
+            if !options.isPartial, truncated, let fullOutputPath, output.hasSuffix("]"),
                let footer = output.range(of: "\n\n[", options: .backwards),
-               output[footer.lowerBound...].contains("Full output: \(fullOutputPath)") {
+               output[footer.lowerBound...].contains(fullOutputPath) {
                 output = String(output[..<footer.lowerBound]).replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
             }
             if !output.isEmpty {

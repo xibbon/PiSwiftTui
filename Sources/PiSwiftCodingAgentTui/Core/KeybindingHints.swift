@@ -63,3 +63,34 @@ public func keyText(_ action: AppAction) -> String {
 public func keyHint(_ action: AppAction, _ description: String) -> String {
     theme.fg(.dim, keyText(action)) + theme.fg(.muted, " \(description)")
 }
+
+/// Key hints for extension renderers, using the active user bindings.
+public func hostKeybindingHints() -> HookKeybindingHints {
+    HookKeybindingHints(keyText: { extensionKeyText($0) }, keyHint: { action, description in
+        theme.fg(.dim, extensionKeyText(action)) + theme.fg(.muted, " \(description)")
+    })
+}
+
+private func extensionKeyText(_ id: String) -> String {
+    let actions: [String: AppAction] = [
+        "app.interrupt": .interrupt, "app.clear": .clear, "app.exit": .exit,
+        "app.suspend": .suspend, "app.thinking.cycle": .cycleThinkingLevel,
+        "app.model.cycleForward": .cycleModelForward, "app.model.cycleBackward": .cycleModelBackward,
+        "app.model.select": .selectModel, "app.tools.expand": .expandTools,
+        "app.thinking.toggle": .toggleThinking, "app.editor.external": .externalEditor,
+        "app.message.followUp": .followUp, "app.message.dequeue": .dequeue,
+        "app.clipboard.pasteImage": .pasteImage, "app.message.copy": .copyMessage,
+    ]
+    let text: String
+    if let action = actions[id] {
+        text = keyText(action)
+    } else if id.hasPrefix("tui.") {
+        text = formatKeys(getKeybindings().getKeys(id))
+    } else {
+        text = selectorKeyText(id)
+    }
+    return text.split(separator: "/", omittingEmptySubsequences: false).map { key in
+        key.split(separator: "+", omittingEmptySubsequences: false)
+            .map { $0 == "alt" ? "option" : String($0) }.joined(separator: "+")
+    }.joined(separator: "/")
+}

@@ -197,7 +197,8 @@ import Testing
         let partial = toolTestText(try result("bash", output, details: details, context: context(expanded: true, partial: true)))
         #expect(partial.contains("[Showing lines"))
         let noTruncation = toolTestText(try result("bash", output, details: ["fullOutputPath": "/tmp/output.log"], context: context(expanded: true)))
-        #expect(!noTruncation.contains("[Showing lines"))
+        // v1.5.2 PT1: core/tools/renderers/bash.ts:40-42 removes this footer only for truncated results.
+        #expect(noTruncation.contains("[Showing lines"))
         let arbitrary = toolTestText(try result("bash", "body\n\n[mention /tmp/output.log]", details: ["fullOutputPath": "/tmp/output.log"], context: context(expanded: true)))
         #expect(arbitrary.contains("[mention /tmp/output.log]"))
         let unknown = toolTestText(try result("bash", output, context: context(expanded: true)))

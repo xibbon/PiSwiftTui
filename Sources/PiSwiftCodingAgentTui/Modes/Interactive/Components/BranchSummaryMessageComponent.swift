@@ -5,9 +5,17 @@ import PiSwiftCodingAgent
 public final class BranchSummaryMessageComponent: Box, OutputPaddingSetting {
     private var expanded = false
     private let message: BranchSummaryMessage
+    private let markdownRunner: HookRunner?
+    private let messageId: String?
+    private let messageTimestamp: String?
 
-    public init(message: BranchSummaryMessage, outputPad: Int = 1) {
+    public init(message: BranchSummaryMessage, outputPad: Int = 1,
+                markdownRunner: HookRunner? = nil, messageId: String? = nil,
+                messageTimestamp: String? = nil) {
         self.message = message
+        self.markdownRunner = markdownRunner
+        self.messageId = messageId
+        self.messageTimestamp = messageTimestamp
         super.init(paddingX: outputPad, paddingY: 1, bgFn: { theme.bg(.customMessageBg, $0) })
         updateDisplay()
     }
@@ -36,7 +44,11 @@ public final class BranchSummaryMessageComponent: Box, OutputPaddingSetting {
         if expanded {
             let header = "**Branch Summary**\n\n"
             let style = DefaultTextStyle(color: { theme.fg(.customMessageText, $0) })
-            content.addChild(Markdown(header + message.summary, paddingX: 0, paddingY: 0, theme: getMarkdownTheme(), defaultTextStyle: style))
+            let transforms = hostPrefixedMarkdownTransform(runner: markdownRunner, type: .summary, header: header,
+                messageId: messageId, timestamp: messageTimestamp).map { [$0] } ?? []
+            content.addChild(Markdown(header + message.summary, paddingX: 0, paddingY: 0,
+                theme: getMarkdownTheme(), defaultTextStyle: style,
+                options: MarkdownOptions(sourceTransforms: transforms)))
         } else {
             content.addChild(Text(theme.fg(.customMessageText, "Branch summary (ctrl+o to expand)"), paddingX: 0, paddingY: 0))
         }

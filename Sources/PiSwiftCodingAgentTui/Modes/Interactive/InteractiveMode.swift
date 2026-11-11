@@ -266,7 +266,7 @@ public final class InteractiveMode {
     public var lastStatusText: ThemedText?
     private var lastStatusMessage = ""
     var builtInHeader: ExpandableText?
-    private let startupHeaderContainer = Container()
+    let startupHeaderContainer = Container()
     let loadedResourcesContainer = Container()
 
     private var session: AgentSession?
@@ -290,6 +290,8 @@ public final class InteractiveMode {
     private var tuiModeOverride: InteractiveTuiMode?
     private var version: String = VERSION
     private var changelogMarkdown: String?
+    private var extensionChangelogUpdates: [ExtensionChangelogUpdate] = []
+    private var reportedInstallFailures: Set<PackageInstallFailure> = []
     private var scopedModels: [ScopedModel] = []
     private var fdPath: String?
     private var verboseStartup = false
@@ -474,12 +476,16 @@ public final class InteractiveMode {
         registerShutdownSignalHandlers()
         startBackgroundCatalogRefresh()
         if let session {
+            prepareStartupNotices()
             pendingResourceDisplayOptions = ResourceDisplayOptions(
                 extensionPaths: visibleStartupExtensionPaths(session.resourceLoader.getExtensions().paths),
                 force: false
             )
         }
         renderInitialMessages()
+        if let session {
+            reportInstallFailures(session.resourceLoader.getExtensions().installFailures)
+        }
         announceSavedCrashIfNeeded()
         renderStartupDiagnostics()
         tui?.requestRender(force: true)
@@ -757,16 +763,30 @@ public final class InteractiveMode {
             headerContainer.addChild(Spacer(1))
             headerContainer.addChild(header)
             headerContainer.addChild(Spacer(1))
+            if tuiConfiguration.mode == .fullscreen, showDetails, !scopedModels.isEmpty {
+                let models = scopedModels.map { scoped in
+                    let thinking = scoped.isThinkingExplicit ? ":\((scoped.thinkingLevel ?? .off).rawValue)" : ""
+                    return scoped.model.id + thinking
+                }.joined(separator: ", ")
+                let cycle = appKey(keybindings, .cycleModelForward).split(separator: "/").map { key in
+                    key.split(separator: "+").map { part in
+                        part.prefix(1).uppercased() + part.dropFirst()
+                    }.joined(separator: "+")
+                }.joined(separator: "/")
+                let hint = cycle.isEmpty ? "" : " (\(cycle) to cycle)"
+                headerContainer.addChild(ThemedText({ theme.fg(.dim, "Model scope: \(models)\(hint)") }, paddingX: 1, paddingY: 0))
+                headerContainer.addChild(Spacer(1))
+            }
 
             if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 headerContainer.addChild(DynamicBorder())
                 if settingsManager.getCollapseChangelog() {
-                    let condensed = "Updated. Use /changelog to view details."
+                    let condensed = collapsedChangelogText(changelogMarkdown)
                     headerContainer.addChild(Text(condensed, paddingX: 1, paddingY: 0))
                 } else {
                     headerContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "What's New")) }, paddingX: 1, paddingY: 0))
                     headerContainer.addChild(Spacer(1))
-                    headerContainer.addChild(Markdown(changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines), paddingX: 1, paddingY: 0, theme: getMarkdownTheme()))
+                    headerContainer.addChild(changelogMarkdownComponent(changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines), paddingY: 0))
                     headerContainer.addChild(Spacer(1))
                 }
                 headerContainer.addChild(DynamicBorder())
@@ -775,9 +795,57 @@ public final class InteractiveMode {
             headerContainer.addChild(Text("", paddingX: 0, paddingY: 0))
             if let changelogMarkdown, !changelogMarkdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 headerContainer.addChild(Spacer(1))
-                let condensed = "Updated. Use /changelog to view details."
+                let condensed = collapsedChangelogText(changelogMarkdown)
                 headerContainer.addChild(Text(condensed, paddingX: 1, paddingY: 0))
             }
+        }
+        if !extensionChangelogUpdates.isEmpty {
+            headerContainer.addChild(DynamicBorder())
+            if settingsManager.getCollapseChangelog() {
+                let text = extensionChangelogUpdates.map { "Updated \($0.name) to v\($0.version)." }.joined(separator: "\n")
+                headerContainer.addChild(Text(text, paddingX: 1, paddingY: 0))
+            } else {
+                headerContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "Extension Updates")) }, paddingX: 1, paddingY: 0))
+                headerContainer.addChild(Spacer(1))
+                let markdown = extensionChangelogUpdates.map(\.markdown).joined(separator: "\n\n")
+                headerContainer.addChild(changelogMarkdownComponent(markdown, paddingY: 0))
+                headerContainer.addChild(Spacer(1))
+            }
+            headerContainer.addChild(DynamicBorder())
+        }
+    }
+
+    @MainActor
+    func prepareStartupNotices() {
+        guard let session else { return }
+        extensionChangelogUpdates = session.messages.isEmpty
+            ? session.resourceLoader.extensionChangelogUpdates(settings: session.settingsManager) : []
+        refreshStartupHeader()
+    }
+
+    @MainActor
+    func changelogMarkdownComponent(_ markdown: String, paddingY: Int) -> Markdown {
+        let transforms = hostMarkdownTransform(runner: session?.hookRunner, type: .changelog).map { [$0] } ?? []
+        return Markdown(markdown, paddingX: 1, paddingY: paddingY,
+            theme: getMarkdownTheme(), options: MarkdownOptions(sourceTransforms: transforms))
+    }
+
+    @MainActor
+    private func collapsedChangelogText(_ markdown: String) -> String {
+        let pattern = try! NSRegularExpression(pattern: #"##\s+\[?(\d+\.\d+\.\d+)\]?"#)
+        let range = NSRange(markdown.startIndex..., in: markdown)
+        let latest = pattern.firstMatch(in: markdown, range: range)
+            .flatMap { Range($0.range(at: 1), in: markdown) }
+            .map { String(markdown[$0]) } ?? version
+        return "Updated to v\(latest). Use \(theme.bold("/changelog")) to view full changelog."
+    }
+
+    @MainActor
+    private func reportInstallFailures(_ failures: [PackageInstallFailure]) {
+        for failure in failures where reportedInstallFailures.insert(failure).inserted {
+            let hint = failure.scope == "temporary" ? "Check the source and try again."
+                : "Run \"pi remove \(failure.source)\(failure.scope == "project" ? " --local" : "")\" to remove it from settings.json."
+            showWarning("Extension package \"\(failure.source)\": failed to install (\(failure.message)). \(hint)")
         }
     }
 
@@ -824,9 +892,9 @@ public final class InteractiveMode {
         let cwdBase = FileManager.default.currentDirectoryPath.split(separator: "/").last.map(String.init)
             ?? FileManager.default.currentDirectoryPath
         if let sessionName = session?.sessionManager.getSessionName(), !sessionName.isEmpty {
-            tui.terminal.setTitle("pi - \(sessionName) - \(cwdBase)")
+            tui.terminal.setTitle(replaceControlCharacters("pi - \(sessionName) - \(cwdBase)"))
         } else {
-            tui.terminal.setTitle("pi - \(cwdBase)")
+            tui.terminal.setTitle(replaceControlCharacters("pi - \(cwdBase)"))
         }
     }
 
@@ -1003,7 +1071,7 @@ public final class InteractiveMode {
             },
             setTitle: { [weak self] title in
                 Task { @MainActor in
-                    self?.tui?.terminal.setTitle(title)
+                    self?.tui?.terminal.setTitle(replaceControlCharacters(title))
                 }
             },
             custom: { [weak self] factory, options in
@@ -1433,11 +1501,13 @@ public final class InteractiveMode {
         options: HookCustomOptions?
     ) async -> HookCustomResult? {
         guard let tui, let editor else { return nil }
-        let savedText = editor.getText()
+        let savedText = editor.getExpandedText()
         let isOverlay = options?.overlay ?? false
         return await waitForExtensionDialog { wait in
-            wait.beforeFinish = {
-                if !isOverlay { editor.setText(savedText) }
+            let statusSource = "extension-overlay:\(wait.id.uuidString)"
+            wait.beforeFinish = { [weak self] in
+                self?.programStatus.setBlocked(source: statusSource, status: nil)
+                if !isOverlay { self?.editor?.setText(savedText) }
             }
             let close: HookCustomClose = { result in
                 guard !wait.completed else { return }
@@ -1463,11 +1533,18 @@ public final class InteractiveMode {
                     wait.overlayHandle = handle
                     extensionDialogOverlays.append(ExtensionDialogOverlay(id: wait.id,
                         component: component, handle: handle, options: resolved))
+                    if let blocked = options?.blocked {
+                        programStatus.setBlocked(source: statusSource, status: BlockedStatus(
+                            kind: ProgramStatus.Kind(rawValue: blocked.kind.rawValue) ?? .question,
+                            message: blocked.message))
+                    }
                     options?.onHandle?(handle)
                     tui.requestRender()
                 } else {
                     pushExtensionDialog(ExtensionDialog(id: wait.id, component: component,
-                        blocked: nil, cancel: { close(nil) }))
+                        blocked: options?.blocked.map { blocked in BlockedStatus(
+                            kind: ProgramStatus.Kind(rawValue: blocked.kind.rawValue) ?? .question,
+                            message: blocked.message) }, cancel: { close(nil) }))
                 }
             }
         }
@@ -1699,7 +1776,7 @@ public final class InteractiveMode {
     @MainActor
     private func setCustomEditorComponent(_ factory: HookEditorComponentFactory?) {
         guard let tui, let editorContainer, let defaultEditor else { return }
-        let currentText = editor?.getText() ?? ""
+        let currentText = editor?.getExpandedText() ?? ""
 
         editorContainer.clear()
 
@@ -1744,11 +1821,10 @@ public final class InteractiveMode {
             editor = defaultEditor
         }
 
-        if let editor {
-            editorContainer.addChild(editor)
-            tui.setFocus(editor)
+        if editor != nil {
+            showTopExtensionDialog()
             mountWorkingIndicator()
-        tui.requestRender()
+            tui.requestRender()
         }
     }
 
@@ -2137,7 +2213,8 @@ public final class InteractiveMode {
                     hideThinkingBlock: hideThinkingBlock,
                     hiddenThinkingLabel: hiddenThinkingLabel,
                     markdownConfiguration: tuiConfiguration,
-                    isStreaming: true
+                    isStreaming: true,
+                    markdownRunner: session.hookRunner
                 )
                 streamingMessage = assistant
                 if let streamingComponent {
@@ -2299,7 +2376,7 @@ public final class InteractiveMode {
                         toolCalls[call.id] = (name: call.name, args: toolArgumentsWithOrder(call.arguments, argumentsJSON: call.argumentsJSON))
                     }
                 }
-                addMessageToChat(message)
+                addMessageToChat(message, messageId: messageEntry.id, messageTimestamp: messageEntry.timestamp)
                 if assistant.stopReason != .aborted && assistant.stopReason != .error,
                    let notice = thinkingNotices[messageEntry.id] { addThinkingDropNotice(notice) }
             case .toolResult(let toolResult):
@@ -2317,23 +2394,26 @@ public final class InteractiveMode {
                 component.updateResult(toolResult, isPartial: false)
                 chatContainer.addChild(component)
             default:
-                addMessageToChat(message)
+                addMessageToChat(message, messageId: messageEntry.id, messageTimestamp: messageEntry.timestamp)
             }
                 if let miss = cacheMisses[messageEntry.id] {
                     chatContainer.addChild(ThemedText({ theme.fg(.warning, formatCacheMissNotice(miss)) }, paddingX: 1, paddingY: 0))
                 }
             case .compaction(let entry):
-                let component = CompactionSummaryMessageComponent(message: CompactionSummaryMessage(summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: 0), outputPad: tuiConfiguration.outputPad)
+                let component = CompactionSummaryMessageComponent(message: CompactionSummaryMessage(summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: 0), outputPad: tuiConfiguration.outputPad,
+                    markdownRunner: session.hookRunner, messageId: entry.id, messageTimestamp: entry.timestamp)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 if let usage = entry.usage { addSummaryCostNotice(usage) }
             case .branchSummary(let entry):
-                let component = BranchSummaryMessageComponent(message: BranchSummaryMessage(summary: entry.summary, fromId: entry.fromId, timestamp: 0), outputPad: tuiConfiguration.outputPad)
+                let component = BranchSummaryMessageComponent(message: BranchSummaryMessage(summary: entry.summary, fromId: entry.fromId, timestamp: 0), outputPad: tuiConfiguration.outputPad,
+                    markdownRunner: session.hookRunner, messageId: entry.id, messageTimestamp: entry.timestamp)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 if let usage = entry.usage { addSummaryCostNotice(usage, branch: true) }
             case .customMessage(let entry):
-                addMessageToChat(makeHookAgentMessage(HookMessage(customType: entry.customType, content: entry.content, display: entry.display, details: entry.details, timestamp: 0)))
+                addMessageToChat(makeHookAgentMessage(HookMessage(customType: entry.customType, content: entry.content, display: entry.display, details: entry.details, timestamp: 0)),
+                    messageId: entry.id, messageTimestamp: entry.timestamp)
             case .custom(let entry):
                 if let renderer = session.hookRunner?.getEntryRenderer(entry.customType) {
                     let component = CustomEntryComponent(entry: entry, renderer: renderer, outputPad: tuiConfiguration.outputPad)
@@ -2393,20 +2473,24 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func addMessageToChat(_ message: AgentMessage) {
+    private func addMessageToChat(_ message: AgentMessage, messageId: String? = nil,
+                                  messageTimestamp: String? = nil) {
         switch message {
         case .system:
             // System messages carry the prompt and tool state; they have no chat row.
             break
         case .user(let user):
             let text = extractUserContentText(user.content)
-            chatContainer.addChild(UserMessageComponent(text: text, markdownConfiguration: tuiConfiguration))
+            chatContainer.addChild(UserMessageComponent(text: text, markdownConfiguration: tuiConfiguration,
+                markdownRunner: session?.hookRunner, messageId: messageId, messageTimestamp: messageTimestamp))
         case .assistant(let assistant):
             let component = AssistantMessageComponent(
                 message: assistant,
                 hideThinkingBlock: hideThinkingBlock,
                 hiddenThinkingLabel: hiddenThinkingLabel,
-                markdownConfiguration: tuiConfiguration
+                markdownConfiguration: tuiConfiguration,
+                markdownRunner: session?.hookRunner, messageId: messageId,
+                messageTimestamp: messageTimestamp
             )
             chatContainer.addChild(component)
         case .toolResult:
@@ -2426,20 +2510,23 @@ public final class InteractiveMode {
                 }
             case "branchSummary":
                 if let summary = decodeBranchSummaryMessage(custom) {
-                    let component = BranchSummaryMessageComponent(message: summary, outputPad: tuiConfiguration.outputPad)
+                    let component = BranchSummaryMessageComponent(message: summary, outputPad: tuiConfiguration.outputPad,
+                        markdownRunner: session?.hookRunner, messageId: messageId, messageTimestamp: messageTimestamp)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
             case "compactionSummary":
                 if let summary = decodeCompactionSummaryMessage(custom) {
-                    let component = CompactionSummaryMessageComponent(message: summary, outputPad: tuiConfiguration.outputPad)
+                    let component = CompactionSummaryMessageComponent(message: summary, outputPad: tuiConfiguration.outputPad,
+                        markdownRunner: session?.hookRunner, messageId: messageId, messageTimestamp: messageTimestamp)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
             case "hookMessage":
                 if let hook = decodeHookMessage(custom), hook.display {
                     let renderer = session?.hookRunner?.getMessageRenderer(hook.customType)
-                    let component = HookMessageComponent(message: hook, customRenderer: renderer, outputPad: tuiConfiguration.outputPad)
+                    let component = HookMessageComponent(message: hook, customRenderer: renderer, outputPad: tuiConfiguration.outputPad,
+                        markdownRunner: session?.hookRunner, messageId: messageId, messageTimestamp: messageTimestamp)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
@@ -2752,7 +2839,7 @@ public final class InteractiveMode {
                 source: info.source, scope: info.scope, origin: info.origin ?? "top-level", baseDir: info.baseDir
             )
         }
-        addDiagnostics("Skill conflicts", skillResult.diagnostics, diagnosticMetadata: skillMetadata)
+        addDiagnostics("Skill warnings", skillResult.diagnostics, diagnosticMetadata: skillMetadata)
         addDiagnostics("Prompt conflicts", session.resourceLoader.getPrompts().diagnostics)
         addDiagnostics("Extension issues", session.resourceLoader.getExtensions().diagnostics)
         // Upstream v0.99.1 removes the Themes list and retains theme diagnostics.
@@ -3141,7 +3228,7 @@ public final class InteractiveMode {
     @MainActor
     private func handleAltEnter() async {
         guard let editor, let session else { return }
-        let text = editor.getText().trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = editor.getExpandedText().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
         if session.isStreaming {
@@ -3185,7 +3272,7 @@ public final class InteractiveMode {
         }
 
         let queuedText = allQueued.joined(separator: "\n\n")
-        let existingText = currentText ?? editor?.getText() ?? ""
+        let existingText = currentText ?? editor?.getExpandedText() ?? ""
         let combined = [queuedText, existingText]
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .joined(separator: "\n\n")
@@ -4529,7 +4616,7 @@ public final class InteractiveMode {
                             : "Logout failed: \(message)")
                     }
                 }
-            }, onCancel: { done() })
+            }, onCancel: { done() }, requestRender: { [weak self] in self?.ui.requestRender() })
             return (component: selector, focus: selector)
         }
     }
@@ -4602,7 +4689,8 @@ public final class InteractiveMode {
             }, onCancel: { [weak self] in
                 done()
                 if authType != nil { self?.showLoginAuthTypeSelector() }
-            }, initialSearchInput: initialSearchInput)
+            }, initialSearchInput: initialSearchInput,
+                requestRender: { [weak self] in self?.ui.requestRender() })
             return (component: selector, focus: selector)
         }
     }
@@ -4622,7 +4710,7 @@ public final class InteractiveMode {
     @MainActor
     private func mountLoginDialog(_ dialog: LoginDialogComponent) -> (() -> Void)? {
         guard let tui, let editorContainer, let editor else { return nil }
-        let savedText = editor.getText()
+        let savedText = editor.getExpandedText()
         editorContainer.clear()
         editorContainer.addChild(dialog)
         tui.setFocus(dialog)
@@ -5137,7 +5225,7 @@ public final class InteractiveMode {
         chatContainer.addChild(DynamicBorder())
         chatContainer.addChild(ThemedText({ theme.bold(theme.fg(.accent, "What's New")) }, paddingX: 1, paddingY: 0))
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(Markdown(changelogMarkdown, paddingX: 1, paddingY: 1, theme: getMarkdownTheme()))
+        chatContainer.addChild(changelogMarkdownComponent(changelogMarkdown, paddingY: 1))
         chatContainer.addChild(DynamicBorder())
         scheduleRender()
     }

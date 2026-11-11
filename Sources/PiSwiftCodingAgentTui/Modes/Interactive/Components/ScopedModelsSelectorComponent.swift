@@ -100,6 +100,7 @@ public struct ModelsCallbacks {
 
 @MainActor
 public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, SystemCursorAware, Focusable, SelectorClosable {
+    public override var capturesViewportInput: Bool { true }
     private var modelsById: [String: Model] = [:]
     private var allIds: [String] = []
     private var enabledIds: EnabledIds = nil
@@ -244,11 +245,12 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
             let isSelected = i == selectedIndex
             let prefix = isSelected ? theme.fg(.accent, "→ ") : "  "
             let id = item.model?.id ?? item.fullId
+            let nameText = item.model.flatMap { getDistinctModelName(id: $0.id, name: $0.name) }.map { theme.fg(.muted, " (\($0))") } ?? ""
             let styledId = item.model == nil ? theme.strikethrough(id) : id
             let modelText = isSelected ? theme.fg(.accent, styledId) : styledId
             let providerBadge = theme.fg(.muted, item.model.map { " [\($0.provider)]" } ?? " [unavailable]")
             let status = item.model != nil && item.enabled ? theme.fg(.accent, "✓ ") : "  "
-            listContainer.addChild(Text("\(prefix)\(status)\(modelText)\(providerBadge)", paddingX: 0, paddingY: 0))
+            listContainer.addChild(Text("\(prefix)\(status)\(modelText)\(nameText)\(providerBadge)", paddingX: 0, paddingY: 0))
         }
 
         if startIndex > 0 || endIndex < filteredItems.count {
@@ -258,7 +260,12 @@ public final class ScopedModelsSelectorComponent: Container, MouseFocusOwner, Sy
 
     public override func handleInput(_ data: String) {
         let kb = getKeybindings()
-
+        if let index = getSelectPageIndex(keybindings: kb, data: data, selectedIndex: selectedIndex, itemCount: filteredItems.count, pageSize: maxVisible) {
+            guard !filteredItems.isEmpty else { return }
+            selectedIndex = index
+            updateList()
+            return
+        }
         if kb.matches(data, TUIKeybinding.selectUp) {
             guard !filteredItems.isEmpty else { return }
             selectedIndex = selectedIndex == 0 ? filteredItems.count - 1 : selectedIndex - 1

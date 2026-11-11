@@ -6,8 +6,33 @@ import PiSwiftCodingAgent
 
 public func shortenPath(_ path: Any?) -> String {
     guard let path = path as? String else { return "" }
-    let home = NSHomeDirectory()
-    return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
+    return shortenHomePath(path)
+}
+
+/// Keep only the last source and its highlighted lines for one tool row.
+final class ToolCodeHighlighter {
+    private var source: String?
+    private var language: String?
+    private var style: [String] = []
+    private var lines: [String] = []
+    private let render: (String, String?) -> [String]
+
+    init(render: @escaping (String, String?) -> [String] = { highlightCode($0, lang: $1) }) {
+        self.render = render
+    }
+
+    func highlight(_ code: String, lang: String?) -> [String] {
+        // The Swift highlighter has a fixed language set. Its output depends on these colors.
+        let colors: [ThemeColor] = [.mdCodeBlock, .syntaxKeyword, .syntaxType, .syntaxNumber,
+            .syntaxString, .syntaxComment, .syntaxFunction, .syntaxVariable, .syntaxOperator, .syntaxPunctuation]
+        let currentStyle = colors.map { theme.fg($0, "x") }
+        if source == code, language == lang, style == currentStyle { return lines }
+        lines = render(code, lang)
+        source = code
+        language = lang
+        style = currentStyle
+        return lines
+    }
 }
 
 public func linkPath(_ styledText: String, rawPath: String, cwd: String) -> String {

@@ -32,7 +32,8 @@ import Testing
     let home = NSHomeDirectory()
     let path = "\(home)/"
     let result = shortenPath(path)
-    #expect(result == "~/")
+    // v1.5.2 PT1: utils/paths.ts:73-77 returns ~ for the home directory itself.
+    #expect(result == "~")
 }
 
 // MARK: - formatSessionDate tests

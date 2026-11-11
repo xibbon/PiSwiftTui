@@ -22,6 +22,7 @@ private struct ScopedModelItem {
 
 @MainActor
 public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCursorAware, Focusable, SelectorClosable {
+    public override var capturesViewportInput: Bool { true }
     private let searchInput: Input
     private let listContainer: Container
     private var allModels: [ModelItem] = []
@@ -133,9 +134,10 @@ public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCur
         }
     }
 
-    private func loadModelsFromSnapshot(adoptRegistryError: Bool = true) async {
+    func loadModelsFromSnapshot(adoptRegistryError: Bool = true) async {
         if adoptRegistryError { errorMessage = modelRegistry.getError() }
         var items = await modelRegistry.getAvailable().map { ModelItem(provider: $0.provider, id: $0.id, model: $0) }
+        let selectedModel = filteredModels[safe: selectedIndex]?.model
         scopedModelItems = scopedModels.map { scoped in
             let model = modelRegistry.find(scoped.model.provider, scoped.model.id) ?? scoped.model
             return ModelItem(provider: model.provider, id: model.id, model: model)
@@ -154,7 +156,7 @@ public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCur
 
         allModels = items
         selectedIndex = activeModels.firstIndex { modelsAreEqual(currentModel, $0.model) } ?? min(selectedIndex, max(0, activeModels.count - 1))
-        filterModels(searchInput.getValue())
+        filterModels(searchInput.getValue(), preserving: selectedModel)
         updateScopeText()
         tui.requestRender()
     }
@@ -185,13 +187,18 @@ public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCur
         refreshSignal.cancel()
     }
 
-    private func filterModels(_ query: String) {
+    private func filterModels(_ query: String, preserving selectedModel: Model? = nil) {
         filteredModels = query.isEmpty ? activeModels : fuzzyFilter(activeModels, query) { "\($0.id) \($0.provider) \($0.model.name)\(isDefaultModel($0.model) ? " default" : "")" }
         let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !normalized.isEmpty && "default".hasPrefix(normalized) {
             filteredModels = activeModels.filter { isDefaultModel($0.model) } + filteredModels.filter { !isDefaultModel($0.model) }
         }
-        selectedIndex = query.isEmpty ? min(selectedIndex, max(0, filteredModels.count - 1)) : 0
+        if let selectedModel {
+            selectedIndex = filteredModels.firstIndex { modelsAreEqual(selectedModel, $0.model) }
+                ?? (query.isEmpty ? min(selectedIndex, max(0, filteredModels.count - 1)) : 0)
+        } else {
+            selectedIndex = query.isEmpty ? min(selectedIndex, max(0, filteredModels.count - 1)) : 0
+        }
         updateList()
     }
 
@@ -208,12 +215,13 @@ public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCur
             let isCurrent = modelsAreEqual(currentModel, item.model)
 
             let modelText = item.id
+            let nameText = getDistinctModelName(id: item.id, name: item.model.name).map { theme.fg(.muted, " (\($0))") } ?? ""
             let providerBadge = theme.fg(.muted, "[\(item.provider)]")
             let checkmark = isCurrent ? theme.fg(.accent, "✓ ") : "  "
             let prefix = isSelected ? theme.fg(.accent, "→ ") : "  "
             let badge = (isVirtualModel(item.model) ? theme.fg(.muted, " · virtual") : "")
                 + (isDefaultModel(item.model) ? theme.fg(.muted, " · default") : "")
-            let line = "\(prefix)\(checkmark)\(isSelected ? theme.fg(.accent, modelText) : modelText) \(providerBadge)\(badge)"
+            let line = "\(prefix)\(checkmark)\(isSelected ? theme.fg(.accent, modelText) : modelText)\(nameText) \(providerBadge)\(badge)"
 
             listContainer.addChild(Text(line, paddingX: 0, paddingY: 0))
         }
@@ -240,6 +248,12 @@ public final class ModelSelectorComponent: Container, MouseFocusOwner, SystemCur
             return
         }
         let kb = getKeybindings()
+        if let index = getSelectPageIndex(keybindings: kb, data: keyData, selectedIndex: selectedIndex, itemCount: filteredModels.count, pageSize: 10) {
+            guard !filteredModels.isEmpty else { return }
+            selectedIndex = index
+            updateList()
+            return
+        }
         if kb.matches(keyData, TUIKeybinding.inputTab) {
             if !scopedModelItems.isEmpty {
                 isScoped.toggle()
@@ -300,4 +314,15 @@ private extension Array {
         guard index >= 0 && index < count else { return nil }
         return self[index]
     }
+}
+
+func getDistinctModelName(id: String, name: String?) -> String? {
+    guard let name = name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return nil }
+    func words(_ value: String) -> [String] {
+        value.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty }
+    }
+    let idWords = words(id)
+    let tokens = Set(idWords)
+    let compact = idWords.joined()
+    return words(name).allSatisfy { tokens.contains($0) || ($0.count > 1 && compact.contains($0)) } ? nil : name
 }

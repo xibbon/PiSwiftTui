@@ -8,6 +8,7 @@ public protocol WorkingStatusEditor: EditorComponent {
 }
 
 public final class CustomEditor: Component, SystemCursorAware, EditorComponent, WorkingStatusEditor {
+    public var capturesViewportInput: Bool { editor.capturesViewportInput }
     private let editor: WorkingBorderEditor
     private let keybindings: KeybindingsManager
     private var explicitHistory: [String] = []

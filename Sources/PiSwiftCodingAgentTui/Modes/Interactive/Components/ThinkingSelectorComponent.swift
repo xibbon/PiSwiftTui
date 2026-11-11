@@ -4,6 +4,7 @@ import PiSwiftAgent
 
 @MainActor
 public final class ThinkingSelectorComponent: Container, MouseFocusOwner, Focusable, SystemCursorAware {
+    public override var capturesViewportInput: Bool { true }
     private let searchInput = Input()
     private let listContainer = Container()
     private var selectList: SelectList

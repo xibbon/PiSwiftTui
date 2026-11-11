@@ -239,6 +239,7 @@ public struct SettingsCallbacks {
 private final class SettingsSubmenuState { var isOpen = false }
 
 public final class SettingsSelectorComponent: Container, MouseFocusOwner, SystemCursorAware {
+    public override var capturesViewportInput: Bool { true }
     private let submenuState: SettingsSubmenuState
     private let settingsList: SettingsList
     public var usesSystemCursor: Bool = false {

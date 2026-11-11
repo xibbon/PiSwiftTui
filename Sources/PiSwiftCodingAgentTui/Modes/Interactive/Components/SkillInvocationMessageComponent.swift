@@ -10,10 +10,13 @@ public final class SkillInvocationMessageComponent: Container, OutputPaddingSett
     private let box: Box
     private var expanded = false
     private var expandHint: String
+    private let markdownRunner: HookRunner?
 
-    public init(skillBlock: ParsedSkillBlock, expandHint: String = "ctrl+o", outputPad: Int = 1) {
+    public init(skillBlock: ParsedSkillBlock, expandHint: String = "ctrl+o", outputPad: Int = 1,
+                markdownRunner: HookRunner? = nil) {
         self.skillBlock = skillBlock
         self.expandHint = expandHint
+        self.markdownRunner = markdownRunner
         self.box = Box(paddingX: outputPad, paddingY: 1, bgFn: { theme.bg(.customMessageBg, $0) })
         super.init()
 
@@ -57,7 +60,11 @@ public final class SkillInvocationMessageComponent: Container, OutputPaddingSett
 
             let header = "**\(skillBlock.name)**\n\n"
             let style = DefaultTextStyle(color: { theme.fg(.customMessageText, $0) })
-            content.addChild(Markdown(header + skillBlock.content, paddingX: 0, paddingY: 0, theme: getMarkdownTheme(), defaultTextStyle: style))
+            let transforms = hostPrefixedMarkdownTransform(runner: markdownRunner, type: .custom, header: header,
+                messageId: nil, timestamp: nil).map { [$0] } ?? []
+            content.addChild(Markdown(header + skillBlock.content, paddingX: 0, paddingY: 0,
+                theme: getMarkdownTheme(), defaultTextStyle: style,
+                options: MarkdownOptions(sourceTransforms: transforms)))
         } else {
             // Collapsed: single line - [skill] name (hint to expand)
             let line =

@@ -80,6 +80,7 @@ private final class SessionSelectorHeader: Component {
 }
 
 final class SessionList: Component, SystemCursorAware {
+    var capturesViewportInput: Bool { true }
     private var allSessions: [SessionInfo]
     private var filteredSessions: [SessionInfo]
     private var selectedIndex: Int = 0
@@ -91,6 +92,7 @@ final class SessionList: Component, SystemCursorAware {
     var onExit: (() -> Void)?
     var onToggleScope: (() -> Void)?
     private let maxVisible = 5
+    private var searchCache: [String: (source: String, lower: String)] = [:]
     var usesSystemCursor: Bool {
         get { searchInput.usesSystemCursor }
         set { searchInput.usesSystemCursor = newValue }
@@ -199,13 +201,9 @@ final class SessionList: Component, SystemCursorAware {
             selectedPath = filteredSessions[safe: selectedIndex]?.path
             return
         }
-        if kb.matches(keyData, TUIKeybinding.selectPageUp) {
-            selectedIndex = max(0, selectedIndex - maxVisible)
-            selectedPath = filteredSessions[safe: selectedIndex]?.path
-            return
-        }
-        if kb.matches(keyData, TUIKeybinding.selectPageDown) {
-            selectedIndex = min(filteredSessions.count - 1, selectedIndex + maxVisible)
+        if let index = getSelectPageIndex(keybindings: kb, data: keyData, selectedIndex: selectedIndex, itemCount: filteredSessions.count, pageSize: maxVisible) {
+            guard !filteredSessions.isEmpty else { return }
+            selectedIndex = index
             selectedPath = filteredSessions[safe: selectedIndex]?.path
             return
         }
@@ -225,9 +223,12 @@ final class SessionList: Component, SystemCursorAware {
     }
 
     private func filterSessions(_ query: String) {
-        filteredSessions = fuzzyFilter(allSessions, query: query) { session in
-            "\(session.id) \(session.name ?? "") \(session.allMessagesText) \(session.cwd)"
+        let paths = Set(allSessions.map(\.path))
+        searchCache = searchCache.filter { paths.contains($0.key) }
+        for session in allSessions where searchCache[session.path]?.source != session.allMessagesText {
+            searchCache[session.path] = (session.allMessagesText, session.allMessagesText.lowercased())
         }
+        filteredSessions = filterSessionSearch(allSessions, query: query) { self.searchCache[$0.path]?.lower ?? $0.allMessagesText.lowercased() }
         if let selectedPath, let index = filteredSessions.firstIndex(where: { $0.path == selectedPath }) {
             selectedIndex = index
         } else {
@@ -237,6 +238,8 @@ final class SessionList: Component, SystemCursorAware {
 }
 
 public final class SessionSelectorComponent: Container, SelectorClosable {
+    public override var capturesViewportInput: Bool { true }
+    public override func handleInput(_ data: String) { sessionList.handleInput(data) }
     private let sessionList: SessionList
     private let header: SessionSelectorHeader
     private var scope: SessionScope = .current
@@ -410,4 +413,62 @@ private extension Array {
         guard index >= 0 && index < count else { return nil }
         return self[index]
     }
+}
+
+/// Each token must match one field. Separate tokens can match separate fields.
+func filterSessionSearch(_ sessions: [SessionInfo], query: String, messageText: (SessionInfo) -> String = { $0.allMessagesText.lowercased() }) -> [SessionInfo] {
+    let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !query.isEmpty else { return sessions }
+    func normalized(_ text: String) -> String { text.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+    var regex: NSRegularExpression?
+    var tokens: [(value: String, phrase: Bool)] = []
+    if query.hasPrefix("re:") {
+        let pattern = String(query.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pattern.isEmpty, let parsed = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return [] }
+        regex = parsed
+    } else {
+        var buffer = ""
+        var quoted = false
+        func flush(_ phrase: Bool) {
+            let text = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { tokens.append((text.lowercased(), phrase)) }
+            buffer = ""
+        }
+        for char in query {
+            if char == "\"" { flush(quoted); quoted.toggle() }
+            else if char.isWhitespace && !quoted { flush(false) }
+            else { buffer.append(char) }
+        }
+        if quoted { tokens = query.split(whereSeparator: \.isWhitespace).map { (String($0).lowercased(), false) } }
+        else { flush(false) }
+    }
+    func score(_ session: SessionInfo) -> Double? {
+        let name = session.name ?? ""
+        if let regex {
+            func matches(_ value: String) -> Bool { regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil }
+            if matches(name) { return 0 }
+            return [session.id, session.allMessagesText, session.cwd].contains(where: matches) ? 1_000_000 : nil
+        }
+        var total = 0.0
+        for token in tokens {
+            let value = token.phrase ? normalized(token.value) : token.value
+            let lowerName = token.phrase ? normalized(name) : name.lowercased()
+            let cwd = token.phrase ? normalized(session.cwd) : session.cwd.lowercased()
+            let messages = token.phrase ? normalized(messageText(session)) : messageText(session)
+            if lowerName.contains(value) { total += Double(MiniTui.fuzzyMatch(value, lowerName).score); continue }
+            if session.id.lowercased().contains(value) || messages.contains(value) || cwd.contains(value) { total += 1_000_000; continue }
+            guard !token.phrase else { return nil }
+            let matches = [name, session.cwd].map { MiniTui.fuzzyMatch(value, $0) }.filter(\.matches)
+            guard let best = matches.map(\.score).min() else { return nil }
+            total += 2_000_000 + Double(best)
+        }
+        return total
+    }
+    return sessions.enumerated().compactMap { index, session -> (SessionInfo, Double, Int)? in
+        score(session).map { (session, $0, index) }
+    }.sorted {
+        if $0.1 != $1.1 { return $0.1 < $1.1 }
+        if $0.0.modified != $1.0.modified { return $0.0.modified > $1.0.modified }
+        return $0.2 < $1.2
+    }.map { $0.0 }
 }
