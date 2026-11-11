@@ -120,7 +120,7 @@ struct T1ClientIdentityTests {
         #expect(wire.count == 4)
         let enabledIdentity = getCodingAgentClientIdentity(SettingsManager.inMemory())
         #expect(wire[2].value(forHTTPHeaderField: "User-Agent") == formatUserAgent(identity: enabledIdentity))
-        #expect(wire[2].value(forHTTPHeaderField: "User-Agent")?.hasPrefix("pi/1.4.0 (") == true)
+        #expect(wire[2].value(forHTTPHeaderField: "User-Agent")?.hasPrefix("pi/1.5.2 (") == true)
         #expect(wire[2].value(forHTTPHeaderField: "User-Agent")?.contains("; swift;") == true)
         if enabledIdentity.attribution == .value(PI_ATTRIBUTION) {
             #expect(wire[2].value(forHTTPHeaderField: "HTTP-Referer") == "https://pi.dev")
