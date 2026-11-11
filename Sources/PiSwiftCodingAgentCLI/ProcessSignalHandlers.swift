@@ -23,6 +23,10 @@ final class SessionRunLifecycle: Sendable {
             return value
         }
         value?.dispose()
+        // v1.5.2 C-TB: AgentSession.dispose() ends only its own commands. The host ends every
+        // tracked shell at process shutdown, as upstream's modes do (print-mode.ts:64,
+        // rpc-mode.ts:385, interactive-mode.ts:4519).
+        if value != nil { killTrackedDetachedChildren() }
     }
 
     func shutdownAndDispose() async {
@@ -37,6 +41,7 @@ final class SessionRunLifecycle: Sendable {
                 }
                 await value.emitCustomToolSessionEvent(.shutdown)
                 value.dispose()
+                killTrackedDetachedChildren()
             }
             current.shutdown = shutdown
             return shutdown
