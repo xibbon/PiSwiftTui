@@ -64,7 +64,8 @@ struct McpExecutableTests {
         for (args, expected) in [
             (["mcp", "list", "--bogus"], "Unknown option --bogus.\nUse \"pi mcp --help\" for usage.\n"),
             (["mcp", "add", "x", "--url"], "--url needs a value.\n"),
-            (["mcp", "login"], "Usage: pi mcp login <server>\nUse \"pi mcp --help\" for usage.\n"),
+            // v1.5.2 PT5: extensions/mcp/cli.ts:271 adds [-l] to login usage.
+            (["mcp", "login"], "Usage: pi mcp login <server> [-l]\nUse \"pi mcp --help\" for usage.\n"),
             (["mcp", "frobnicate"], "Unknown mcp command \"frobnicate\".\nUse \"pi mcp --help\" for usage.\n"),
             (["mcp", "add", "x", "--url=https://example.com"], "Unknown option --url=https://example.com.\nUse \"pi mcp --help\" for usage.\n")
         ] {

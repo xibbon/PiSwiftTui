@@ -64,10 +64,18 @@ public final class KeybindingsManager {
     }
 
     public static func create(agentDir: String = getAgentDir()) -> KeybindingsManager {
+        let manager = load(agentDir: agentDir)
+        manager.activate()
+        return manager
+    }
+
+    public static func load(agentDir: String) -> KeybindingsManager {
         let configPath = URL(fileURLWithPath: agentDir).appendingPathComponent("keybindings.json").path
-        let config = loadFromFile(configPath)
-        let manager = KeybindingsManager(config: config)
-        activeAppHintKeys.withLock { $0 = manager.appActionToKeys }
+        return KeybindingsManager(config: loadFromFile(configPath))
+    }
+
+    public func activate() {
+        activeAppHintKeys.withLock { $0 = appActionToKeys }
         activeSelectorHintKeys.withLock { $0 = DEFAULT_SELECTOR_KEYBINDINGS.merging(config) { _, configured in configured } }
 
         var tuiBindings: [String: [KeyId]?] = [:]
@@ -84,8 +92,6 @@ public final class KeybindingsManager {
             }
         }
         setEditorKeybindings(EditorKeybindingsManager(config: EditorKeybindingsConfig(editorBindings)))
-
-        return manager
     }
 
     public static func inMemory(config: KeybindingsConfig = [:]) -> KeybindingsManager {

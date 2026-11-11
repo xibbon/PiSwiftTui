@@ -79,9 +79,8 @@ func handlePackageCommand(
         return true
     }
 
-    if offline && (options.command == .install || options.command == .update) {
-        let action = options.command == .install ? "install" : "update"
-        fputs("Offline mode is enabled; package \(action) is unavailable.\n", stderr)
+    if offline && options.command == .install {
+        fputs("Offline mode is enabled; package install is unavailable.\n", stderr)
         setPackageCommandExitCode(1)
         return true
     }
@@ -123,6 +122,8 @@ func handlePackageCommand(
         offline: offline
     )
 
+    let updateMessages = LockedState<[String]>([])
+    let updateWarningCount = LockedState(0)
     packageManager.setProgressCallback { event in
         switch event.type {
         case "start":
@@ -132,6 +133,15 @@ func handlePackageCommand(
         case "error":
             if let message = event.message {
                 fputs("Error: \(message)\n", stderr)
+            }
+        case "progress":
+            if let message = event.message {
+                updateWarningCount.withLock { $0 += 1 }
+                fputs("\(message)\n", stdout)
+            }
+        case "result":
+            if event.action == "update", let message = event.message {
+                updateMessages.withLock { $0.append(message) }
             }
         default:
             break
@@ -195,12 +205,13 @@ func handlePackageCommand(
                 }
             }
         case .update:
-            try await packageManager.update(options.source)
-            if let source = options.source, !source.isEmpty {
-                print("Updated \(source)")
-            } else {
-                print("Updated packages")
-            }
+            let result = try await packageManager.updateWithResult(options.source)
+            print(packageUpdateSummaryText(
+                updated: updateMessages.withLock { $0 },
+                warningCount: max(result.warningCount, updateWarningCount.withLock { $0 }),
+                skippedOffline: result.skippedOffline,
+                source: options.source
+            ))
         }
     } catch {
         fputs("Error: \(error.localizedDescription)\n", stderr)
@@ -208,6 +219,19 @@ func handlePackageCommand(
     }
 
     return true
+}
+
+func packageUpdateSummaryText(updated: [String], warningCount: Int, skippedOffline: Bool, source: String?) -> String {
+    if skippedOffline { return "Skipped package updates (offline mode)" }
+    if !updated.isEmpty {
+        return "Updated \(updated.count) package\(updated.count == 1 ? "" : "s"):\n" +
+            updated.map { "  \($0)" }.joined(separator: "\n")
+    }
+    if warningCount > 0 {
+        return source.map { "\($0) was not updated, see the warnings above" }
+            ?? "No packages were updated, see the warnings above"
+    }
+    return source.map { "\($0) is already up to date" } ?? "Packages are already up to date"
 }
 
 private func parsePackageCommand(_ args: [String]) -> PackageCommandOptions? {

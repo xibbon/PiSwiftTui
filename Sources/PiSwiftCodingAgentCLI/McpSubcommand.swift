@@ -29,6 +29,7 @@ struct McpAddSubcommand: AsyncParsableCommand {
     @Option(name: .customLong("oauth-client-secret")) var oauthClientSecret: String?
     @Option(name: .customLong("oauth-callback-port")) var oauthCallbackPort: String?
     @Option(name: .customLong("oauth-client-name"), help: "Client name sent when registering with the OAuth server") var oauthClientName: String?
+    @Option(name: .customLong("oauth-client-registration")) var oauthClientRegistration: String?
     @Option(name: .customLong("description"), help: "What the server offers, shown in the system prompt") var description: String?
     @Option(name: .customLong("exposure")) var exposure: String?
     @Argument var server: String
@@ -40,6 +41,7 @@ struct McpAddSubcommand: AsyncParsableCommand {
         for (flag, value) in [("url", url), ("cwd", cwd), ("bearer-token-env-var", bearerTokenEnvVar),
                               ("oauth-client-id", oauthClientID), ("oauth-client-secret", oauthClientSecret),
                               ("oauth-callback-port", oauthCallbackPort), ("oauth-client-name", oauthClientName),
+                              ("oauth-client-registration", oauthClientRegistration),
                               ("description", description), ("exposure", exposure)] {
             if let value { args += ["--" + flag, value] }
         }
@@ -65,15 +67,17 @@ struct McpListSubcommand: AsyncParsableCommand {
 
 struct McpLoginSubcommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "login", abstract: "Sign in through the browser")
+    @Flag(name: [.customShort("l"), .customLong("local")]) var local = false
     @Argument var server: String
     @Option(name: .customLong("timeout")) var timeout = "300"
-    mutating func run() async throws { await finishMcpCommand(["login", server, "--timeout", timeout]) }
+    mutating func run() async throws { await finishMcpCommand(["login", server, "--timeout", timeout] + (local ? ["--local"] : [])) }
 }
 
 struct McpLogoutSubcommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "logout", abstract: "Delete the stored OAuth credentials")
+    @Flag(name: [.customShort("l"), .customLong("local")]) var local = false
     @Argument var server: String
-    mutating func run() async throws { await finishMcpCommand(["logout", server]) }
+    mutating func run() async throws { await finishMcpCommand(["logout", server] + (local ? ["--local"] : [])) }
 }
 
 let mcpCommandHelp = """
@@ -82,8 +86,8 @@ Usage:
   \(APP_NAME) mcp add <server> [options] --url <url>
   \(APP_NAME) mcp remove <server> [-l]
   \(APP_NAME) mcp list [--json]
-  \(APP_NAME) mcp login <server> [--timeout <seconds>]
-  \(APP_NAME) mcp logout <server>
+  \(APP_NAME) mcp login <server> [-l] [--timeout <seconds>]
+  \(APP_NAME) mcp logout <server> [-l]
 
 Configure and check MCP servers and sign in to OAuth servers without starting a session.
 Reads ~/\(CONFIG_DIR_NAME)/agent/mcp.json and, in trusted projects, \(CONFIG_DIR_NAME)/mcp.json.
@@ -95,7 +99,7 @@ Commands:
   login <server>          Sign in through the browser
   logout <server>         Delete the stored OAuth credentials
 
-Options for add and remove:
+Options for add, remove, login, and logout:
   -l, --local             Use \(CONFIG_DIR_NAME)/mcp.json in the current project instead of the global file
 
 Options for add:
@@ -112,6 +116,8 @@ Options for add:
                           Fixed OAuth callback port
   --oauth-client-name <name>
                           Client name sent when registering with the OAuth server
+  --oauth-client-registration <mode>
+                          auto (default), cimd, or dcr
   --exposure <mode>       codemode (default), deferred, direct, or hidden
   --description <text>    What the server offers, shown in the system prompt
 
@@ -164,11 +170,12 @@ private func mcpHasKnownOptionSyntax(_ args: [String]) -> Bool {
     case "add": known = ["local": .flag, "url": .value, "env": .list, "cwd": .value,
         "header": .list, "bearer-token-env-var": .value, "oauth-client-id": .value,
         "oauth-client-secret": .value, "oauth-callback-port": .value, "oauth-client-name": .value,
+        "oauth-client-registration": .value,
         "description": .value, "exposure": .value]
     case "remove": known = ["local": .flag]
     case "list": known = ["json": .flag]
-    case "login": known = ["timeout": .value]
-    case "logout": known = [:]
+    case "login": known = ["local": .flag, "timeout": .value]
+    case "logout": known = ["local": .flag]
     default: return false
     }
     return parseMcpOptions(Array(args.dropFirst()), known: known, error: { _ in },
@@ -230,13 +237,18 @@ func runMcpCommand(_ args: [String], options: McpCommandOptions) async -> Int32 
             clientMetadataDocumentURL: piSwiftClientMetadataDocumentURL, createTransport: options.createTransport)
         return printMcpList(report, json: parsed.flags.contains("json"), options: options)
     case "login", "logout":
-        guard let parsed = parseMcpOptions(rest, known: command == "login" ? ["timeout": .value] : [:], error: options.error) else { return 1 }
+        guard let parsed = parseMcpOptions(rest, known: command == "login" ? ["local": .flag, "timeout": .value] : ["local": .flag], error: options.error) else { return 1 }
         guard parsed.positional.count == 1, let name = parsed.positional.first, !name.isEmpty else {
-            options.error("Usage: \(APP_NAME) mcp \(command) <server>\n\(mcpHelpHint)"); return 1
+            options.error("Usage: \(APP_NAME) mcp \(command) <server> [-l]\n\(mcpHelpHint)"); return 1
         }
         guard let entry = loaded.servers.first(where: { $0.name == name }) else {
             let configured = loaded.servers.map(\.name).joined(separator: ", ")
-            options.error("No MCP server named \"\(name)\".\(note.map { " " + $0 } ?? "") Configured: \(configured.isEmpty ? "none" : configured).")
+            let suggestion = loaded.servers.map(\.name).first { mcpEditDistance($0, name) <= 2 }
+            options.error("No MCP server named \"\(name)\".\(suggestion.map { " Did you mean \"\($0)\"?" } ?? "")\(note.map { " " + $0 } ?? "") Configured: \(configured.isEmpty ? "none" : configured).")
+            return 1
+        }
+        if parsed.flags.contains("local"), entry.scope != .project {
+            options.error("MCP server \"\(name)\" is defined in \(entry.source), not in the project; omit --local.")
             return 1
         }
         let connection = McpServerConnection(entry: entry, cwd: options.cwd, createTransport: options.createTransport,
@@ -287,6 +299,21 @@ private func mcpNumber(_ raw: String) -> Double {
     return Double(text) ?? .nan
 }
 
+private func mcpEditDistance(_ first: String, _ second: String) -> Int {
+    let a = Array(first)
+    let b = Array(second)
+    var previous = Array(0...b.count)
+    for (index, character) in a.enumerated() {
+        var current = [index + 1]
+        for (otherIndex, otherCharacter) in b.enumerated() {
+            current.append(min(previous[otherIndex + 1] + 1, current[otherIndex] + 1,
+                               previous[otherIndex] + (character == otherCharacter ? 0 : 1)))
+        }
+        previous = current
+    }
+    return previous[b.count]
+}
+
 // Match Math.round(timeoutMs / 1000).toString(), including overflow in timeout * 1000.
 private func mcpTimeoutText(_ seconds: Double) -> String {
     let rounded = ((seconds * 1_000) / 1_000).rounded(.toNearestOrAwayFromZero)
@@ -320,6 +347,7 @@ private func addMcpCommand(_ args: [String], projectConfig: URL, options: McpCom
     guard let parsed = parseMcpOptions(args, known: ["local": .flag, "url": .value, "env": .list,
         "cwd": .value, "header": .list, "bearer-token-env-var": .value, "oauth-client-id": .value,
         "oauth-client-secret": .value, "oauth-callback-port": .value, "oauth-client-name": .value,
+        "oauth-client-registration": .value,
         "description": .value, "exposure": .value], error: options.error, maxPositionals: 2) else { return 1 }
     let command = Array(parsed.positional.dropFirst())
     let url = parsed.values["url"]
@@ -327,7 +355,7 @@ private func addMcpCommand(_ args: [String], projectConfig: URL, options: McpCom
         options.error("Usage: \(APP_NAME) mcp add <server> [options] (--url <url> | -- <command> [args...])\n\(mcpHelpHint)")
         return 1
     }
-    let httpOnly = ["header", "bearer-token-env-var", "oauth-client-id", "oauth-client-secret", "oauth-callback-port", "oauth-client-name"]
+    let httpOnly = ["header", "bearer-token-env-var", "oauth-client-id", "oauth-client-secret", "oauth-callback-port", "oauth-client-name", "oauth-client-registration"]
     if let misplaced = (url == nil ? httpOnly : ["env", "cwd"]).first(where: { parsed.has($0) }) {
         options.error("--\(misplaced) only applies to \(url == nil ? "HTTP servers (--url)" : "stdio servers").")
         return 1
@@ -342,6 +370,10 @@ private func addMcpCommand(_ args: [String], projectConfig: URL, options: McpCom
         oauth["clientId"] = parsed.values["oauth-client-id"]
         oauth["clientSecret"] = parsed.values["oauth-client-secret"]
         oauth["clientName"] = parsed.values["oauth-client-name"]
+        // The Swift client has no metadata document; its default registration is DCR.
+        if let registration = parsed.values["oauth-client-registration"], registration != "auto" {
+            oauth["clientRegistration"] = registration
+        }
         if let port = parsed.values["oauth-callback-port"] { oauth["callbackPort"] = mcpNumber(port) }
         if !oauth.isEmpty { value["oauth"] = oauth }
     } else {

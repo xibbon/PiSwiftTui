@@ -119,8 +119,42 @@ private func reportSubcommandSettingsErrors(_ settingsManager: SettingsManager, 
 struct AuthSubcommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "auth",
-        abstract: "Check or export authentication credentials",
+        abstract: "Log in to and out of model providers, or check and export credentials",
+        discussion: """
+        Usage:
+          pi auth login <provider> [--api-key] [--no-browser]
+          pi auth logout <provider>
+          pi auth print-api-key [--provider <provider>] [--model <model>]
+          pi auth print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]
+          pi auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]
+
+        Log in to and out of model providers, print their credentials for external clients, or check that they are ready.
+        Credentials are stored in ~/.pi/agent/auth.json.
+
+        Commands:
+          login <provider>        Sign in with an account in the browser, or save an API key, then exit
+          logout <provider>       Remove the stored credentials; environment variables and models.json stay
+          print-api-key           Print the resolved API key
+          print-bearer-token      Print a resolved OAuth bearer token (refreshes if expired)
+          check                   Print ready, not_ready, or invalid; exit with 0, 1, or 2
+
+        Options for print-api-key, print-bearer-token, and check (at least one is required):
+          --provider <provider>   Resolve credentials for a provider
+          --model <model>         Resolve credentials from a model
+
+        Options for login:
+          --api-key               Save an API key instead of signing in with an account
+          --no-browser            Do not open a browser; use another sign-in method, e.g. device code
+
+        Other options:
+          --min-expiry <duration> Minimum remaining token lifetime for print-bearer-token, e.g. 30m or 1h
+          --json                  Print the check result as JSON
+          --credentials           Emit the credential from check, or include it in JSON output
+          --no-refresh            Do not refresh expired OAuth credentials during check
+        """,
         subcommands: [
+            AuthLoginSubcommand.self,
+            AuthLogoutSubcommand.self,
             AuthCheckSubcommand.self,
             PrintAPIKeySubcommand.self,
             PrintBearerTokenSubcommand.self,
@@ -494,16 +528,19 @@ func runModelsUpdate(
         signal: signal
     ))
     if result.aborted {
-        return .failure("Model catalog refresh timed out after 15 seconds.")
+        return .failure("Model catalog refresh timed out.")
     }
-    if !result.errors.isEmpty {
-        let details = result.errors
+    let warnings = result.catalogWarnings(commandName: APP_NAME)
+    let failures = result.catalogFailures
+    if !failures.isEmpty {
+        let details = failures
             .map { provider, error in "\(provider): \(error.localizedDescription)" }
             .sorted()
             .joined(separator: "; ")
-        return .failure("Could not refresh model catalogs: \(details)")
+        return .failure((warnings + ["Could not refresh model catalogs: \(details)"]).joined(separator: "\n"))
     }
-    return .success("Model catalogs refreshed.")
+    return CLICommandResult(stdout: "Model catalogs refreshed",
+                            stderr: warnings.isEmpty ? nil : warnings.joined(separator: "\n"), exitCode: 0)
 }
 
 private enum AuthProviderResolution {

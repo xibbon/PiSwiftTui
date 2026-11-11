@@ -10,14 +10,36 @@ public func selectConfig(
     cwd: String,
     agentDir: String,
     initialProjectMode: Bool = false,
-    projectTrusted: Bool = true
+    projectTrusted: Bool = true,
+    prepareTheme: (@MainActor (SettingsManager) async -> Void)? = nil,
+    installKeybindings: (@MainActor (KeybindingsManager) -> Void)? = nil,
+    startUI: (@MainActor (TUI, ConfigSelectorComponent, SettingsManager, () -> Void) -> Void)? = nil
 ) async {
     await withCheckedContinuation { continuation in
         Task { @MainActor in
-            await prepareStartupTheme(settingsManager, enableWatcher: true)
-            let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: getAgentDir())
+            if let prepareTheme {
+                await prepareTheme(settingsManager)
+            } else {
+                await prepareStartupTheme(settingsManager, enableWatcher: true)
+            }
+            let keybindings = KeybindingsManager.load(agentDir: agentDir)
+            if let installKeybindings {
+                installKeybindings(keybindings)
+            } else {
+                keybindings.activate()
+            }
+            let ui = TUI(terminal: ProcessTerminal(), showHardwareCursor: settingsManager.getShowHardwareCursor(), logDirectory: agentDir)
             ui.setClearOnShrink(getClearOnShrink(cwd: cwd, agentDir: agentDir, loadProjectSettings: projectTrusted))
             var resolved = false
+            let close: () -> Void = {
+                guard !resolved else { return }
+                resolved = true
+                if startUI == nil {
+                    ui.stop()
+                    stopThemeWatcher()
+                }
+                continuation.resume()
+            }
 
             let globalPaths = try? await resolveBuiltinExtensionPaths(settingsManager: settingsManager,
                 names: resolvedPaths.extensions.filter { $0.metadata.source == "builtin" }.map { String($0.path.dropFirst(BUILTIN_PATH_PREFIX.count)) },
@@ -27,13 +49,7 @@ public func selectConfig(
                 settingsManager: settingsManager,
                 cwd: cwd,
                 agentDir: agentDir,
-                onClose: {
-                    guard !resolved else { return }
-                    resolved = true
-                    ui.stop()
-                    stopThemeWatcher()
-                    continuation.resume()
-                },
+                onClose: close,
                 onExit: {
                     ui.stop()
                     stopThemeWatcher()
@@ -48,7 +64,11 @@ public func selectConfig(
 
             ui.addChild(selector)
             ui.setFocus(selector.getResourceList())
-            startStartupTui(ui, settingsManager: settingsManager)
+            if let startUI {
+                startUI(ui, selector, settingsManager, close)
+            } else {
+                startStartupTui(ui, settingsManager: settingsManager)
+            }
         }
     }
 }

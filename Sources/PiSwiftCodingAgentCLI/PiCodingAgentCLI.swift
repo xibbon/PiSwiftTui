@@ -530,6 +530,11 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
 
     static func main() async {
         let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.starts(with: ["auth", "login"]),
+           arguments.dropFirst(2).contains(where: { $0.hasPrefix("--api-key=") }) {
+            fputs("Usage: pi auth login <provider> [--api-key] [--no-browser]\n", stderr)
+            Darwin.exit(1)
+        }
         let routed = Self.moveLeadingSubcommandToFront(arguments)
         if routed.first == "mcp" {
             await runMcpCLI(Array(routed.dropFirst()))
@@ -685,6 +690,10 @@ Examples:
   \(APP_NAME) package remove <source>
   \(APP_NAME) package update [source]
   \(APP_NAME) package list
+
+  # Log in to or out of a provider
+  \(APP_NAME) auth login <provider> [--api-key] [--no-browser]
+  \(APP_NAME) auth logout <provider>
 
   # Check or export credentials
   \(APP_NAME) auth check --provider openai
@@ -850,23 +859,42 @@ func prepareInitialMessage(
         return PreparedInitialMessage(message: nil, images: nil)
     }
 
-    let processed = try processFileArguments(
-        parsed.fileArgs,
-        options: ProcessFileOptions(autoResizeImages: autoResizeImages, blockImages: blockImages, resizeOptions: resizeOptions)
-    )
-    let textContent = processed.textContent
+    let options = ProcessFileOptions(autoResizeImages: autoResizeImages, blockImages: blockImages, resizeOptions: resizeOptions)
+    var textContent = ""
+    var imageAttachments: [ImageContent] = []
+    for fileArg in parsed.fileArgs {
+        let processed = try processFileArguments([fileArg], options: options)
+        var fileText = processed.textContent
+        var fileImages = processed.imageAttachments
+        if !autoResizeImages, !blockImages, fileImages.count == 1,
+           fileImages[0].mimeType == "image/bmp" {
+            if let converted = convertToPng(fileImages[0].data, "image/bmp") {
+                fileImages[0] = converted
+                if let end = fileText.range(of: "</file>\n", options: .backwards) {
+                    fileText.insert(contentsOf: "[Image converted from image/bmp to image/png.]", at: end.lowerBound)
+                }
+            } else {
+                fileImages.removeAll()
+                if let end = fileText.range(of: "</file>\n", options: .backwards) {
+                    fileText.insert(contentsOf: "[Image omitted: could not be converted to a supported inline image format.]", at: end.lowerBound)
+                }
+            }
+        }
+        textContent += fileText
+        imageAttachments += fileImages
+    }
     if parsed.messages.isEmpty {
-        return PreparedInitialMessage(message: textContent, images: processed.imageAttachments.isEmpty ? nil : processed.imageAttachments)
+        return PreparedInitialMessage(message: textContent, images: imageAttachments.isEmpty ? nil : imageAttachments)
     }
 
     let first = parsed.messages.removeFirst()
     return PreparedInitialMessage(
         message: textContent + first,
-        images: processed.imageAttachments.isEmpty ? nil : processed.imageAttachments
+        images: imageAttachments.isEmpty ? nil : imageAttachments
     )
 }
 
-private func getChangelogForDisplay(_ parsed: Args, _ settingsManager: SettingsManager) -> String? {
+func getChangelogForDisplay(_ parsed: Args, _ settingsManager: SettingsManager) -> String? {
     if parsed.continue == true || parsed.resume == true {
         return nil
     }

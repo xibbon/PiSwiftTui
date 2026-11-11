@@ -251,8 +251,9 @@ struct McpCommandTests {
             (["list", "--bogus"], "Unknown option --bogus.\nUse \"pi mcp --help\" for usage."),
             (["add", "x", "--url"], "--url needs a value."),
             (["list", "x"], "Usage: pi mcp list [--json]\nUse \"pi mcp --help\" for usage."),
-            (["login"], "Usage: pi mcp login <server>\nUse \"pi mcp --help\" for usage."),
-            (["logout", "a", "b"], "Usage: pi mcp logout <server>\nUse \"pi mcp --help\" for usage."),
+            // v1.5.2 PT5: extensions/mcp/cli.ts:271 adds [-l] to login/logout usage.
+            (["login"], "Usage: pi mcp login <server> [-l]\nUse \"pi mcp --help\" for usage."),
+            (["logout", "a", "b"], "Usage: pi mcp logout <server> [-l]\nUse \"pi mcp --help\" for usage."),
             (["add", "x", "--env", "A", "--", "cmd"], "--env expects KEY=VALUE, got \"A\"."),
             (["add", "x", "--url", "https://example.com", "--cwd", "src"], "--cwd only applies to stdio servers."),
             (["add", "x", "--oauth-client-id", "pi", "--", "cmd"], "--oauth-client-id only applies to HTTP servers (--url).")]

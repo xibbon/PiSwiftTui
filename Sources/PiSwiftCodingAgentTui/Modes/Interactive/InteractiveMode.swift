@@ -5221,6 +5221,11 @@ public final class InteractiveMode {
             onPrompt: { prompt in
                 try await dialog.showPrompt(prompt.message, prompt.placeholder)
             },
+            onDeviceCode: { info in
+                guard !dialog.signal.isCancelled else { return }
+                dialog.showDeviceCode(info)
+                dialog.showWaiting("Waiting for authentication...")
+            },
             onProgress: { message in
                 guard !dialog.signal.isCancelled else { return }
                 dialog.showProgress(message)

@@ -26,8 +26,12 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
     private var pendingInputId: UUID?
     private var removeInputCancellationHandler: (@Sendable () -> Void)?
     private var authURL: AuthUrlComponent?
+    private var deviceCodeAction: (info: OAuthDeviceCodeInfo, hint: Container)?
     var authBrowserOpener: (String) -> Bool = openBrowser
     var authURLCopy: @MainActor (String) -> PiSwiftCodingAgent.ClipboardCopyResult = copyToClipboard
+    var deviceCodeConfirmKeyMatches: (String) -> Bool = {
+        getKeybindings().matches($0, TUIKeybinding.selectConfirm)
+    }
     public let signal: CancellationToken
     public var focused: Bool {
         get { input.focused }
@@ -129,6 +133,7 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
     }
 
     public func showAuth(_ url: String, _ instructions: String?) {
+        deviceCodeAction = nil
         contentContainer.clear()
         contentContainer.addChild(Spacer(1))
         let link = AuthUrlComponent(url: url, requestRender: { [tui] in tui.requestRender() },
@@ -148,7 +153,67 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
         tui.requestRender()
     }
 
+    public func showDeviceCode(_ info: OAuthDeviceCodeInfo) {
+        authURL = nil
+        deviceCodeAction = nil
+        contentContainer.clear()
+        contentContainer.addChild(Spacer(1))
+        let shownURL = replaceControlCharacters(info.verificationUri)
+        let safeURL = trustedOAuthHttpURL(info.verificationUri)
+        contentContainer.addChild(Text(theme.fg(.accent,
+            safeURL.map { hyperlink(shownURL, url: $0) } ?? shownURL), paddingX: 1, paddingY: 0))
+#if os(macOS)
+        let clickHint = "Cmd+click to open"
+#else
+        let clickHint = "Ctrl+click to open"
+#endif
+        contentContainer.addChild(Text(theme.fg(.dim,
+            safeURL.map { hyperlink(clickHint, url: $0) } ?? clickHint), paddingX: 1, paddingY: 0))
+        contentContainer.addChild(Spacer(1))
+        contentContainer.addChild(Text(theme.fg(.warning,
+            "Enter code: \(replaceControlCharacters(info.userCode))"), paddingX: 1, paddingY: 0))
+
+        if !signal.isCancelled, info.openBrowserOnConfirm || info.copyCodeOnConfirm {
+            let actionLabel: String
+            if info.openBrowserOnConfirm {
+                actionLabel = info.copyCodeOnConfirm ? "to open browser and copy code" : "to open browser"
+            } else {
+                actionLabel = "to copy code"
+            }
+            let hint = Container()
+            let confirmKeys = formatKeys(getKeybindings().getKeys(TUIKeybinding.selectConfirm))
+            hint.addChild(Text(theme.fg(.dim, "(\(confirmKeys) \(actionLabel))"), paddingX: 1, paddingY: 0))
+            contentContainer.addChild(hint)
+            deviceCodeAction = (info, hint)
+        }
+        tui.requestRender()
+    }
+
+    private func setDeviceCodeStatus(_ hint: Container, _ message: String) {
+        guard !signal.isCancelled, focused else { return }
+        hint.clear()
+        hint.addChild(Text(theme.fg(.dim, message), paddingX: 1, paddingY: 0))
+        tui.requestRender()
+    }
+
+    private func activateDeviceCode(_ action: (info: OAuthDeviceCodeInfo, hint: Container)) {
+        let info = action.info
+        setDeviceCodeStatus(action.hint, info.copyCodeOnConfirm ? "Copying code..." : "Browser open requested")
+        if info.copyCodeOnConfirm {
+            switch authURLCopy(info.userCode) {
+            case .success, .osc52SentUnverified:
+                setDeviceCodeStatus(action.hint, "Code copied to clipboard")
+            case .failure:
+                setDeviceCodeStatus(action.hint, "Copy code manually")
+            }
+        }
+        if info.openBrowserOnConfirm, let url = trustedOAuthHttpURL(info.verificationUri) {
+            _ = authBrowserOpener(url)
+        }
+    }
+
     public func showManualInput(_ prompt: String) async throws -> String {
+        deviceCodeAction = nil
         guard !signal.isCancelled, !Task.isCancelled else { throw LoginDialogError.cancelled }
         contentContainer.addChild(Spacer(1))
         contentContainer.addChild(Text(theme.fg(.dim, prompt), paddingX: 1, paddingY: 0))
@@ -162,6 +227,7 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
     }
 
     public func showPrompt(_ message: String, _ placeholder: String? = nil, secret: Bool = false) async throws -> String {
+        deviceCodeAction = nil
         guard !signal.isCancelled else { throw LoginDialogError.cancelled }
         contentContainer.addChild(Spacer(1))
         contentContainer.addChild(Text(theme.fg(.text, message), paddingX: 1, paddingY: 0))
@@ -178,6 +244,7 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
 
     public func showDetails(_ lines: [String]) {
         authURL = nil
+        deviceCodeAction = nil
         contentContainer.clear()
         contentContainer.addChild(Spacer(1))
         for line in lines {
@@ -220,6 +287,12 @@ public final class LoginDialogComponent: Container, SystemCursorAware, Focusable
         }
         if let authURL, appKeyMatches(keyData, .copyMessage) {
             authURL.copy()
+            return
+        }
+        if let action = deviceCodeAction, inputResolver == nil, !signal.isCancelled,
+           focused, deviceCodeConfirmKeyMatches(keyData) {
+            deviceCodeAction = nil
+            activateDeviceCode(action)
             return
         }
         input.handleInput(keyData)
