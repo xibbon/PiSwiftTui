@@ -20,8 +20,11 @@ public final class UserMessageComponent: Container {
             color: { theme.fg(.userMessageText, $0) },
             bgColor: { theme.bg(.userMessageBg, $0) }
         )
-        let transforms = hostMarkdownTransform(runner: markdownRunner, type: .user,
+        var transforms = hostMarkdownTransform(runner: markdownRunner, type: .user,
             messageId: messageId, timestamp: messageTimestamp).map { [$0] } ?? []
+        if markdownConfiguration.mermaidEnabled {
+            transforms.append(createMermaidMarkdownTransform(options: MermaidMarkdownTransformOptions(theme: theme)))
+        }
         addChild(Markdown(
             text,
             paddingX: markdownConfiguration.outputPad,

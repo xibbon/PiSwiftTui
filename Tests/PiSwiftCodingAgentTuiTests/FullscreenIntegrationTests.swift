@@ -134,7 +134,8 @@ private final class FullscreenTestTerminal: Terminal {
     #expect(rendered.contains("After"))
 
     let unsupported = "```mermaid\npie\n  title Pets\n  \"Dogs\" : 4\n```"
-    #expect(transform(unsupported, 100) == unsupported)
+    // v1.5.2 PT2: mermaid.test.ts:51 renders pie diagrams.
+    #expect(transform(unsupported, 100).contains("Dogs  ████████████████████ 100%"))
 }
 
 @MainActor

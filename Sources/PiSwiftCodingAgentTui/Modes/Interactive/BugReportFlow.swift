@@ -84,7 +84,8 @@ struct BugReportUI {
             let component = HookEditorComponent(tui: tui, title: "Report a bug", prefill: initialHint,
                 description: "\(bugReportDisclaimer)\n\nWhat went wrong? (optional)",
                 onSubmit: { value in restoreEditor(); continuation.resume(returning: value) },
-                onCancel: { restoreEditor(); continuation.resume(returning: nil) })
+                onCancel: { restoreEditor(); continuation.resume(returning: nil) },
+                externalEditorCommand: session.settingsManager.getExternalEditorCommand())
             show(component)
         }
     }

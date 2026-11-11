@@ -319,7 +319,7 @@ public final class InteractiveMode {
     private var verboseStartup = false
     private var pendingResourceDisplayOptions: ResourceDisplayOptions?
 
-    private var pendingMessagesContainer: Container?
+    var pendingMessagesContainer: Container?
     private(set) var statusContainer: Container?
     private var widgetContainer: Container?
     private var defaultEditor: CustomEditor?
@@ -399,8 +399,8 @@ public final class InteractiveMode {
     private var isBashMode = false
     private var bashComponent: BashExecutionComponent?
     private var bashAbort: CancellationToken?
-    private var pendingBashComponents: [BashExecutionComponent] = []
-    private var pendingBashMessages: [BashExecutionMessage] = []
+    var pendingBashComponents: [BashExecutionComponent] = []
+    var pendingBashMessages: [BashExecutionMessage] = []
 
     private var pendingSteeringMessages: [String] = []
     private var pendingFollowUpMessages: [String] = []
@@ -1541,10 +1541,11 @@ public final class InteractiveMode {
 
     @MainActor
     func showHookEditor(_ title: String, _ prefill: String?) async -> String? {
-        guard let tui else { return nil }
+        guard let tui, let session else { return nil }
         return await waitForExtensionDialog { wait in
             let editor = HookEditorComponent(tui: tui, title: title, prefill: prefill,
-                onSubmit: { wait.finish($0) }, onCancel: { wait.finish(nil) })
+                onSubmit: { wait.finish($0) }, onCancel: { wait.finish(nil) },
+                externalEditorCommand: session.settingsManager.getExternalEditorCommand())
             wait.component = editor
             pushExtensionDialog(ExtensionDialog(id: wait.id, component: editor,
                 blocked: BlockedStatus(kind: .question, message: title), cancel: { wait.finish(nil) }))
@@ -2193,6 +2194,7 @@ public final class InteractiveMode {
             }
         case .agentSettled:
             // Hook follow-ups and persisted display-only entries settle after agent_end.
+            flushPendingBashComponents()
             renderInitialMessages()
             if extensionShutdownRequested, session?.isIdle == true {
                 extensionShutdownRequested = false
@@ -2212,7 +2214,8 @@ public final class InteractiveMode {
                 }
                 renderInitialMessages(entries: Array(entries.dropFirst()))
                 let compactionMessage = CompactionSummaryMessage(summary: result.summary, tokensBefore: result.tokensBefore, timestamp: Int64(Date().timeIntervalSince1970 * 1000))
-                let component = CompactionSummaryMessageComponent(message: compactionMessage, outputPad: tuiConfiguration.outputPad)
+                let component = CompactionSummaryMessageComponent(message: compactionMessage, outputPad: tuiConfiguration.outputPad,
+                    mermaidEnabled: tuiConfiguration.mermaidEnabled)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 if let usage = result.usage { addSummaryCostNotice(usage) }
@@ -2482,13 +2485,15 @@ public final class InteractiveMode {
                 }
             case .compaction(let entry):
                 let component = CompactionSummaryMessageComponent(message: CompactionSummaryMessage(summary: entry.summary, tokensBefore: entry.tokensBefore, timestamp: 0), outputPad: tuiConfiguration.outputPad,
-                    markdownRunner: session.hookRunner, messageId: entry.id, messageTimestamp: entry.timestamp)
+                    markdownRunner: session.hookRunner, messageId: entry.id, messageTimestamp: entry.timestamp,
+                    mermaidEnabled: tuiConfiguration.mermaidEnabled)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 if let usage = entry.usage { addSummaryCostNotice(usage) }
             case .branchSummary(let entry):
                 let component = BranchSummaryMessageComponent(message: BranchSummaryMessage(summary: entry.summary, fromId: entry.fromId, timestamp: 0), outputPad: tuiConfiguration.outputPad,
-                    markdownRunner: session.hookRunner, messageId: entry.id, messageTimestamp: entry.timestamp)
+                    markdownRunner: session.hookRunner, messageId: entry.id, messageTimestamp: entry.timestamp,
+                    mermaidEnabled: tuiConfiguration.mermaidEnabled)
                 component.setExpanded(toolOutputExpanded)
                 chatContainer.addChild(component)
                 if let usage = entry.usage { addSummaryCostNotice(usage, branch: true) }
@@ -2594,14 +2599,16 @@ public final class InteractiveMode {
             case "branchSummary":
                 if let summary = decodeBranchSummaryMessage(custom) {
                     let component = BranchSummaryMessageComponent(message: summary, outputPad: tuiConfiguration.outputPad,
-                        markdownRunner: session?.hookRunner, messageId: messageId, messageTimestamp: messageTimestamp)
+                        markdownRunner: session?.hookRunner, messageId: messageId, messageTimestamp: messageTimestamp,
+                        mermaidEnabled: tuiConfiguration.mermaidEnabled)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
             case "compactionSummary":
                 if let summary = decodeCompactionSummaryMessage(custom) {
                     let component = CompactionSummaryMessageComponent(message: summary, outputPad: tuiConfiguration.outputPad,
-                        markdownRunner: session?.hookRunner, messageId: messageId, messageTimestamp: messageTimestamp)
+                        markdownRunner: session?.hookRunner, messageId: messageId, messageTimestamp: messageTimestamp,
+                        mermaidEnabled: tuiConfiguration.mermaidEnabled)
                     component.setExpanded(toolOutputExpanded)
                     chatContainer.addChild(component)
                 }
@@ -2994,7 +3001,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func updatePendingMessagesDisplay() {
+    func updatePendingMessagesDisplay() {
         guard let pendingMessagesContainer else { return }
         pendingMessagesContainer.clear()
 
@@ -3023,7 +3030,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func flushPendingBashComponents() {
+    func flushPendingBashComponents() {
         guard let session else { return }
         for component in pendingBashComponents {
             pendingMessagesContainer?.removeChild(component)
@@ -3456,6 +3463,9 @@ public final class InteractiveMode {
                 customEntry.setExpanded(toolOutputExpanded)
             }
         }
+        for component in pendingBashComponents {
+            component.setExpanded(expanded)
+        }
         showStatus("Tool output: \(expanded ? "expanded" : "collapsed")")
     }
 
@@ -3480,42 +3490,17 @@ public final class InteractiveMode {
 
     @MainActor
     private func openExternalEditor() async {
-        guard let editor, let tui else { return }
-        let editorCmd = ProcessInfo.processInfo.environment["VISUAL"] ?? ProcessInfo.processInfo.environment["EDITOR"]
-        guard let editorCmd, !editorCmd.isEmpty else {
-            showWarning("No editor configured. Set VISUAL or EDITOR.")
-            return
-        }
+        guard let editor, let tui, let session else { return }
+        let editorCmd = session.settingsManager.getExternalEditorCommand()
 
-        let currentText = editor.getText()
-        let tmpFile = (NSTemporaryDirectory() as NSString).appendingPathComponent("pi-editor-\(Int(Date().timeIntervalSince1970)).md")
-
-        do {
-            try currentText.write(toFile: tmpFile, atomically: true, encoding: .utf8)
-
-            tui.stop()
-
-            let parts = editorCmd.split(separator: " ").map(String.init)
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: parts[0])
-            process.arguments = Array(parts.dropFirst()) + [tmpFile]
-            process.standardInput = FileHandle.standardInput
-            process.standardOutput = FileHandle.standardOutput
-            process.standardError = FileHandle.standardError
-            try process.run()
-            process.waitUntilExit()
-
-            if process.terminationStatus == 0 {
-                let newContent = (try? String(contentsOfFile: tmpFile, encoding: .utf8)) ?? currentText
-                editor.setText(splitBom(newContent).text.trimmingCharacters(in: .newlines))
-            }
-        } catch {
-            showWarning("Failed to open external editor")
-        }
-
-        try? FileManager.default.removeItem(atPath: tmpFile)
-
+        let currentText = editor.getExpandedText()
+        tui.stop()
+        let result = editInExternalEditor(command: editorCmd, content: currentText)
         tui.start()
+        switch result {
+        case .complete(let content): editor.setText(content)
+        case .failed(let message): showStatus(message)
+        }
         tui.requestRender()
     }
 
@@ -3848,9 +3833,11 @@ public final class InteractiveMode {
             // never fall back to local execution.
             return
         }
+        guard self.session === session else { return }
 
         if let result = eventResult?.result {
             let component = BashExecutionComponent(command: command, ui: tui, excludeFromContext: excludeFromContext, outputPad: tuiConfiguration.outputPad)
+            component.setExpanded(toolOutputExpanded)
             bashComponent = component
 
             let deferDisplay = session.isStreaming
@@ -3894,6 +3881,7 @@ public final class InteractiveMode {
 
         let operations = eventResult?.operations ?? DefaultBashOperations()
         let component = BashExecutionComponent(command: command, ui: tui, excludeFromContext: excludeFromContext, outputPad: tuiConfiguration.outputPad)
+        component.setExpanded(toolOutputExpanded)
         bashComponent = component
 
         let deferDisplay = session.isStreaming
@@ -3922,6 +3910,15 @@ public final class InteractiveMode {
                 }, signal: abortToken, cwd: session.sessionManager.getCwd())
             )
 
+            guard self.session === session else {
+                if bashComponent === component {
+                    bashComponent = nil
+                    bashAbort = nil
+                    footer?.setBashToolRunning(false)
+                }
+                return
+            }
+
             let truncation = result.truncated ? truncateTail(result.output) : nil
             component.setComplete(exitCode: result.exitCode, cancelled: result.cancelled, truncationResult: truncation, fullOutputPath: result.fullOutputPath)
 
@@ -3945,6 +3942,7 @@ public final class InteractiveMode {
                 }
             }
         } catch {
+            guard self.session === session else { return }
             component.setComplete(exitCode: nil, cancelled: false)
             showError("Bash command failed: \(error.localizedDescription)")
         }

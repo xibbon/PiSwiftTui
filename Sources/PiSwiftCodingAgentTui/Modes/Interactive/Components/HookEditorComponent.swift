@@ -8,6 +8,8 @@ public final class HookEditorComponent: Container, SystemCursorAware {
     private let onSubmitCallback: (String) -> Void
     private let onCancelCallback: () -> Void
     private let tui: TUI
+    private let externalEditorCommand: String
+    private let editorFailure = Text("")
     public var usesSystemCursor: Bool {
         get { editor.usesSystemCursor }
         set { editor.usesSystemCursor = newValue }
@@ -19,11 +21,16 @@ public final class HookEditorComponent: Container, SystemCursorAware {
         prefill: String? = nil,
         description: String? = nil,
         onSubmit: @escaping (String) -> Void,
-        onCancel: @escaping () -> Void
+        onCancel: @escaping () -> Void,
+        externalEditorCommand: String? = nil
     ) {
         self.tui = tui
         self.onSubmitCallback = onSubmit
         self.onCancelCallback = onCancel
+        self.externalEditorCommand = externalEditorCommand
+            ?? ProcessInfo.processInfo.environment["VISUAL"]
+            ?? ProcessInfo.processInfo.environment["EDITOR"]
+            ?? "nano"
         self.editor = Editor(theme: getEditorTheme())
 
         super.init()
@@ -41,12 +48,10 @@ public final class HookEditorComponent: Container, SystemCursorAware {
             editor.setText(prefill)
         }
         addChild(editor)
+        addChild(editorFailure)
 
         addChild(Spacer(1))
-        let hasExternal = (ProcessInfo.processInfo.environment["VISUAL"] ?? ProcessInfo.processInfo.environment["EDITOR"]) != nil
-        let hint = hasExternal
-            ? "ctrl+enter submit  esc cancel  ctrl+g external editor"
-            : "ctrl+enter submit  esc cancel"
+        let hint = "ctrl+enter submit  esc cancel  ctrl+g external editor"
         addChild(Text(theme.fg(.dim, hint), paddingX: 1, paddingY: 0))
         addChild(Spacer(1))
         addChild(DynamicBorder())
@@ -69,42 +74,16 @@ public final class HookEditorComponent: Container, SystemCursorAware {
     }
 
     private func openExternalEditor() {
-        let env = ProcessInfo.processInfo.environment
-        let editorCmd = env["VISUAL"] ?? env["EDITOR"]
-        guard let editorCmd else { return }
-
-        let currentText = editor.getText()
-        let tmpFile = (NSTemporaryDirectory() as NSString).appendingPathComponent("pi-hook-editor-\(Int(Date().timeIntervalSince1970)).md")
-
-        do {
-            try currentText.write(toFile: tmpFile, atomically: true, encoding: .utf8)
-            tui.stop()
-
-            let components = editorCmd.split(separator: " ").map(String.init)
-            guard let editorExec = components.first else { return }
-            let args = Array(components.dropFirst()) + [tmpFile]
-
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: editorExec)
-            process.arguments = args
-            process.standardInput = FileHandle.standardInput
-            process.standardOutput = FileHandle.standardOutput
-            process.standardError = FileHandle.standardError
-
-            try process.run()
-            process.waitUntilExit()
-
-            if process.terminationStatus == 0 {
-                let newContent = try String(contentsOfFile: tmpFile, encoding: .utf8)
-                    .replacingOccurrences(of: "\n$", with: "", options: .regularExpression)
-                editor.setText(newContent)
-            }
-        } catch {
-            // Ignore errors; fall back to current editor state.
-        }
-
-        try? FileManager.default.removeItem(atPath: tmpFile)
+        tui.stop()
+        let result = editInExternalEditor(command: externalEditorCommand, content: editor.getText())
         tui.start()
+        switch result {
+        case .complete(let content):
+            editor.setText(content)
+            editorFailure.setText("")
+        case .failed(let message):
+            editorFailure.setText(theme.fg(.warning, message))
+        }
         tui.requestRender()
     }
 }

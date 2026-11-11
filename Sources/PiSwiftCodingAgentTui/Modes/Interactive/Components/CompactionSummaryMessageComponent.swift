@@ -8,14 +8,16 @@ public final class CompactionSummaryMessageComponent: Box, OutputPaddingSetting 
     private let markdownRunner: HookRunner?
     private let messageId: String?
     private let messageTimestamp: String?
+    private let mermaidEnabled: Bool
 
     public init(message: CompactionSummaryMessage, outputPad: Int = 1,
                 markdownRunner: HookRunner? = nil, messageId: String? = nil,
-                messageTimestamp: String? = nil) {
+                messageTimestamp: String? = nil, mermaidEnabled: Bool = true) {
         self.message = message
         self.markdownRunner = markdownRunner
         self.messageId = messageId
         self.messageTimestamp = messageTimestamp
+        self.mermaidEnabled = mermaidEnabled
         super.init(paddingX: outputPad, paddingY: 1, bgFn: { theme.bg(.customMessageBg, $0) })
         updateDisplay()
     }
@@ -45,8 +47,11 @@ public final class CompactionSummaryMessageComponent: Box, OutputPaddingSetting 
         if expanded {
             let header = "**Compacted from \(tokenStr) tokens**\n\n"
             let style = DefaultTextStyle(color: { theme.fg(.customMessageText, $0) })
-            let transforms = hostPrefixedMarkdownTransform(runner: markdownRunner, type: .summary, header: header,
+            var transforms = hostPrefixedMarkdownTransform(runner: markdownRunner, type: .summary, header: header,
                 messageId: messageId, timestamp: messageTimestamp).map { [$0] } ?? []
+            if mermaidEnabled {
+                transforms.append(createMermaidMarkdownTransform(options: MermaidMarkdownTransformOptions(theme: theme)))
+            }
             content.addChild(Markdown(header + message.summary, paddingX: 0, paddingY: 0,
                 theme: getMarkdownTheme(), defaultTextStyle: style,
                 options: MarkdownOptions(sourceTransforms: transforms)))

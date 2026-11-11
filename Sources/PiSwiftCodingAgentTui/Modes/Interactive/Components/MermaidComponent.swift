@@ -1,6 +1,15 @@
 import Foundation
 import MiniTui
 import PiSwiftCodingAgent
+import Synchronization
+
+private struct MermaidCacheEntry: Sendable {
+    let source: String
+    let width: Int
+    let themeKey: String
+    let hyperlinks: Bool
+    let result: String
+}
 
 public struct MermaidMarkdownTransformOptions: Sendable {
     public var enabled: Bool
@@ -24,6 +33,8 @@ public struct MermaidMarkdownTransformOptions: Sendable {
 private struct MermaidNode: Sendable {
     let id: String
     let label: String
+    let style: MermaidAuthoredStyle?
+    let href: String?
 }
 
 private struct MermaidDiagram: Sendable {
@@ -49,12 +60,26 @@ private struct MermaidFence {
 public func createMermaidMarkdownTransform(
     options: MermaidMarkdownTransformOptions
 ) -> MarkdownSourceTransform {
-    { source, width in
+    let cache = Mutex<MermaidCacheEntry?>(nil)
+    return { source, width in
         guard options.enabled,
               !options.isStreaming || options.renderWhileStreaming else {
             return source
         }
-        return transformMermaidFences(source, width: width, options: options)
+        let hyperlinks = getCapabilities().hyperlinks
+        let themeKey = options.theme.map {
+            $0.getFgAnsi(.borderMuted) + $0.getFgAnsi(.text) + $0.getFgAnsi(.accent)
+        } ?? ""
+        if let hit = cache.withLock({ $0 }), hit.source == source, hit.width == width,
+           hit.themeKey == themeKey, hit.hyperlinks == hyperlinks {
+            return hit.result
+        }
+        let result = transformMermaidFences(source, width: width, options: options)
+        if source.utf8.count + result.utf8.count <= 1_048_576 {
+            cache.withLock { $0 = MermaidCacheEntry(source: source, width: width,
+                themeKey: themeKey, hyperlinks: hyperlinks, result: result) }
+        }
+        return result
     }
 }
 
@@ -66,28 +91,56 @@ private func transformMermaidFences(
     let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
     var output: [String] = []
     var index = 0
+    var replacedAtEnd = false
 
     while index < lines.count {
         guard let fence = mermaidFence(lines: lines, start: index, allowUnclosed: options.isStreaming) else {
             output.append(lines[index])
+            replacedAtEnd = false
             index += 1
             continue
         }
 
         let original = lines[fence.start...fence.end].joined(separator: "\n")
-        guard let diagram = parseMermaidDiagram(fence.body),
-              let rendered = renderMermaidDiagram(diagram, theme: options.theme),
+        let safeBody = String(String.UnicodeScalarView(fence.body.unicodeScalars.filter { scalar in
+            let value = scalar.value
+            return value == 9 || value == 10 || value == 13 ||
+                (value >= 32 && value != 127 && !(128...159).contains(value))
+        }))
+        let pie = renderMermaidPie(safeBody, theme: options.theme)
+        let presentation = mermaidFlowPresentation(safeBody)
+        var rendered = pie?.lines ?? parseMermaidDiagram(presentation.source)
+            .flatMap { renderMermaidDiagram($0, theme: options.theme, presentation: presentation) }
+        if options.isStreaming, rendered != nil {
+            for label in presentation.orphanLabels {
+                rendered?.append("")
+                rendered?.append("┌" + String(repeating: "─", count: label.count + 2) + "┐")
+                rendered?.append("│ \(label) │")
+                rendered?.append("└" + String(repeating: "─", count: label.count + 2) + "┘")
+            }
+        }
+        guard let rendered,
               rendered.allSatisfy({ visibleWidth($0) <= width }) else {
             output.append(original)
+            replacedAtEnd = false
             index = fence.end + 1
             continue
         }
 
-        output.append(rendered.map(markdownCodeSpan).joined(separator: "  \n"))
+        let warnings = pie?.warnings ?? presentation.warnings
+        if let warning = warnings.first, !options.isStreaming {
+            let suffix = warnings.count > 1 ? " (+\(warnings.count - 1) more)" : ""
+            let notice = "Mermaid diagram not rendered: \(warning)\(suffix)"
+            output.append(original + "\n" + markdownCodeSpan(options.theme?.fg(.warning, notice) ?? notice) + "  ")
+        } else {
+            output.append(rendered.map(markdownCodeSpan).joined(separator: "  \n"))
+        }
+        replacedAtEnd = true
         index = fence.end + 1
     }
 
-    return output.joined(separator: "\n")
+    let transformed = output.joined(separator: "\n")
+    return replacedAtEnd ? transformed + "\n" : transformed
 }
 
 private func mermaidFence(lines: [String], start: Int, allowUnclosed: Bool) -> MermaidFence? {
@@ -206,7 +259,7 @@ private func parseMermaidNode(_ token: String) -> MermaidNode? {
     guard !id.isEmpty else { return nil }
     let remainder = trimmed.dropFirst(id.count).trimmingCharacters(in: .whitespaces)
     if remainder.isEmpty {
-        return MermaidNode(id: String(id), label: String(id))
+        return MermaidNode(id: String(id), label: String(id), style: nil, href: nil)
     }
 
     let pairs: [(Character, Character)] = [("[", "]"), ("(", ")"), ("{", "}")]
@@ -220,70 +273,95 @@ private func parseMermaidNode(_ token: String) -> MermaidNode? {
         label = String(label.dropFirst().dropLast())
     }
     guard !label.isEmpty, !label.contains("[") && !label.contains("]") else { return nil }
-    return MermaidNode(id: String(id), label: label)
+    return MermaidNode(id: String(id), label: label, style: nil, href: nil)
 }
 
-private func renderMermaidDiagram(_ diagram: MermaidDiagram, theme: Theme?) -> [String]? {
+private func renderMermaidDiagram(_ diagram: MermaidDiagram, theme: Theme?, presentation: MermaidFlowPresentation) -> [String]? {
     guard !diagram.nodes.isEmpty else { return nil }
+    let nodes = diagram.nodes.map { MermaidNode(id: $0.id, label: $0.label,
+        style: presentation.styles[$0.id], href: presentation.links[$0.id]) }
     switch diagram.direction {
     case .horizontal:
-        return renderHorizontalMermaid(diagram.nodes, theme: theme)
+        return renderHorizontalMermaid(nodes, theme: theme, edgeStyles: presentation.edgeStyles)
     case .vertical:
-        return renderVerticalMermaid(diagram.nodes, theme: theme)
+        return renderVerticalMermaid(nodes, theme: theme, edgeStyles: presentation.edgeStyles)
     }
 }
 
-private func renderHorizontalMermaid(_ nodes: [MermaidNode], theme: Theme?) -> [String] {
-    let tops = nodes.map { styledBorder("┌" + String(repeating: "─", count: $0.label.count + 2) + "┐", theme) }
-    let bottoms = nodes.map { styledBorder("└" + String(repeating: "─", count: $0.label.count + 2) + "┘", theme) }
+private func renderHorizontalMermaid(_ nodes: [MermaidNode], theme: Theme?, edgeStyles: [Int: MermaidAuthoredStyle]) -> [String] {
+    let tops = nodes.map { styledBorder("┌" + String(repeating: "─", count: $0.label.count + 2) + "┐", theme, style: $0.style) }
+    let bottoms = nodes.map { styledBorder("└" + String(repeating: "─", count: $0.label.count + 2) + "┘", theme, style: $0.style) }
     var middle = ""
     for index in nodes.indices {
         let node = nodes[index]
-        middle += styledBorder("│", theme) + " " + styledText(node.label, theme) + " "
+        middle += styledBorder("│", theme, style: node.style) + styledNodeSpace(node, theme: theme)
+            + linkedText(node, theme: theme) + styledNodeSpace(node, theme: theme)
         if index == nodes.count - 1 {
-            middle += styledBorder("│", theme)
+            middle += styledBorder("│", theme, style: node.style)
         } else {
-            middle += styledBorder("├", theme) + styledEdge("───▶", theme)
+            middle += styledBorder("├", theme, style: node.style) + styledEdge("───▶", theme, style: edgeStyles[index])
         }
     }
     return [tops.joined(separator: "    "), middle, bottoms.joined(separator: "    ")]
 }
 
-private func renderVerticalMermaid(_ nodes: [MermaidNode], theme: Theme?) -> [String] {
+private func renderVerticalMermaid(_ nodes: [MermaidNode], theme: Theme?, edgeStyles: [Int: MermaidAuthoredStyle]) -> [String] {
     let maxWidth = nodes.map { $0.label.count + 2 }.max() ?? 2
     var lines: [String] = []
     for index in nodes.indices {
         let node = nodes[index]
         let left = (maxWidth - node.label.count) / 2
         let right = maxWidth - node.label.count - left
-        lines.append(styledBorder("┌" + String(repeating: "─", count: maxWidth) + "┐", theme))
+        lines.append(styledBorder("┌" + String(repeating: "─", count: maxWidth) + "┐", theme, style: node.style))
         lines.append(
-            styledBorder("│", theme)
+            styledBorder("│", theme, style: node.style)
                 + String(repeating: " ", count: left)
-                + styledText(node.label, theme)
+                + linkedText(node, theme: theme)
                 + String(repeating: " ", count: right)
-                + styledBorder("│", theme)
+                + styledBorder("│", theme, style: node.style)
         )
-        lines.append(styledBorder("└" + String(repeating: "─", count: maxWidth) + "┘", theme))
+        lines.append(styledBorder("└" + String(repeating: "─", count: maxWidth) + "┘", theme, style: node.style))
         if index < nodes.count - 1 {
             let indent = String(repeating: " ", count: (maxWidth + 1) / 2)
-            lines.append(indent + styledEdge("│", theme))
-            lines.append(indent + styledEdge("▼", theme))
+            lines.append(indent + styledEdge("│", theme, style: edgeStyles[index]))
+            lines.append(indent + styledEdge("▼", theme, style: edgeStyles[index]))
         }
     }
     return lines
 }
 
-private func styledBorder(_ text: String, _ theme: Theme?) -> String {
-    theme?.fg(.borderMuted, text) ?? text
+private func styledBorder(_ text: String, _ theme: Theme?, style: MermaidAuthoredStyle? = nil) -> String {
+    if let style, let theme,
+       let authored = style.apply(text, border: true, fallback: theme.getFgAnsi(.borderMuted)) {
+        return authored
+    }
+    return theme?.fg(.borderMuted, text) ?? text
 }
 
 private func styledText(_ text: String, _ theme: Theme?) -> String {
     theme?.fg(.text, text) ?? text
 }
 
-private func styledEdge(_ text: String, _ theme: Theme?) -> String {
-    theme?.fg(.accent, text) ?? text
+private func styledEdge(_ text: String, _ theme: Theme?, style: MermaidAuthoredStyle? = nil) -> String {
+    if let style, let theme,
+       let authored = style.apply(text, border: true, fallback: theme.getFgAnsi(.accent)) {
+        return authored
+    }
+    return theme?.fg(.accent, text) ?? text
+}
+
+private func linkedText(_ node: MermaidNode, theme: Theme?) -> String {
+    let authored = node.style.flatMap { style in
+        theme.flatMap { style.apply(node.label, border: false, fallback: $0.getFgAnsi(.text)) }
+    }
+    let text = authored ?? styledText(node.label, theme)
+    guard theme != nil, getCapabilities().hyperlinks, let href = node.href else { return text }
+    return "\u{1B}]8;;\(href)\u{1B}\\\(text)\u{1B}]8;;\u{1B}\\"
+}
+
+private func styledNodeSpace(_ node: MermaidNode, theme: Theme?) -> String {
+    guard let theme, let style = node.style else { return " " }
+    return style.apply(" ", border: false, fallback: theme.getFgAnsi(.text)) ?? " "
 }
 
 private func markdownCodeSpan(_ line: String) -> String {

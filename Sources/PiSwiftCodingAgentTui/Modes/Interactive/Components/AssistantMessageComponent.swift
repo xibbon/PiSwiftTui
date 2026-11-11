@@ -107,11 +107,14 @@ public final class AssistantMessageComponent: Container {
         if includeMermaid && markdownConfiguration.mermaidEnabled {
             let state = markdownStreamingState
             let renderWhileStreaming = markdownConfiguration.mermaidRenderWhileStreaming
+            let streamingTransform = createMermaidMarkdownTransform(options: MermaidMarkdownTransformOptions(
+                enabled: true, renderWhileStreaming: renderWhileStreaming,
+                isStreaming: true, theme: theme))
+            let finalTransform = createMermaidMarkdownTransform(options: MermaidMarkdownTransformOptions(
+                enabled: true, renderWhileStreaming: renderWhileStreaming,
+                isStreaming: false, theme: theme))
             transforms.append { source, width in
-                let transform = createMermaidMarkdownTransform(options: MermaidMarkdownTransformOptions(
-                    enabled: true, renderWhileStreaming: renderWhileStreaming,
-                    isStreaming: state.withLock { $0 }, theme: theme))
-                return transform(source, width)
+                return state.withLock { $0 } ? streamingTransform(source, width) : finalTransform(source, width)
             }
         }
         return MarkdownOptions(
