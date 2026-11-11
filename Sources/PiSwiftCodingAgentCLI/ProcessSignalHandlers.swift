@@ -2,9 +2,52 @@ import Darwin
 import Dispatch
 import Foundation
 import PiSwiftCodingAgent
+import Synchronization
 
-func registerNonInteractiveSignalHandlers() -> [DispatchSourceSignal] {
+/// The CLI owns its session. Taking it from the lock makes every exit path dispose it once.
+final class SessionRunLifecycle: Sendable {
+    private struct State {
+        var session: AgentSession?
+        var shutdown: Task<Void, Never>?
+    }
+    private let state = Mutex(State())
+
+    func install(_ value: AgentSession) {
+        state.withLock { $0.session = value }
+    }
+
+    func disposeOnce() {
+        let value = state.withLock { current in
+            let value = current.session
+            current.session = nil
+            return value
+        }
+        value?.dispose()
+    }
+
+    func shutdownAndDispose() async {
+        let shutdown = state.withLock { current -> Task<Void, Never>? in
+            if let shutdown = current.shutdown { return shutdown }
+            guard let value = current.session else { return nil }
+            current.session = nil
+            let shutdown = Task {
+                await value.abort()
+                if let hookRunner = value.hookRunner {
+                    _ = await hookRunner.emit(SessionShutdownEvent())
+                }
+                await value.emitCustomToolSessionEvent(.shutdown)
+                value.dispose()
+            }
+            current.shutdown = shutdown
+            return shutdown
+        }
+        await shutdown?.value
+    }
+}
+
+func registerNonInteractiveSignalHandlers(onSignal: @escaping @Sendable () async -> Void = {}) -> [DispatchSourceSignal] {
     let signalQueue = DispatchQueue(label: "pi-coding-agent.non-interactive-signals")
+    let signalCount = Mutex(0)
     let signals: [(signal: Int32, exitCode: Int32)] = [
         (SIGTERM, 143),
         (SIGHUP, 129),
@@ -14,9 +57,21 @@ func registerNonInteractiveSignalHandlers() -> [DispatchSourceSignal] {
         signal(entry.signal, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: entry.signal, queue: signalQueue)
         source.setEventHandler {
-            killTrackedDetachedChildren()
-            restoreStdoutAfterMachineReadableOutput()
-            Darwin.exit(entry.exitCode)
+            let count = signalCount.withLock { value in
+                value += 1
+                return value
+            }
+            if count > 1 {
+                killTrackedDetachedChildren()
+                restoreStdoutAfterMachineReadableOutput()
+                Darwin.exit(entry.exitCode)
+            }
+            Task {
+                await onSignal()
+                killTrackedDetachedChildren()
+                restoreStdoutAfterMachineReadableOutput()
+                Darwin.exit(entry.exitCode)
+            }
         }
         source.resume()
         return source

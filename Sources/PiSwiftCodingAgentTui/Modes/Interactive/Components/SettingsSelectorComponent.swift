@@ -63,7 +63,7 @@ public struct SettingsConfig: Sendable {
         followUpMode: String,
         transport: Transport,
         sessionShareDestination: SessionShareDestination = .auto,
-        cacheWarmingMode: CacheWarmingMode = .off,
+        cacheWarmingMode: CacheWarmingMode = .idle,
         thinkingLevel: ThinkingLevel,
         availableThinkingLevels: [ThinkingLevel],
         currentTheme: String = "system",
@@ -290,7 +290,7 @@ public final class SettingsSelectorComponent: Container, MouseFocusOwner, System
             SettingItem(
                 id: "cache-warming-mode",
                 label: "Cache warming",
-                description: "Off; while the agent runs; or also between runs when continuation remains worthwhile",
+                description: "off; streaming while the agent runs; idle also between runs while continuation stays profitable",
                 currentValue: config.cacheWarmingMode.rawValue,
                 values: CacheWarmingMode.allCases.map(\.rawValue)
             ),

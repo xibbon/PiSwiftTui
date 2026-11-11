@@ -657,6 +657,15 @@ public actor RpcClient {
         return RpcForkResult(text: text, cancelled: cancelled)
     }
 
+    /// Duplicate the active branch through its current leaf entry.
+    public func clone() async throws -> Bool {
+        let response = try await send(["type": "clone"])
+        guard let data = try responseData(response) as? [String: Any] else {
+            throw RpcClientError("Invalid clone response")
+        }
+        return data["cancelled"] as? Bool ?? false
+    }
+
     public func getForkMessages() async throws -> [ForkableMessage] {
         let response = try await send(["type": "get_fork_messages"])
         guard let data = try responseData(response) as? [String: Any],

@@ -654,6 +654,13 @@ func handleRpcCommand(
         let result = try await session.fork(entryId)
         return makeSuccessResponse(idValue, "fork", ["text": result.selectedText, "cancelled": result.cancelled])
 
+    case "clone":
+        guard session.sessionManager.getLeafId() != nil else {
+            return makeErrorResponse(idValue, "clone", "Cannot clone session: no current entry selected")
+        }
+        let cancelled = !(try await session.cloneAtLeaf())
+        return makeSuccessResponse(idValue, "clone", ["cancelled": cancelled])
+
     case "get_fork_messages":
         let messages = session.getUserMessagesForForking().map { ["entryId": $0.entryId, "text": $0.text] }
         return makeSuccessResponse(idValue, "get_fork_messages", ["messages": messages])

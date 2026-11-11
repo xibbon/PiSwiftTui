@@ -242,6 +242,12 @@ private struct InteractiveHookUIContext: HookUIContext {
 }
 
 @MainActor
+private final class CacheWarmingNoticeTotal {
+    var cost: Double
+    init(cost: Double) { self.cost = cost }
+}
+
+@MainActor
 public final class InteractiveMode {
     struct ResourceDisplayOptions: Sendable {
         var extensionPaths: [String]
@@ -353,6 +359,7 @@ public final class InteractiveMode {
 
     private var streamingComponent: AssistantMessageComponent?
     private var streamingMessage: AssistantMessage?
+    private var cacheWarmingNotice: (component: ThemedText, total: CacheWarmingNoticeTotal, note: String?)?
     private var pendingTools: [String: ToolExecutionComponent] = [:]
     private let bugReportHints = BugReportHintTracker()
     private var entriesRenderedByBoundaryCompaction: Set<String> = []
@@ -1198,14 +1205,16 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    private func handleHookNewSession(_ options: HookNewSessionOptions?) async -> HookCommandResult {
+    func handleHookNewSession(_ options: HookNewSessionOptions?) async -> HookCommandResult {
         guard let session else { return HookCommandResult(cancelled: true) }
 
         loadingAnimation?.stop()
         loadingAnimation = nil
         clearWorkingIndicator()
 
-        _ = session.sessionManager.newSession(NewSessionOptions(parentSession: options?.parentSession))
+        guard await session.newSession(NewSessionOptions(parentSession: options?.parentSession)) else {
+            return HookCommandResult(cancelled: true)
+        }
 
         if let setup = options?.setup {
             await setup(session.sessionManager)
@@ -2357,8 +2366,18 @@ public final class InteractiveMode {
     @MainActor
     func addCacheWarmingUsage(_ entry: UsageEntry) {
         guard session?.settingsManager.getShowCacheMissNotices() == true else { return }
+        if let previous = cacheWarmingNotice,
+           chatContainer.children.last === previous.component,
+           previous.note == entry.note {
+            previous.total.cost += entry.usage.cost.total
+            previous.component.invalidate()
+            return
+        }
+        let total = CacheWarmingNoticeTotal(cost: entry.usage.cost.total)
+        let component = ThemedText({ theme.fg(.dim, formatCacheWarmingUsage(total.cost, entry.note)) }, paddingX: 1, paddingY: 0)
+        cacheWarmingNotice = (component, total, entry.note)
         chatContainer.addChild(Spacer(1))
-        chatContainer.addChild(ThemedText({ theme.fg(.dim, formatCacheWarmingUsage(entry)) }, paddingX: 1, paddingY: 0))
+        chatContainer.addChild(component)
     }
 
     func maybeShowAssistantDiagnostics(_ message: AssistantMessage) {
@@ -5360,14 +5379,20 @@ public final class InteractiveMode {
     @MainActor
     func handleNewSessionCommand() {
         guard let session else { return }
-        _ = session.sessionManager.newSession()
-        session.refreshContext()
-        reportingManualCompaction = false
-        programStatus.reset()
-        altScreenRenderer?.resetTextSelection()
-        chatContainer.clear()
-        showStatus("New session started")
-        scheduleRender()
+        // The command remains synchronous for the input handler. The session switch can run hooks.
+        if session.hookRunner?.hasHandlers("session_before_switch") != true {
+            programStatus.reset()
+        }
+        Task { @MainActor in
+            guard await session.newSession() else { return }
+            session.refreshContext()
+            reportingManualCompaction = false
+            programStatus.reset()
+            altScreenRenderer?.resetTextSelection()
+            chatContainer.clear()
+            showStatus("New session started")
+            scheduleRender()
+        }
     }
 
     /// v0.68.0: /clone — duplicate the current branch into a new session at the latest

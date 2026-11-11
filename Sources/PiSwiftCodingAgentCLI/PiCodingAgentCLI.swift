@@ -235,10 +235,13 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         }
 
         let shouldPrintMessages = isInteractive
+        let sessionLifecycle = SessionRunLifecycle()
         var nonInteractiveSignalSources: [DispatchSourceSignal] = []
         if !isInteractive {
             _ = takeOverStdoutForMachineReadableOutput()
-            nonInteractiveSignalSources = registerNonInteractiveSignalHandlers()
+            nonInteractiveSignalSources = registerNonInteractiveSignalHandlers {
+                await sessionLifecycle.shutdownAndDispose()
+            }
         }
         defer {
             if !nonInteractiveSignalSources.isEmpty {
@@ -652,6 +655,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             clientIdentityProvider: { clientIdentityPolicy.resolve(modelRegistry) }
         ))
         sessionBox.withLock { $0 = createdSession }
+        sessionLifecycle.install(createdSession)
+        defer { sessionLifecycle.disposeOnce() }
         let sendMessageHandler: HookSendMessageHandler = { [weak createdSession] message, options in
             guard let session = createdSession else { return }
             Task {
@@ -672,10 +677,14 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         )
         let startupDiagnostics = diagnosticDisposition.diagnostics
         if diagnosticDisposition.shouldPrint { reportStartupDiagnostics(startupDiagnostics) }
-        if diagnosticDisposition.hasRuntimeErrors { throw ExitCode.failure }
+        if diagnosticDisposition.hasRuntimeErrors {
+            await sessionLifecycle.shutdownAndDispose()
+            throw ExitCode.failure
+        }
 
         if appMode == .rpc {
             await runRpcMode(createdSession)
+            await sessionLifecycle.shutdownAndDispose()
             return
         }
 
@@ -708,7 +717,11 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                     verbose: parsed.verbose == true,
                     tuiMode: cli.parsedTuiModeOverride,
                     startupDiagnostics: startupDiagnostics,
-                    initialThemeSetting: cli.useTheme
+                    initialThemeSetting: cli.useTheme,
+                    exitProcess: { status in
+                        sessionLifecycle.disposeOnce()
+                        Darwin.exit(status)
+                    }
                 )
             }
             await interactiveMode.start(
@@ -717,15 +730,21 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                 initialImages: initialMessageResult.images
             )
         } else {
-            let status = try await runPrintMode(
-                createdSession,
-                appMode == .json ? .json : .text,
-                parsed.messages,
-                initialMessageResult.message,
-                initialMessageResult.images
-            )
-            if status != 0 {
-                throw ExitCode(Int32(status))
+            do {
+                let status = try await runPrintMode(
+                    createdSession,
+                    appMode == .json ? .json : .text,
+                    parsed.messages,
+                    initialMessageResult.message,
+                    initialMessageResult.images
+                )
+                await sessionLifecycle.shutdownAndDispose()
+                if status != 0 {
+                    throw ExitCode(Int32(status))
+                }
+            } catch {
+                await sessionLifecycle.shutdownAndDispose()
+                throw error
             }
         }
     }
