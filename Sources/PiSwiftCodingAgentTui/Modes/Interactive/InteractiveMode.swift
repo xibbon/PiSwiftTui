@@ -10,6 +10,27 @@ func visibleStartupExtensionPaths(_ paths: [String]) -> [String] {
     paths.filter { !$0.hasPrefix(BUILTIN_PATH_PREFIX) }
 }
 
+func parseImportSessionPath(_ input: String) -> String? {
+    let path = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let first = path.first else { return nil }
+    if first == "\"" || first == "'" {
+        guard let close = path.dropFirst().firstIndex(of: first) else { return nil }
+        let value = String(path[path.index(after: path.startIndex)..<close])
+        return value.isEmpty ? nil : value
+    }
+    return path.split(whereSeparator: \.isWhitespace).first.map(String.init)
+}
+
+public struct InteractiveSessionBindings: Sendable {
+    public let customToolsResult: CustomToolsLoadResult
+    public let mcpUi: InteractiveMcpUi?
+
+    public init(customToolsResult: CustomToolsLoadResult, mcpUi: InteractiveMcpUi?) {
+        self.customToolsResult = customToolsResult
+        self.mcpUi = mcpUi
+    }
+}
+
 @MainActor
 public protocol RenderRequesting: AnyObject {
     func requestRender()
@@ -270,6 +291,7 @@ public final class InteractiveMode {
     let loadedResourcesContainer = Container()
 
     private var session: AgentSession?
+    private var runtime: AgentSessionRuntime?
     var crashLog = CrashLog()
     private var tui: TUI?
     lazy var programStatus = ProgramStatusReporter(
@@ -313,7 +335,7 @@ public final class InteractiveMode {
     private var footer: FooterComponent?
     private var footerContainer: Container?
     private var customFooter: Component?
-    private var footerDataProvider: FooterDataProvider?
+    private var footerDataProvider: (any InteractiveFooterDataProvider)?
     private var footerBranchUnsubscribe: (() -> Void)?
     private var extensionDialogs: [ExtensionDialog] = []
     private var extensionDialogWaiters: [UUID: () -> Void] = [:]
@@ -335,6 +357,7 @@ public final class InteractiveMode {
     private var backgroundCatalogRefreshTask: Task<Void, Never>?
     private var setToolUIContext: (HookUIContext, Bool) -> Void = { _, _ in }
     private var setToolSendMessageHandler: (@Sendable (_ handler: @escaping HookSendMessageHandler) -> Void) = { _ in }
+    private var replacementBindings: @Sendable (AgentSession) -> InteractiveSessionBindings? = { _ in nil }
 
     private var isInitialized = false
     private(set) var loadingAnimation: WorkingStatusIndicator?
@@ -397,6 +420,7 @@ public final class InteractiveMode {
     /// The CLI exits the process. Tests can record the status instead.
     var exitProcess: @MainActor (Int32) -> Void = { Darwin.exit($0) }
     private var shutdownSession: (@MainActor () async -> Void)?
+    private var extensionShutdownRequested = false
     private var shutdownSignalCount = 0
     /// v0.70.5: signal sources for SIGHUP/SIGTERM that drive a clean shutdown so extensions
     /// receive `session_shutdown` and detached children get killed before the process exits.
@@ -415,12 +439,14 @@ public final class InteractiveMode {
     public convenience init(
         session: AgentSession,
         version: String,
+        runtime: AgentSessionRuntime? = nil,
         changelogMarkdown: String? = nil,
         scopedModels: [ScopedModel] = [],
         customTools: [LoadedCustomTool] = [],
         mcpUi: InteractiveMcpUi? = nil,
         setToolUIContext: @escaping (HookUIContext, Bool) -> Void = { _, _ in },
         setToolSendMessageHandler: @escaping @Sendable (_ handler: @escaping HookSendMessageHandler) -> Void = { _ in },
+        replacementBindings: @escaping @Sendable (AgentSession) -> InteractiveSessionBindings? = { _ in nil },
         fdPath: String? = nil,
         verbose: Bool = false,
         tuiMode: InteractiveTuiMode? = nil,
@@ -442,6 +468,7 @@ public final class InteractiveMode {
         self.exitProcess = exitProcess
         self.shutdownSession = shutdownSession
         self.session = session
+        self.runtime = runtime
         self.version = version
         self.changelogMarkdown = changelogMarkdown
         self.scopedModels = scopedModels
@@ -449,6 +476,7 @@ public final class InteractiveMode {
         self.mcpUi = mcpUi
         self.setToolUIContext = setToolUIContext
         self.setToolSendMessageHandler = setToolSendMessageHandler
+        self.replacementBindings = replacementBindings
         self.fdPath = fdPath
         self.verboseStartup = verbose
         session.toolHtmlRenderer = TuiToolHtmlRenderer(theme: theme, cwd: session.sessionManager.getCwd(),
@@ -456,12 +484,21 @@ public final class InteractiveMode {
                 guard let session else { return nil }
                 return registeredToolRenderers(name, session: session, fallback: self?.customTools[name]?.tool)
             })
+        runtime?.setRebindSession { [weak self] next in
+            await self?.rebindSession(next)
+        }
     }
 
     /// Construct a mounted component host for embedding and deterministic event tests.
     convenience init(session: AgentSession, tui: TUI, editor: EditorComponentView, renderer: AltScreenRenderer? = nil,
-                     mcpUi: InteractiveMcpUi? = nil, tuiMode: InteractiveTuiMode? = nil, verbose: Bool = false) {
-        self.init(session: session, version: VERSION, mcpUi: mcpUi, verbose: verbose, tuiMode: tuiMode)
+                     mcpUi: InteractiveMcpUi? = nil, tuiMode: InteractiveTuiMode? = nil, verbose: Bool = false,
+                     runtime: AgentSessionRuntime? = nil,
+                     replacementBindings: @escaping @Sendable (AgentSession) -> InteractiveSessionBindings? = { _ in nil },
+                     shutdownSession: (@MainActor () async -> Void)? = nil,
+                     exitProcess: @escaping @MainActor (Int32) -> Void = { Darwin.exit($0) }) {
+        self.init(session: session, version: VERSION, runtime: runtime, mcpUi: mcpUi,
+                  replacementBindings: replacementBindings, verbose: verbose, tuiMode: tuiMode,
+                  shutdownSession: shutdownSession, exitProcess: exitProcess)
         self.tui = tui
         self.ui = TuiRenderAdapter(tui)
         self.editor = editor
@@ -650,6 +687,7 @@ public final class InteractiveMode {
             SlashCommand(name: "new", description: "Start a new session"),
             SlashCommand(name: "compact", description: "Compact session"),
             SlashCommand(name: "resume", description: "Resume a session"),
+            SlashCommand(name: "import", description: "Import a session", argumentHint: "<path>"),
             SlashCommand(name: "quit", description: "Exit the agent"),
             SlashCommand(name: "exit", description: "Exit the agent"),
         ]
@@ -895,8 +933,8 @@ public final class InteractiveMode {
     func updateTerminalTitle() {
         programStatus.handleEvent(.sessionInfoChanged)
         guard let tui else { return }
-        let cwdBase = FileManager.default.currentDirectoryPath.split(separator: "/").last.map(String.init)
-            ?? FileManager.default.currentDirectoryPath
+        let cwd = session?.sessionManager.getCwd() ?? FileManager.default.currentDirectoryPath
+        let cwdBase = cwd.split(separator: "/").last.map(String.init) ?? cwd
         if let sessionName = session?.sessionManager.getSessionName(), !sessionName.isEmpty {
             tui.terminal.setTitle(replaceControlCharacters("pi - \(sessionName) - \(cwdBase)"))
         } else {
@@ -950,7 +988,7 @@ public final class InteractiveMode {
         let provider = CombinedAutocompleteProvider(
             commands: commands,
             items: [],
-            basePath: FileManager.default.currentDirectoryPath,
+            basePath: session?.sessionManager.getCwd() ?? FileManager.default.currentDirectoryPath,
             fdPath: fdPath
         )
         autocompleteProvider = provider
@@ -1007,7 +1045,7 @@ public final class InteractiveMode {
     }
 
     @MainActor
-    func initializeHooksAndCustomTools() async {
+    func initializeHooksAndCustomTools(emitStartEvent: Bool = true) async {
         guard let session else { return }
 
         mcpUi?.attach(custom: { [weak self] factory in
@@ -1237,6 +1275,13 @@ public final class InteractiveMode {
                 guard let self else { return HookCommandResult(cancelled: true) }
                 return await self.handleHookNavigateTree(targetId, options: options)
             },
+            switchSessionOptionsHandler: { [weak self] path, options in
+                guard let self else { return HookCommandResult(cancelled: true) }
+                return await self.handleHookSwitchSession(path, options: options)
+            },
+            shutdownHandler: { [weak self] in
+                Task { @MainActor [weak self] in self?.requestShutdown() }
+            },
             reloadHandler: { [weak self] in
                 await self?.handleReloadCommand()
             },
@@ -1267,7 +1312,7 @@ public final class InteractiveMode {
 
         setupHookShortcuts(hookRunner)
 
-        _ = await hookRunner.emit(SessionStartEvent())
+        if emitStartEvent { _ = await hookRunner.emit(SessionStartEvent()) }
 
         rebuildAutocomplete()
 
@@ -2045,9 +2090,10 @@ public final class InteractiveMode {
     func subscribeToAgent() {
         guard let session else { return }
         unsubscribeFromAgent()
-        unsubscribe = session.subscribe { [weak self] event in
+        unsubscribe = session.subscribe { [weak self, weak session] event in
             Task { @MainActor in
-                self?.handleSessionEvent(event)
+                guard let self, let session, self.session === session else { return }
+                self.handleSessionEvent(event)
             }
         }
         let (events, continuation) = AsyncStream<any HookEvent>.makeStream()
@@ -2148,6 +2194,10 @@ public final class InteractiveMode {
         case .agentSettled:
             // Hook follow-ups and persisted display-only entries settle after agent_end.
             renderInitialMessages()
+            if extensionShutdownRequested, session?.isIdle == true {
+                extensionShutdownRequested = false
+                requestShutdown()
+            }
         case .autoCompactionStart:
             setTransientStatus("Compacting")
         case .autoCompactionEnd(let result, let aborted, _, _):
@@ -3090,6 +3140,15 @@ public final class InteractiveMode {
         }
     }
 
+    public func requestShutdownFromHook() {
+        guard !isShuttingDown else { return }
+        if session?.isIdle == true {
+            requestShutdown()
+        } else {
+            extensionShutdownRequested = true
+        }
+    }
+
     @MainActor
     func performShutdown(fromSignal: Bool = false) async {
         guard !isShuttingDown else { return }
@@ -3651,6 +3710,12 @@ public final class InteractiveMode {
             editor.setText("")
             return
         }
+        if trimmed == "/import" || trimmed.hasPrefix("/import ") {
+            let rawPath = String(trimmed.dropFirst("/import".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            editor.setText("")
+            Task { @MainActor in await handleImportSession(rawPath) }
+            return
+        }
         if trimmed == "/quit" || trimmed == "/exit" {
             editor.setText("")
             requestShutdown()
@@ -3776,7 +3841,7 @@ public final class InteractiveMode {
             eventResult = try await session.hookRunner?.emitUserBash(UserBashEvent(
                 command: command,
                 excludeFromContext: excludeFromContext,
-                cwd: FileManager.default.currentDirectoryPath
+                cwd: session.sessionManager.getCwd()
             ))
         } catch {
             // user_bash fails closed (v0.86.0): the runner already reported the error;
@@ -3854,7 +3919,7 @@ public final class InteractiveMode {
                         bashComponent.appendOutput(chunk)
                         self.scheduleRender()
                     }
-                }, signal: abortToken)
+                }, signal: abortToken, cwd: session.sessionManager.getCwd())
             )
 
             let truncation = result.truncated ? truncateTail(result.output) : nil
@@ -4141,7 +4206,7 @@ public final class InteractiveMode {
         tui.setFocus(loader)
         ui.requestRender()
 
-        let cwd = FileManager.default.currentDirectoryPath
+        let cwd = session.sessionManager.getCwd()
         let agentDir = getAgentDir()
         let packageManager = DefaultPackageManager(cwd: cwd, agentDir: agentDir,
             settingsManager: session.settingsManager, builtinExtensions: builtInExtensions.map(\.name))
@@ -4436,6 +4501,48 @@ public final class InteractiveMode {
         }
     }
 
+    /// Ask about trust for a replacement folder in the running editor slot.
+    /// The caller applies the selected updates before it builds the new session.
+    @MainActor
+    public func selectReplacementProjectTrust(
+        cwd: String,
+        settingsManager: SettingsManager
+    ) async -> ProjectTrustOption? {
+        guard tui != nil, editorContainer != nil else { return nil }
+        let saved = settingsManager.getGlobalSettings().projectTrust ?? [:]
+        let ancestor = saved.keys.filter { cwd == $0 || cwd.hasPrefix($0 + "/") }
+            .max { $0.count < $1.count }
+        let decision = ancestor.map { ProjectTrustUpdate(path: $0, decision: saved[$0]) }
+        return await withCheckedContinuation { continuation in
+            var resolved = false
+            var selector: ProjectTrustSelectorComponent?
+            showSelector { done in
+                let view = ProjectTrustSelectorComponent(
+                    cwd: cwd,
+                    options: getProjectTrustOptions(cwd, includeSessionOnly: true),
+                    onSelect: { choice in
+                        guard !resolved else { return }
+                        resolved = true
+                        done()
+                        continuation.resume(returning: choice)
+                    },
+                    onCancel: {
+                        guard !resolved else { return }
+                        resolved = true
+                        done()
+                        continuation.resume(returning: nil)
+                    },
+                    savedDecision: decision,
+                    projectTrusted: settingsManager.getProjectTrust(cwd)
+                )
+                selector = view
+                return (component: view, focus: view)
+            }
+            // Ctrl+C follows the selector's Escape path and resolves the pending choice.
+            selectorCancel = { selector?.handleInput("\u{001B}") }
+        }
+    }
+
     @MainActor
     private func showThemeSelector() {
         guard let settingsManager = session?.settingsManager else { return }
@@ -4580,13 +4687,105 @@ public final class InteractiveMode {
     @MainActor
     func handleResumeSession(_ sessionPath: String) async {
         guard let session else { return }
-
-        if let loadingAnimation {
-            loadingAnimation.stop()
-            self.loadingAnimation = nil
+        if let runtime {
+            do {
+                let next = try await runtime.switchSessionRebinding(sessionPath)
+                showStatus("Resumed session")
+            } catch AgentSessionRuntimeError.missingSessionCwd(let issue) {
+                guard let choice = await showHookSelector(issue.prompt, issue.options) else {
+                    showStatus("Resume cancelled")
+                    return
+                }
+                do {
+                    let next: AgentSession
+                    if choice == issue.options[0] {
+                        next = try await runtime.continueMissingCwd(sessionPath, in: issue.fallbackCwd)
+                    } else if choice == issue.options[1] {
+                        next = try await runtime.forkMissingCwd(sessionPath, into: issue.fallbackCwd,
+                            sessionDir: session.sessionManager.getSessionDir())
+                    } else {
+                        showStatus("Resume cancelled")
+                        return
+                    }
+                    if choice == issue.options[0] {
+                        showStatus("Resumed session in \(issue.fallbackCwd)")
+                    } else {
+                        showStatus("Forked into new session \(next.sessionManager.getSessionId()) in \(issue.fallbackCwd)")
+                    }
+                } catch { showError(error.localizedDescription) }
+            } catch AgentSessionRuntimeError.switchCancelled {
+                showStatus("Resume cancelled")
+            } catch { showError(error.localizedDescription) }
+            return
         }
-        clearWorkingIndicator()
+        guard await session.switchSession(sessionPath) else { showStatus("Resume cancelled"); return }
+        resetSessionTranscript()
+        showStatus("Resumed session")
+    }
 
+    @MainActor
+    private func handleHookSwitchSession(_ path: String, options: HookSwitchSessionOptions?) async -> HookCommandResult {
+        guard let runtime else {
+            guard let session, await session.switchSession(path) else { return HookCommandResult(cancelled: true) }
+            resetSessionTranscript()
+            if let withSession = options?.withSession, let runner = session.hookRunner {
+                await withSession(runner.createCommandContext())
+            }
+            return HookCommandResult(cancelled: false)
+        }
+        do {
+            let next = try await runtime.switchSessionRebinding(path)
+            if let withSession = options?.withSession, let runner = next.hookRunner {
+                await withSession(runner.createCommandContext())
+            }
+            showStatus("Resumed session")
+            return HookCommandResult(cancelled: false)
+        } catch AgentSessionRuntimeError.missingSessionCwd(let issue) {
+            guard let choice = await showHookSelector(issue.prompt, issue.options) else {
+                showStatus("Resume cancelled")
+                return HookCommandResult(cancelled: true)
+            }
+            do {
+                let next: AgentSession
+                if choice == issue.options[0] {
+                    next = try await runtime.continueMissingCwd(path, in: issue.fallbackCwd)
+                } else if choice == issue.options[1] {
+                    next = try await runtime.forkMissingCwd(path, into: issue.fallbackCwd,
+                        sessionDir: session?.sessionManager.getSessionDir())
+                } else {
+                    showStatus("Resume cancelled")
+                    return HookCommandResult(cancelled: true)
+                }
+                if let withSession = options?.withSession, let runner = next.hookRunner {
+                    await withSession(runner.createCommandContext())
+                }
+                if choice == issue.options[0] {
+                    showStatus("Resumed session in \(issue.fallbackCwd)")
+                } else {
+                    showStatus("Forked into new session \(next.sessionManager.getSessionId()) in \(issue.fallbackCwd)")
+                }
+                return HookCommandResult(cancelled: false)
+            } catch {
+                showError(error.localizedDescription)
+                return HookCommandResult(cancelled: true)
+            }
+        } catch AgentSessionRuntimeError.switchCancelled {
+            return HookCommandResult(cancelled: true)
+        } catch {
+            showError(error.localizedDescription)
+            return HookCommandResult(cancelled: true)
+        }
+    }
+
+    public func switchSessionFromHook(_ path: String, options: HookSwitchSessionOptions?) async -> HookCommandResult {
+        await handleHookSwitchSession(path, options: options)
+    }
+
+    @MainActor
+    private func resetSessionTranscript() {
+        loadingAnimation?.stop()
+        loadingAnimation = nil
+        clearWorkingIndicator()
         pendingMessagesContainer?.clear()
         pendingSteeringMessages.removeAll()
         pendingFollowUpMessages.removeAll()
@@ -4595,18 +4794,108 @@ public final class InteractiveMode {
         streamingComponent = nil
         streamingMessage = nil
         pendingTools.removeAll()
-
-        let switched = await session.switchSession(sessionPath)
-        guard switched else {
-            showStatus("Resume cancelled")
-            return
-        }
-
         reportingManualCompaction = false
         programStatus.reset()
+        altScreenRenderer?.resetTextSelection()
         chatContainer.clear()
         renderInitialMessages()
-        showStatus("Resumed session")
+    }
+
+    @MainActor
+    func rebindSession(_ next: AgentSession) async {
+        resetExtensionDialogs()
+        mcpUi?.cancelManager()
+        unsubscribeFromAgent()
+        footerBranchUnsubscribe?()
+        footerDataProvider?.dispose()
+        if let customFooter = customFooter as? HookDisposableComponent { customFooter.dispose() }
+        customFooter = nil
+        hookWidgets.removeAll()
+        hookWidgetOrder.removeAll()
+        autocompleteProviderWrappers.removeAll()
+        hookShortcuts.removeAll()
+        session = next
+        if let bindings = replacementBindings(next) {
+            let tools = bindings.customToolsResult
+            customTools = Dictionary(uniqueKeysWithValues: tools.tools.map { ($0.tool.name, $0) })
+            setToolUIContext = tools.setUIContext
+            setToolSendMessageHandler = tools.setSendMessageHandler
+            mcpUi = bindings.mcpUi
+        } else {
+            customTools = Dictionary(uniqueKeysWithValues: next.customTools.map { ($0.tool.name, $0) })
+            setToolUIContext = { _, _ in }
+            setToolSendMessageHandler = { _ in }
+            mcpUi = nil
+        }
+        next.toolHtmlRenderer = TuiToolHtmlRenderer(theme: theme, cwd: next.sessionManager.getCwd(),
+            getTheme: { theme }, getRenderers: { [weak self, weak next] name in
+                guard let next else { return nil }
+                return registeredToolRenderers(name, session: next, fallback: self?.customTools[name]?.tool)
+            })
+        if let tui, let footerContainer {
+            let data = SessionFooterDataProvider(cwd: next.sessionManager.getCwd())
+            footerDataProvider = data
+            footerBranchUnsubscribe = data.onBranchChange { [weak tui] in
+                Task { @MainActor in tui?.requestRender() }
+            }
+            let replacement = FooterComponent(session: next, footerData: data)
+            footer = replacement
+            footerContainer.clear()
+            footerContainer.addChild(replacement)
+        }
+        skills = next.resourceLoader.getSkills().skills
+        setRegisteredThemes(next.resourceLoader.getThemes().themes)
+        refreshHostSettingsAfterReload()
+        updateTerminalTitle()
+        subscribeToAgent()
+        await initializeHooksAndCustomTools(emitStartEvent: false)
+        rebuildAutocomplete()
+        resetSessionTranscript()
+        ui.requestRender()
+    }
+
+    @MainActor
+    func handleImportSession(_ rawPath: String) async {
+        guard let runtime, let session else {
+            showError("Session import is unavailable")
+            return
+        }
+        guard let inputPath = parseImportSessionPath(rawPath) else {
+            showError("Usage: /import <path.jsonl>")
+            return
+        }
+        let resolved = (inputPath as NSString).expandingTildeInPath
+        guard await showHookConfirm("Import session", "Replace current session with \(inputPath)?") else {
+            showStatus("Import cancelled")
+            return
+        }
+        do {
+            let result = try await runtime.importFromJsonl(resolved)
+            if result.cancelled { showStatus("Import cancelled") }
+            else if let next = runtime.session {
+                showStatus("Session imported from: \(inputPath)")
+            }
+        } catch AgentSessionRuntimeError.missingSessionCwd(let issue) {
+            guard let choice = await showHookSelector(issue.prompt, issue.options) else {
+                showStatus("Import cancelled")
+                return
+            }
+            if choice == issue.options[0] {
+                do {
+                    let result = try await runtime.importFromJsonl(resolved, fallbackCwd: issue.fallbackCwd)
+                    if result.cancelled { showStatus("Import cancelled") }
+                    else if let next = runtime.session {
+                        showStatus("Session imported from: \(inputPath)")
+                    }
+                } catch { showError("Failed to import session: \(error.localizedDescription)") }
+            } else if choice == issue.options[1] {
+                do {
+                    let next = try await runtime.forkAndSwitch(resolved, into: issue.fallbackCwd,
+                        sessionDir: session.sessionManager.getSessionDir())
+                    showStatus("Forked into new session \(next.sessionManager.getSessionId()) in \(issue.fallbackCwd)")
+                } catch { showError("Failed to import session: \(error.localizedDescription)") }
+            } else { showStatus("Import cancelled") }
+        } catch { showError("Failed to import session: \(error.localizedDescription)") }
     }
 
     @MainActor

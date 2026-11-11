@@ -345,353 +345,83 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             }
         }
 
-        var skillsSettings = settingsManager.getSkillsSettings()
-        if parsed.noSkills == true {
-            skillsSettings.enabled = false
-        }
-
-        let resourceLoader = DefaultResourceLoader(DefaultResourceLoaderOptions(
-            cwd: cwd,
-            agentDir: getAgentDir(),
-            settingsManager: settingsManager,
-            additionalExtensionPaths: cli.extensions,
-            additionalSkillPaths: parsed.skills ?? [],
-            additionalThemePaths: parsed.themes ?? [],
-            noExtensions: parsed.noExtensions ?? false,
-            builtinExtensions: builtInExtensions.map(\.name),
-            disabledBuiltinExtensions: parsed.noMcp == true ? ["mcp"] : [],
-            noSkills: parsed.noSkills ?? false,
-            noPromptTemplates: parsed.noPromptTemplates ?? false,
-            noContextFiles: parsed.noContextFiles ?? false,
-            projectTrusted: trust.trusted,
-            offline: resolvedOffline,
-            systemPrompt: parsed.systemPrompt,
-            appendSystemPrompt: parsed.appendSystemPrompt
-        ))
-        await resourceLoader.reload()
-        time("resourceLoader.reload")
-        runtimeDiagnostics += resourceLoader.getExtensions().diagnostics
-        runtimeDiagnostics += resourceLoader.getSkills().diagnostics
-        runtimeDiagnostics += resourceLoader.getPrompts().diagnostics
-        runtimeDiagnostics += resourceLoader.getThemes().diagnostics
-
-        let allBuiltInToolsMap = createAllTools(
-            cwd: cwd,
-            options: ToolsOptions(read: ReadToolOptions(
-                autoResizeImages: settingsManager.getAutoResizeImages(),
-                blockImages: settingsManager.getBlockImages()
-            ))
+        var startupBundle: CLISessionBundle? = try await buildCLISession(
+            cwd: cwd, agentDir: agentDir, sessionManager: sessionManager, parsed: parsed,
+            extensions: cli.extensions, settingsManager: settingsManager,
+            projectTrusted: trust.trusted, authStorage: authStorage, modelRegistry: modelRegistry,
+            clientIdentityPolicy: clientIdentityPolicy, eventBus: eventBus,
+            scopedModels: scopedModels, initialModel: initialModel, initialThinking: initialThinking,
+            sessionContext: sessionContext, shouldPrintMessages: shouldPrintMessages,
+            isInteractive: isInteractive, resolvedOffline: resolvedOffline, isReplacement: false
         )
-        let excludedTools = ToolNameMatcher(parsed.excludeTools ?? [])
-        let disableCustomTools = parsed.noTools == true && parsed.tools == nil
-        let baseHookPaths = parsed.noExtensions == true ? [] : settingsManager.getHooks()
-        let hookPaths = baseHookPaths + (parsed.hooks ?? [])
-        let hookLoadResult = parsed.noExtensions == true
-            ? loadHooks(hookPaths, cwd: cwd, eventBus: eventBus)
-            : discoverAndLoadHooks(hookPaths, cwd, getAgentDir(), eventBus)
-        time("discoverAndLoadHooks")
-        runtimeDiagnostics += hookLoadResult.errors.map {
-            ResourceDiagnostic(type: "error", message: "Failed to load hook \"\($0.path)\": \($0.error)")
-        }
-
-        let baseCustomToolPaths = parsed.noExtensions == true ? [] : settingsManager.getCustomTools()
-        let customToolPaths = baseCustomToolPaths + (parsed.customTools ?? [])
-        let builtInToolNames = allBuiltInToolsMap.keys.map { $0.rawValue }
-        let customToolsResult = parsed.noExtensions == true
-            ? loadCustomTools(customToolPaths, cwd, builtInToolNames, eventBus)
-            : discoverAndLoadCustomTools(customToolPaths, cwd, builtInToolNames, getAgentDir(), eventBus)
-        time("discoverAndLoadCustomTools")
-        runtimeDiagnostics += customToolsResult.errors.map {
-            ResourceDiagnostic(type: "error", message: "Failed to load custom tool \"\($0.path)\": \($0.error)")
-        }
-
-        let extensionPaths = resourceLoader.getExtensions().paths.filter { !$0.hasPrefix(BUILTIN_PATH_PREFIX) }
-        let discoverDefaultExtensions = parsed.noExtensions != true
-        let extensionResult = await discoverAndLoadExtensions(
-                extensionPaths,
-                cwd,
-                getAgentDir(),
-                eventBus,
-                includeProjectExtensions: trust.trusted,
-                discoverDefaults: discoverDefaultExtensions
-            )
-        time("discoverAndLoadExtensions")
-        runtimeDiagnostics += extensionStartupDiagnostics(extensionResult)
-
-        // Load built-ins after trust resolution, when project settings are available.
-        let resolvedBuiltins = try await resolveBuiltinExtensionPaths(settingsManager: settingsManager,
-            names: builtInExtensions.map(\.name), cwd: cwd, agentDir: getAgentDir(), projectTrusted: trust.trusted)
-        let disabledBuiltinPaths = Set(resolvedBuiltins.extensions.filter {
-            $0.metadata.source == "builtin" && !$0.enabled
-        }.map { "-" + $0.path })
-        let explicitBuiltinPaths = Set(cli.extensions.filter { $0.hasPrefix(BUILTIN_PATH_PREFIX) })
-        let knownBuiltinPaths = Set(builtInExtensions.map { BUILTIN_PATH_PREFIX + $0.name })
-        let mcpUi = await MainActor.run { isInteractive ? InteractiveMcpUi() : nil }
-        let hostedBuiltins = startupBuiltinExtensions(
-            agentDir: URL(fileURLWithPath: agentDir, isDirectory: true), mcpUi: mcpUi
-        )
-        let inlineExtensions = selectStartupInlineExtensions(
-            hostedBuiltins + [PiReview.inlineExtension], disabledPaths: disabledBuiltinPaths,
-            explicitPaths: explicitBuiltinPaths, noExtensions: parsed.noExtensions == true,
-            noMcp: parsed.noMcp == true
-        )
-        let loadInlineExtensions: @Sendable () -> LoadExtensionsResult = {
-            var hooks: [LoadedHook] = []
-            var errors: [ExtensionLoadError] = explicitBuiltinPaths.subtracting(knownBuiltinPaths).sorted().map {
-                .invalidExtension(path: $0, reason: "Unknown built-in extension: \($0)")
-            }
-            for inlineExtension in inlineExtensions {
-                let result = ExtensionLoader.load(inlineExtension, cwd: cwd, eventBus: eventBus)
-                if let hook = result.hook {
-                    hooks.append(hook)
-                }
-                if let error = result.error {
-                    errors.append(error)
-                }
-            }
-            return LoadExtensionsResult(hooks: hooks, errors: errors)
-        }
-        let inlineExtensionResult = loadInlineExtensions()
-        runtimeDiagnostics += extensionStartupDiagnostics(inlineExtensionResult, inline: true)
-
-        let replacementResult = omitReplacedExtensions(extensionResult.hooks + inlineExtensionResult.hooks)
-        runtimeDiagnostics += replacementResult.warnings
-        let allHooks = hookLoadResult.hooks + replacementResult.hooks
-        let hookRunner: HookRunner? = allHooks.isEmpty ? nil : HookRunner(allHooks, cwd, sessionManager, modelRegistry)
-
-        let agentBox = LockedState<Agent?>(nil)
-        let sessionBox = LockedState<AgentSession?>(nil)
-        let sendMessageHandlerBox = LockedState<HookSendMessageHandler>({ _, _ in })
-
-        let getCustomToolContext: @Sendable () -> CustomToolContext = {
-            let agent = agentBox.withLock { $0 }
-            let session = sessionBox.withLock { $0 }
-            let handler = sendMessageHandlerBox.withLock { $0 }
-            return CustomToolContext(
-                sessionManager: sessionManager,
-                modelRegistry: modelRegistry,
-                model: agent?.state.model,
-                isIdle: { session?.isIdle ?? false },
-                hasPendingMessages: { (session?.pendingMessageCount ?? 0) > 0 },
-                abort: { Task { await session?.abort() } },
-                events: eventBus,
-                sendMessage: { message, options in handler(message, options) },
-                clientIdentityProvider: { clientIdentityPolicy.resolve(modelRegistry) }
-            )
-        }
-
-        let wrappedCustomTools = wrapCustomTools(customToolsResult.tools, getCustomToolContext)
-            .filter { !disableCustomTools && !excludedTools.matches($0.name) }
-
-        let extensionToolDefinitions = (hookRunner?.getExtensionTools() ?? []).map {
-            LoadedCustomTool(path: "<extension>", resolvedPath: "<extension>", tool: $0)
-        }
-        let wrappedExtensionTools = wrapCustomTools(extensionToolDefinitions, getCustomToolContext)
-            .filter { !disableCustomTools && !excludedTools.matches($0.name) }
-
-        var toolRegistry: [String: AgentTool] = [:]
-        for (name, tool) in allBuiltInToolsMap {
-            toolRegistry[name.rawValue] = tool
-        }
-        for tool in wrappedCustomTools + wrappedExtensionTools {
-            toolRegistry[tool.name] = tool
-        }
-        let allToolDefinitions = Dictionary(
-            (customToolsResult.tools + extensionToolDefinitions).map { ($0.tool.name, $0.tool) },
-            uniquingKeysWith: { _, newer in newer }
-        )
-        let builtinNames = Set(ToolName.allCases.map(\.rawValue))
-        let registryOrder = ToolName.allCases.map(\.rawValue) + (wrappedCustomTools + wrappedExtensionTools).map(\.name)
-        let toolSelection = selectStartupTools(parsed, registeredTools: registryOrder.compactMap { name in
-            guard toolRegistry[name] != nil else { return nil }
-            let definition = allToolDefinitions[name]
-            return InitialToolRegistration(name: name, isBuiltin: builtinNames.contains(name) && definition == nil,
-                exposure: definition?.exposure ?? .direct, defaultActive: definition?.defaultActive ?? true)
-        }, settingsManager: settingsManager)
-        let registeredNames = Set(toolSelection.initial.registeredToolNames)
-        toolRegistry = toolRegistry.filter { registeredNames.contains($0.key) }
-        let toolDefinitions = allToolDefinitions.filter { registeredNames.contains($0.key) }
-        let toolRegistryOrder = toolSelection.initial.registeredToolNames
-        let allTools = toolSelection.initial.activeToolNames.compactMap { toolRegistry[$0] }
-        let initialActiveToolNames = allTools.map(\.name)
-
-        let loaderSystemPrompt = resourceLoader.getSystemPrompt()
-        let loaderAppend = resourceLoader.getAppendSystemPrompt()
-        let appendSystemPrompt = loaderAppend.isEmpty ? nil : loaderAppend.joined(separator: "\n\n")
-        let makeSystemPromptOptions: @Sendable ([String]) -> BuildSystemPromptOptions = { toolNames in
-            let validToolNames = toolNames.compactMap { ToolName(rawValue: $0) }
-            return BuildSystemPromptOptions(
-                customPrompt: loaderSystemPrompt,
-                selectedTools: validToolNames,
-                appendSystemPrompt: appendSystemPrompt,
-                cwd: cwd,
-                agentDir: getAgentDir(),
-                contextFiles: resourceLoader.getAgentsFiles(),
-                skills: resourceLoader.getSkills().skills
-            )
-        }
-        let rebuildSystemPrompt: @Sendable ([String]) -> String = { toolNames in
-            do {
-                return try buildSystemPrompt(makeSystemPromptOptions(toolNames))
-            } catch {
-                // Only custom section names are validated, and the CLI passes none.
-                preconditionFailure("built-in system prompt sections are always valid: \(error)")
-            }
-        }
-
-        let systemPrompt = rebuildSystemPrompt(initialActiveToolNames)
-        time("buildSystemPrompt")
-
-        if let cliThinking = parsed.thinking {
-            initialThinking = cliThinking
-        }
-
-        let fallbackModel = initialModel ?? getModel(provider: .openai, modelId: "gpt-4o-mini")
-        let blockImages = settingsManager.getBlockImages()
-        let convertToLlmWithBlockImages: @Sendable ([AgentMessage]) -> [Message] = { messages in
-            let converted = convertToLlm(messages)
-            guard blockImages else { return converted }
-            let filtered = filterImagesFromMessages(converted)
-            if filtered.filtered > 0 {
-                if let data = "[blockImages] Defense-in-depth: filtered \(filtered.filtered) image(s) at convertToLlm layer\n".data(using: .utf8) {
-                    FileHandle.standardError.write(data)
-                }
-            }
-            return filtered.messages
-        }
-        let createdAgent = Agent(AgentOptions(
-            initialState: AgentState(
-                systemPrompt: systemPrompt,
-                model: fallbackModel,
-                thinkingLevel: initialThinking,
-                tools: allTools
-            ),
-            convertToLlm: { messages in
-                convertToLlmWithBlockImages(messages)
-            },
-            steeringMode: AgentSteeringMode(rawValue: settingsManager.getSteeringMode()),
-            followUpMode: AgentFollowUpMode(rawValue: settingsManager.getFollowUpMode()),
-            sessionId: sessionManager.getSessionId(),
-            transport: settingsManager.getTransport(),
-            thinkingBudgets: settingsManager.getThinkingBudgets(),
-            getApiKey: { provider in
-                return await authStorage.getApiKey(provider)
-            },
-            getModelAuth: { model in
-                await resolveCLIModelAuth(registry: modelRegistry, model: model,
-                    sessionId: sessionManager.getSessionId(), hookRunner: hookRunner)
-            },
-            timeoutMs: settingsManager.getHttpIdleTimeoutMs(),
-            websocketConnectTimeoutMs: settingsManager.getWebSocketConnectTimeoutMs(),
-            beforeToolCall: hookRunner.map(makeHookRunnerBeforeToolCallHook),
-            afterToolCall: hookRunner.map(makeHookRunnerAfterToolCallHook)
-        ))
-        agentBox.withLock { $0 = createdAgent }
-        let cacheWarmer = CacheWarmer(
-            stream: makeCLICacheReplay(registry: modelRegistry, policy: clientIdentityPolicy,
-                hookRunner: hookRunner),
-            sessionManager: sessionManager,
-            getMode: { settingsManager.getCacheWarmingMode() },
-            decide: { event in
-                guard let hookRunner, hookRunner.hasHandlers(event.type) else { return event.action }
-                return await hookRunner.emitCacheWarmingDecision(event)
-            },
-            onWarmed: { entry in sessionBox.withLock { $0 }?.emitCacheWarmed(entry) }
-        )
-        createdAgent.streamFn = makeCLIAgentStream(registry: modelRegistry, policy: clientIdentityPolicy,
-            sessionManager: sessionManager, agentBox: agentBox, cacheWarmer: cacheWarmer)
-
-        if initialThinking != .off && !createdAgent.state.model.reasoning {
-            createdAgent.thinkingLevel = .off
-        } else {
-            let requested = PiSwiftAI.ThinkingLevel(rawValue: initialThinking.rawValue)
-            let clamped = PiSwiftAI.clampThinkingLevel(
-                model: createdAgent.state.model,
-                requested: requested
-            )
-            createdAgent.thinkingLevel = clamped.flatMap { ThinkingLevel(rawValue: $0.rawValue) } ?? .off
-        }
-
-        if parsed.continue == true || parsed.resume == true {
-            if !sessionContext.messages.isEmpty {
-                createdAgent.messages = sessionContext.messages
-            }
-        }
-
-        if shouldPrintMessages && parsed.continue != true && parsed.resume != true {
-            let contextFiles = resourceLoader.getAgentsFiles()
-            if !contextFiles.isEmpty {
-                print("Loaded project context from:")
-                for file in contextFiles {
-                    print("  - \(file.path)")
-                }
-            }
-        }
-
-        let reloadExtensionsHook: @Sendable () async -> LoadExtensionsResult = {
-            let fileExtensions = await discoverAndLoadExtensions(
-                extensionPaths,
-                cwd,
-                getAgentDir(),
-                eventBus,
-                includeProjectExtensions: trust.trusted,
-                discoverDefaults: discoverDefaultExtensions
-            )
-            let inlineExtensions = loadInlineExtensions()
-            let replaced = omitReplacedExtensions(fileExtensions.hooks + inlineExtensions.hooks)
-            return LoadExtensionsResult(
-                hooks: replaced.hooks,
-                errors: fileExtensions.errors + inlineExtensions.errors,
-                warnings: fileExtensions.warnings + inlineExtensions.warnings + replaced.warnings
-            )
-        }
-
-        let fileCommands = loadSlashCommands(LoadSlashCommandsOptions(cwd: cwd, agentDir: getAgentDir()))
-        let promptTemplates = resourceLoader.getPrompts().prompts
-        let createdSession = AgentSession(config: AgentSessionConfig(
-            agent: createdAgent,
-            sessionManager: sessionManager,
-            settingsManager: settingsManager,
-            resourceLoader: resourceLoader,
-            projectTrusted: trust.trusted,
-            systemPromptOptions: makeSystemPromptOptions(initialActiveToolNames),
-            scopedModels: scopedModels,
-            fileCommands: fileCommands,
-            promptTemplates: promptTemplates,
-            hookRunner: hookRunner,
-            customTools: customToolsResult.tools,
-            modelRegistry: modelRegistry,
-            cacheWarmer: cacheWarmer,
-            skillsSettings: skillsSettings,
-            eventBus: eventBus,
-            usesDefaultTools: toolSelection.usesDefaultTools,
-            defaultToolModifiers: toolSelection.defaultToolModifiers,
-            excludedToolNames: toolSelection.excludedToolNames,
-            allowedToolNames: toolSelection.allowedToolNames,
-            toolRegistry: toolRegistry,
-            toolRegistryOrder: toolRegistryOrder,
-            toolDefinitions: toolDefinitions,
-            rebuildSystemPrompt: rebuildSystemPrompt,
-            reloadExtensionsHook: reloadExtensionsHook,
-            wrapExtensionTools: { tools in
-                let defs = tools.map { LoadedCustomTool(path: "<extension>", resolvedPath: "<extension>", tool: $0) }
-                let wrapped = wrapCustomTools(defs, getCustomToolContext)
-                    .filter { !disableCustomTools && !excludedTools.matches($0.name) }
-                return hookRunner.map { wrapToolsWithHooks(wrapped, $0) } ?? wrapped
-            },
-            clientIdentityProvider: { clientIdentityPolicy.resolve(modelRegistry) }
-        ))
-        sessionBox.withLock { $0 = createdSession }
-        sessionLifecycle.install(createdSession)
+        let resourceLoader = startupBundle!.resourceLoader
+        let customToolsResult = startupBundle!.customToolsResult
+        let mcpUi = startupBundle!.mcpUi
+        runtimeDiagnostics += startupBundle!.diagnostics
+        sessionLifecycle.install(startupBundle!.session)
         defer { sessionLifecycle.disposeOnce() }
-        let sendMessageHandler: HookSendMessageHandler = { [weak createdSession] message, options in
-            guard let session = createdSession else { return }
-            Task {
-                await session.sendHookMessage(message, options: options)
+        let replacementArgs = parsed
+        let replacementExtensions = cli.extensions
+        let replacementTheme = cli.useTheme
+        let bundleBox = LockedState<CLISessionBundle?>(startupBundle)
+        let replacementTrustSelector = LockedState<ProjectTrustOptionSelector?>(nil)
+        let rpcShutdownBridge = RpcShutdownBridge()
+        let runtime = AgentSessionRuntime(agentDir: agentDir, factory: { args in
+            let eventBus = createEventBus()
+            let authStorage = AuthStorage.create(getAuthPath())
+            let identitySettings = SettingsManager.create(args.cwd, args.agentDir, projectTrusted: false)
+            let identityPolicy = CLIClientIdentityPolicy(identitySettings)
+            let registry = ModelRegistry(authStorage, args.agentDir, clientIdentityProvider: {
+                identityPolicy.identity()
+            })
+            let trustContext = await resolveProjectTrustForCLI(
+                cwd: args.cwd, agentDir: args.agentDir, modelRegistry: registry, eventBus: eventBus,
+                choice: trustChoice, persistChoice: trustChoice != nil,
+                noExtensions: replacementArgs.noExtensions == true,
+                mode: appMode.hookMode, hasUI: isInteractive,
+                selectTrustOption: replacementTrustSelector.withLock { $0 }
+            )
+            let settings = trustContext.settingsManager
+            identityPolicy.useSettings(settings)
+            if isInteractive, let replacementTheme {
+                var overrides = Settings()
+                overrides.theme = replacementTheme
+                settings.applyOverrides(overrides)
             }
-        }
-        customToolsResult.setSendMessageHandler(sendMessageHandler)
-        sendMessageHandlerBox.withLock { $0 = sendMessageHandler }
+            var replacementScopedModels: [ScopedModel] = []
+            let patterns = replacementArgs.models ?? settings.getEnabledModels()
+            if let patterns, !patterns.isEmpty {
+                let scope = await resolveModelScopeWithDiagnostics(patterns, registry)
+                replacementScopedModels = scope.scopedModels
+            }
+            let defaultThinking = ThinkingLevel(rawValue: settings.getDefaultThinkingLevel()
+                ?? DEFAULT_THINKING_LEVEL.rawValue) ?? DEFAULT_THINKING_LEVEL
+            replacementScopedModels = replacementScopedModels.map { scoped in
+                let resolved = scoped.isThinkingExplicit ? (scoped.thinkingLevel ?? .off) : defaultThinking
+                return ScopedModel(model: scoped.model, thinkingLevel: resolved,
+                    isThinkingExplicit: scoped.isThinkingExplicit)
+            }
+            let context = args.sessionManager.buildSessionContext()
+            let selection = await findInitialModelForSession(replacementArgs, replacementScopedModels,
+                settings, registry, context, false)
+            let thinking = startupThinkingLevel(settingsManager: settings, model: selection.model,
+                restoredLevel: context.messages.isEmpty ? nil : context.thinkingLevel,
+                scopedModel: selection.scopedModel,
+                cliLevel: replacementArgs.thinking ?? selection.cliThinkingLevel)
+            let bundle = try await buildCLISession(
+                cwd: args.cwd, agentDir: args.agentDir, sessionManager: args.sessionManager,
+                parsed: replacementArgs, extensions: replacementExtensions,
+                settingsManager: settings, projectTrusted: trustContext.trust.trusted,
+                authStorage: authStorage, modelRegistry: registry,
+                clientIdentityPolicy: identityPolicy, eventBus: eventBus,
+                scopedModels: replacementScopedModels, initialModel: selection.model,
+                initialThinking: thinking, sessionContext: context, shouldPrintMessages: false,
+                isInteractive: isInteractive, resolvedOffline: resolvedOffline, isReplacement: true
+            )
+            bundleBox.withLock { $0 = bundle }
+            return bundle.session
+        }, initialSession: startupBundle!.session)
+        sessionLifecycle.installRuntime(runtime)
 
         runtimeDiagnostics += collectSettingsDiagnostics(settingsManager)
         let diagnosticDisposition = startupDiagnosticDisposition(
@@ -710,7 +440,8 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
         }
 
         if appMode == .rpc {
-            await runRpcMode(createdSession)
+            startupBundle = nil
+            await runRpcMode(runtime.session!, runtime: runtime, shutdownBridge: rpcShutdownBridge)
             await sessionLifecycle.shutdownAndDispose()
             return
         }
@@ -734,14 +465,22 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             printTimings()
             let interactiveMode = await MainActor.run {
                 InteractiveMode(
-                    session: createdSession,
+                    session: runtime.session!,
                     version: VERSION,
+                    runtime: runtime,
                     changelogMarkdown: changelogMarkdown,
                     scopedModels: scopedModels,
                     customTools: customToolsResult.tools,
                     mcpUi: mcpUi,
                     setToolUIContext: customToolsResult.setUIContext,
                     setToolSendMessageHandler: customToolsResult.setSendMessageHandler,
+                    replacementBindings: { replacement in
+                        bundleBox.withLock { bundle in
+                            guard let bundle, bundle.session === replacement else { return nil }
+                            return InteractiveSessionBindings(customToolsResult: bundle.customToolsResult,
+                                mcpUi: bundle.mcpUi)
+                        }
+                    },
                     fdPath: nil,
                     verbose: parsed.verbose == true,
                     tuiMode: cli.parsedTuiModeOverride,
@@ -756,6 +495,13 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
                     }
                 )
             }
+            replacementTrustSelector.withLock { selector in
+                selector = { [weak interactiveMode] targetCwd, targetSettings in
+                    await interactiveMode?.selectReplacementProjectTrust(
+                        cwd: targetCwd, settingsManager: targetSettings)
+                }
+            }
+            startupBundle = nil
             await interactiveMode.start(
                 initialMessages: parsed.messages,
                 initialMessage: initialMessageResult.message,
@@ -763,8 +509,9 @@ struct PiCodingAgentCLI: AsyncParsableCommand {
             )
         } else {
             do {
+                startupBundle = nil
                 let status = try await runPrintMode(
-                    createdSession,
+                    runtime.session!,
                     appMode == .json ? .json : .text,
                     parsed.messages,
                     initialMessageResult.message,

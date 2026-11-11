@@ -315,32 +315,134 @@ final class PendingCompactionTasks: Sendable {
     }
 }
 
-public func runRpcMode(_ session: AgentSession) async {
-    await runRpcMode(session, output: RpcOutput.takeOverStdout(), readInputLine: { readLine() })
+/// Carries an extension shutdown request across a runtime replacement and the RPC input loop.
+public final class RpcShutdownBridge: Sendable {
+    private struct State: Sendable {
+        var requested = false
+        var inputReady = false
+        var activeCommands = 0
+        var input: AsyncStream<String>.Continuation?
+        var session: AgentSession?
+    }
+    private let state = LockedState(State())
+    private let scheduleCheck: @Sendable (@escaping @Sendable () -> Void) -> Void
+
+    public init() {
+        self.scheduleCheck = { check in
+            Task {
+                await Task.yield()
+                check()
+            }
+        }
+    }
+
+    init(scheduleCheck: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void) {
+        self.scheduleCheck = scheduleCheck
+    }
+
+    public func request() {
+        let ready = state.withLock { current in
+            current.requested = true
+            return current.inputReady
+        }
+        // Match rpc-mode.ts:349-353. Let the requesting handler finish and a line
+        // already queued on this turn enter the stream before the idle check runs.
+        if ready { scheduleCheck { [self] in completeIfIdle() } }
+    }
+
+    func attach(_ input: AsyncStream<String>.Continuation, session: AgentSession) {
+        state.withLock { current in
+            current.input = input
+            current.session = session
+        }
+    }
+
+    func inputDidAttach() {
+        state.withLock { $0.inputReady = true }
+        completeIfIdle()
+    }
+
+    @discardableResult
+    func enqueue(_ line: String) -> Bool {
+        state.withLock { current in
+            guard let input = current.input else { return false }
+            if case .terminated = input.yield(line) { return false }
+            return true
+        }
+    }
+
+    func finishInput() { state.withLock { $0.input?.finish() } }
+
+    func beginCommand() { state.withLock { $0.activeCommands += 1 } }
+
+    func endCommand() {
+        state.withLock { $0.activeCommands -= 1 }
+        completeIfIdle()
+    }
+
+    func updateSession(_ session: AgentSession) {
+        state.withLock { $0.session = session }
+        completeIfIdle()
+    }
+
+    func settled(_ session: AgentSession) {
+        guard state.withLock({ $0.session === session }) else { return }
+        completeIfIdle()
+    }
+
+    private func completeIfIdle() {
+        state.withLock { current in
+            if current.requested && current.inputReady && current.activeCommands == 0 &&
+               current.session?.isIdle == true {
+                current.input?.finish()
+            }
+        }
+    }
+}
+
+public func runRpcMode(_ session: AgentSession, runtime: AgentSessionRuntime? = nil,
+                       shutdownBridge: RpcShutdownBridge? = nil) async {
+    await runRpcMode(session, runtime: runtime, shutdownBridge: shutdownBridge,
+        output: RpcOutput.takeOverStdout(), readInputLine: { readLine() })
 }
 
 // A supplied input/output pair permits host tests without process-wide stdin changes.
-func runRpcMode(_ session: AgentSession, output: RpcOutput,
-                readInputLine: @Sendable () -> String?) async {
+func runRpcMode(_ session: AgentSession, runtime: AgentSessionRuntime? = nil,
+                shutdownBridge: RpcShutdownBridge? = nil, output: RpcOutput,
+                readInputLine: @escaping @Sendable () -> String?) async {
+    let currentSession = LockedState(session)
+    let unsubscribeState = LockedState<(@Sendable () -> Void)?>(nil)
+    let shutdown = shutdownBridge ?? RpcShutdownBridge()
+    let (inputLines, inputContinuation) = AsyncStream<String>.makeStream()
+    shutdown.attach(inputContinuation, session: session)
     await installDefaultToolHtmlRenderer(session)
     let pendingCompactions = PendingCompactionTasks()
 
     // Upstream refreshes the catalogs here in the background (interactive mode starts its own
     // refresh after TUI initialization). RPC startup must not wait on the network.
-    let catalogRefresh = Task { @MainActor in
-        guard !isOfflineEnvironmentEnabled() else { return }
-        _ = await runBoundedCatalogRefresh(
-            registry: session.modelRegistry,
-            signal: CancellationToken()
-        )
+    let catalogRefresh = LockedState<Task<Void, Never>?>(nil)
+    let startCatalogRefresh: @Sendable (AgentSession) -> Void = { active in
+        let task = Task { @MainActor in
+            guard !isOfflineEnvironmentEnabled() else { return }
+            _ = await runBoundedCatalogRefresh(
+                registry: active.modelRegistry,
+                signal: CancellationToken()
+            )
+        }
+        catalogRefresh.withLock { current in
+            current?.cancel()
+            current = task
+        }
     }
-    defer { catalogRefresh.cancel() }
+    startCatalogRefresh(session)
+    defer { catalogRefresh.withLock { $0?.cancel(); $0 = nil } }
 
     let pendingHookRequests = PendingHookRequests()
     let uiContext = await MainActor.run {
         RpcHookUIContext(output: output, pending: pendingHookRequests)
     }
 
+    @Sendable func bind(_ session: AgentSession, emitStart: Bool) async -> @Sendable () -> Void {
     if let hookRunner = session.hookRunner {
         hookRunner.initialize(
             getModel: { [weak session] in session?.agent.state.model },
@@ -372,6 +474,9 @@ func runRpcMode(_ session: AgentSession, output: RpcOutput,
             setActiveToolsHandler: { [weak session] toolNames in
                 session?.setActiveToolsByName(toolNames)
             },
+            shutdownHandler: {
+                shutdown.request()
+            },
             uiContext: uiContext,
             mode: .rpc,
             hasUI: false
@@ -386,16 +491,49 @@ func runRpcMode(_ session: AgentSession, output: RpcOutput,
             ])
         }
 
-        _ = await hookRunner.emit(SessionStartEvent())
+        if emitStart { _ = await hookRunner.emit(SessionStartEvent()) }
     }
 
-    await session.emitCustomToolSessionEvent(.start, previousSessionFile: nil)
+    if emitStart { await session.emitCustomToolSessionEvent(.start, previousSessionFile: nil) }
 
-    _ = session.subscribe { event in
+    return session.subscribe { event in
         output.sendLine(encodeSessionEventJSON(event))
+        if case .agentSettled = event { shutdown.settled(session) }
+    }
     }
 
-    while let line = readInputLine() {
+    let initialUnsubscribe = await bind(session, emitStart: true)
+    unsubscribeState.withLock { $0 = initialUnsubscribe }
+    runtime?.setRebindSession { next in
+        let previous = unsubscribeState.withLock { value -> (@Sendable () -> Void)? in
+            let old = value
+            value = nil
+            return old
+        }
+        previous?()
+        await installDefaultToolHtmlRenderer(next)
+        startCatalogRefresh(next)
+        let unsubscribe = await bind(next, emitStart: false)
+        currentSession.withLock { $0 = next }
+        shutdown.updateSession(next)
+        unsubscribeState.withLock { $0 = unsubscribe }
+    }
+    defer {
+        runtime?.setRebindSession(nil)
+        unsubscribeState.withLock { $0?(); $0 = nil }
+    }
+
+    shutdown.inputDidAttach()
+    let inputTask = Task.detached {
+        while !Task.isCancelled, let line = readInputLine() {
+            if !shutdown.enqueue(line) { break }
+        }
+        shutdown.finishInput()
+    }
+    defer { inputTask.cancel(); shutdown.finishInput() }
+
+    for await line in inputLines {
+        let session = currentSession.withLock { $0 }
         guard let data = line.data(using: .utf8) else { continue }
         guard let json = try? JSONSerialization.jsonObject(with: data, options: []),
               let dict = json as? [String: Any] else {
@@ -419,17 +557,39 @@ func runRpcMode(_ session: AgentSession, output: RpcOutput,
         // Manual compaction must not block the input loop: abort can cancel it.
         if commandType == "compact" {
             let request = mapToAnyCodable(dict)
+            let compactionSession = session
+            shutdown.beginCommand()
             pendingCompactions.run {
                 let command = request.mapValues(\.jsonValue)
                 do {
-                    output.send(try await handleRpcCommand("compact", command, session, output))
+                    output.send(try await handleRpcCommand("compact", command, compactionSession, output))
                 } catch {
                     output.send(makeErrorResponse(command["id"], "compact", error.localizedDescription))
                 }
+                shutdown.endCommand()
             }
             continue
         }
-        await dispatchRpcCommand(commandType, dict, session, output)
+        shutdown.beginCommand()
+        if commandType == "switch_session", let runtime {
+            let sessionPath = dict["sessionPath"] as? String
+            guard let sessionPath else {
+                output.send(makeErrorResponse(idValue, commandType, "Missing sessionPath"))
+                shutdown.endCommand()
+                continue
+            }
+            do {
+                _ = try await runtime.switchSessionRebinding(sessionPath)
+                output.send(makeSuccessResponse(idValue, commandType, ["cancelled": false]))
+            } catch AgentSessionRuntimeError.switchCancelled {
+                output.send(makeSuccessResponse(idValue, commandType, ["cancelled": true]))
+            } catch {
+                output.send(makeErrorResponse(idValue, commandType, error.localizedDescription))
+            }
+        } else {
+            await dispatchRpcCommand(commandType, dict, session, output)
+        }
+        shutdown.endCommand()
     }
     await pendingCompactions.waitForAll()
 }

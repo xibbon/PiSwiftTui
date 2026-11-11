@@ -16,6 +16,8 @@ private func pt3SignalTrace(_ message: String) {
 final class SessionRunLifecycle: Sendable {
     private struct State {
         var session: AgentSession?
+        var runtime: AgentSessionRuntime?
+        var claimed = false
         var shutdown: Task<Void, Never>?
     }
     private let state = Mutex(State())
@@ -24,10 +26,18 @@ final class SessionRunLifecycle: Sendable {
         state.withLock { $0.session = value }
     }
 
+    /// Read the published runtime session at shutdown, including after a replacement.
+    func installRuntime(_ runtime: AgentSessionRuntime) {
+        state.withLock { $0.runtime = runtime }
+    }
+
     func disposeOnce() {
         let value = state.withLock { current in
-            let value = current.session
+            guard !current.claimed else { return nil as AgentSession? }
+            current.claimed = true
+            let value = current.runtime?.session ?? current.session
             current.session = nil
+            current.runtime = nil
             return value
         }
         value?.dispose()
@@ -40,8 +50,10 @@ final class SessionRunLifecycle: Sendable {
     func shutdownAndDispose() async {
         let shutdown = state.withLock { current -> Task<Void, Never>? in
             if let shutdown = current.shutdown { return shutdown }
-            guard let value = current.session else { return nil }
+            guard !current.claimed, let value = current.runtime?.session ?? current.session else { return nil }
+            current.claimed = true
             current.session = nil
+            current.runtime = nil
             let shutdown = Task {
                 pt3SignalTrace("lifecycle abort begin")
                 await value.abort()
