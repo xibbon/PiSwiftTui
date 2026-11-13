@@ -81,17 +81,12 @@ final class CompactionComponent: Box {
     }
 }
 
-func taskActions(_ id: TaskID) -> String {
-    "/retry \(id.rawValue) or /abort \(id.rawValue)"
-}
-
-func describeBlockedReason(_ reason: TaskBlockedReason, restarts: Double? = nil) -> String {
+func describeBlockedReason(_ reason: TaskBlockedReason) -> String {
     switch reason {
     case .missingTask: "blocked: task definition is missing"
     case .taskTooOld: "blocked: saved task version is too old"
     case .migrationFailed: "blocked: task migration failed"
-    case .restartLimit:
-        restarts.map { "parked after \($0.formatted(.number.grouping(.never))) restarts" } ?? "parked at restart limit"
+    case .restartLimit: "stopped at restart limit"
     }
 }
 
@@ -99,18 +94,27 @@ func describeNotice(_ notice: Notice) -> String {
     let task = notice.taskId.map { " #\($0.rawValue)" } ?? ""
     let kind = notice.taskKind.map { " (\($0))" } ?? ""
     let source = notice.extensionName.map { " [extension: \($0)]" } ?? ""
-    switch notice.category {
-    case .operation, .sessionFailed: return notice.displayMessage
-    case .report: return "Runtime report\(task)\(kind)\(source): \(notice.message)"
-    case .taskParked:
-        let actions = notice.taskId.map { "; " + taskActions($0) } ?? ""
-        return "Task parked\(task)\(kind)\(source): \(notice.message)\(actions)"
-    case .taskFault: return "Task fault\(task)\(kind)\(source): \(notice.message)"
-    case .extensionError: return "Extension error\(task)\(kind)\(source): \(notice.message)"
+    if let label = notice.reportLabel {
+        var details: [String] = []
+        if let info = notice.reportInfo {
+            if case .taskInterrupted(_, _, let reason, let restarts) = info {
+                details.append(reason.rawValue)
+                details.append("\(restarts.formatted(.number.grouping(.never))) restarts")
+            }
+            if case .taskFaulted(_, _, let reason) = info { details.append(reason.rawValue) }
+            if case .taskOutdated(_, _, let reason) = info { details.append(reason.rawValue) }
+            if case .hostError(let callback, _) = info { details.append("callback: \(callback.rawValue)") }
+            if case .extensionError(_, _, let conversation) = info, let conversation {
+                details.append("conversation #\(conversation.rawValue)")
+            }
+        }
+        let suffix = details.isEmpty ? "" : " [\(details.joined(separator: ", "))]"
+        return "\(label)\(task)\(kind)\(source)\(suffix): \(notice.message)"
     }
+    return notice.displayMessage
 }
 
-func describeTask(_ node: TaskGraphNode, blocked: DurableBlockedTask? = nil) -> String {
+func describeTask(_ node: TaskGraphNode) -> String {
     var status: String
     switch node.state {
     case .waiting(_, let on, _): status = "waiting on " + on.map { String($0.rawValue) }.joined(separator: ", ")
@@ -120,8 +124,8 @@ func describeTask(_ node: TaskGraphNode, blocked: DurableBlockedTask? = nil) -> 
     case .completing(let outcome): status = "completing (\(outcome))"
     case .pending(let phase), .running(let phase): status = "\(node.state.status) \(phase)"
     }
-    if let reason = blocked?.reason ?? node.blocked {
-        status = describeBlockedReason(reason, restarts: blocked?.restarts) + "; " + taskActions(node.id)
+    if let reason = node.blocked {
+        status = describeBlockedReason(reason)
     }
     let flags = [node.background ? "background" : "", node.abortRequested ? "aborting" : ""].filter { !$0.isEmpty }
     let owned = node.conversations.isEmpty ? "" : " owns conversation " + node.conversations.map { String($0.rawValue) }.joined(separator: ", ")

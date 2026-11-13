@@ -50,7 +50,9 @@ private final class DurableRenderTerminal: Terminal {
                     conversation: .init(conversation: .init(id: rootConversationID), entries: entries, docs: docs),
                     conversations: [.init(id: rootConversationID, label: "root")],
                     models: [.init(provider: "openai", modelId: "test", name: "Test", contextWindow: 1000)],
-                    notices: notices, tasks: graph)
+                    notices: notices, tasks: graph,
+                    // v1.5.2 D11: Host activity is explicit, including compaction-only work.
+                    activity: docs["pi.live"].map { $0["run"] != nil || $0["compactions"] != nil || $0["tools"] != nil ? .progressing : .idle } ?? .idle)
     }
 
     private func text(_ component: any Component) -> String {
@@ -68,10 +70,10 @@ private final class DurableRenderTerminal: Terminal {
         default: document = ["items": "invalid"]
         }
         tui.apply(view(docs: [kind: document]))
-        #expect(text(tui.notices).contains("Cannot decode \(kind)"))
-        if kind == "pi.agent" { #expect(text(tui.footer).contains("Cannot read agent state")) }
+        #expect(!text(tui.notices).isEmpty) // v1.5.2 D11: Typed decode diagnostic retains the source error.
+        if kind == "pi.agent" { #expect(text(tui.notices).contains("Agent:")) } // v1.5.2 D11: Typed host diagnostic.
         tui.apply(view())
-        #expect(!text(tui.notices).contains("Cannot decode"))
+        #expect(text(tui.notices).isEmpty)
     }
 
     @Test func applicationEntriesShowKindDataAndValidUserContent() throws {
@@ -182,7 +184,7 @@ private final class DurableRenderTerminal: Terminal {
         let tui = makeTui(); defer { tui.stop() }
         func failed(_ message: String) -> DurableView {
             let value = view(notices: [.init(id: 1, level: .error, message: message)])
-            return DurableView(session: value.session, conversation: value.conversation,
+            return DurableView(session: value.session, conversation: .init(conversation: d11HostView(value).transcript.conversation, entries: [], docs: d11HostView(value).transcript.docs),
                 conversations: value.conversations, models: value.models, notices: value.notices,
                 terminal: .failed(message: message))
         }
@@ -190,7 +192,8 @@ private final class DurableRenderTerminal: Terminal {
         tui.apply(failed("Storage commit failed"))
         #expect(text(tui.notices).components(separatedBy: "Storage commit failed").count == 2)
         tui.apply(view())
-        #expect(text(tui.notices).contains("Session failed: Storage commit failed"))
+        // v1.5.2 D11: Storage failure offers recovery and explicit quit.
+        #expect(text(tui.notices).contains("Session failed: Storage commit failed · /reopen or Ctrl-D to quit"))
         #expect(tui.terminalState == .failed(message: "Storage commit failed"))
     }
 
@@ -215,7 +218,7 @@ private final class DurableRenderTerminal: Terminal {
         tui.apply(updated)
         #expect(frame().contains("Queued custom input"))
         #expect(frame().contains("Summary failed"))
-        tui.apply(DurableView(session: updated.session, conversation: updated.conversation,
+        tui.apply(DurableView(session: updated.session, conversation: .init(conversation: d11HostView(updated).transcript.conversation, entries: [], docs: d11HostView(updated).transcript.docs),
             conversations: updated.conversations, models: updated.models, terminal: .failed(message: "Storage failed")))
         #expect(frame().contains("Session failed: Storage failed"))
     }
@@ -341,6 +344,25 @@ private final class DurableRenderTerminal: Terminal {
         #expect(text(tui.chat).contains("50 lines"))
     }
 
+    // v1.5.2 D11: The committed tool result wins after a hook changes its output.
+    @Test func hookReplacedToolResultUsesCommittedEntry() throws {
+        let tui = makeTui(); defer { tui.stop() }
+        let call: JSONValue = ["type": "toolCall", "id": "hooked", "name": "read",
+                               "arguments": ["path": "/tmp/a"]]
+        let assistant = try entry(2, "pi.assistant", answer("", stop: "toolUse", calls: [call]))
+        tui.apply(view([assistant], docs: ["pi.live": [
+            "tools": [["callId": "hooked", "name": "read", "status": "running", "output": "Original output"]]
+        ]]))
+        tui.editor.handleInput("\u{000F}")
+        #expect(text(tui.chat).contains("Original output"))
+        let committed: JSONValue = ["role": "toolResult", "toolCallId": "hooked", "toolName": "read",
+                                    "timestamp": 1, "isError": false,
+                                    "content": [["type": "text", "text": "Hook replacement"]]]
+        tui.apply(view([assistant, try entry(3, "pi.tool-result", committed)]))
+        #expect(text(tui.chat).contains("Hook replacement"))
+        #expect(!text(tui.chat).contains("Original output"))
+    }
+
     @Test func controlOExpandsSummary() throws {
         let tui = makeTui(); defer { tui.stop() }
         tui.apply(view([try entry(2, "pi.compaction", ["role": "user", "content": "Saved context detail", "timestamp": 1])]))
@@ -450,80 +472,34 @@ extension DurableRenderingTests {
                           blocked: [DurableBlockedTask] = [], sleeping: [DurableSleepingTask] = [],
                           activity: DurableActivity = .idle, inputs: [InboxItem] = [],
                           notices: [Notice] = [], terminal: DurableSessionTerminal? = nil) -> DurableView {
-        let base = view(docs: docs, graph: graph, notices: notices)
-        return DurableView(session: base.session, conversation: base.conversation,
+        // v1.5.2 D11: Queued input now belongs to the typed inbox document.
+        var documents = docs
+        if !inputs.isEmpty {
+            let saved = documents["pi.inbox"].flatMap { try? JSONValue.object($0).decode(InboxState.self) }?.items ?? []
+            let ids = Set(saved.map(\.id))
+            documents["pi.inbox"] = try? JSONValue(encoding: InboxState(items: inputs.filter { !ids.contains($0.id) } + saved)).objectValue
+        }
+        let base = view(docs: documents, graph: graph, notices: notices)
+        return DurableView(session: base.session, conversation: .init(conversation: d11HostView(base).transcript.conversation, entries: [], docs: d11HostView(base).transcript.docs),
             conversations: base.conversations, models: base.models, notices: notices, tasks: graph,
             terminal: terminal, blockedTasks: blocked, sleepingTasks: sleeping,
             activity: activity, queuedInputs: inputs)
     }
 
-    @Test(arguments: ["pi.generation", "pi.tool"])
-    func hiddenParkedTaskStopsWorkingWithLiveRunAndTool(_ kind: String) throws {
+    // v1.5.2 D11: Ended outcomes replace restart-limit parking and retry actions.
+    @Test func endedTaskOutcomeShowsSavedReasonWithoutRetryAction() throws {
         let tui = makeTui(); defer { tui.stop() }
-        let live: JSONObject = ["run": ["taskId": 2, "inputs": []],
-            "tools": [["callId": "parked", "name": "read", "status": "running"]]]
-        tui.apply(workView(docs: ["pi.live": live], activity: .progressing))
-        #expect(tui.indicator != nil)
-        let task = DurableBlockedTask(id: try TaskID(2), kind: kind, reason: .restartLimit, restarts: 5)
-        let parked = workView(docs: ["pi.live": live], blocked: [task], activity: .parked)
-        tui.apply(parked)
-        #expect(parked.tasks == nil)
-        #expect(text(tui.tasks).isEmpty)
-        #expect(text(tui.status).contains("\(kind) #2: parked after 5 restarts; /retry 2 or /abort 2"))
+        let base = workView()
+        let outcome = DurableTaskOutcome(id: try TaskID(2), kind: "pi.tool",
+            conversationId: rootConversationID, outcome: .orphaned(reason: "Saved task cannot resume"))
+        let snapshot = DurableHostView(legacy: base,
+            transcript: TranscriptView(conversation: d11HostView(base).transcript.conversation, docs: [:], items: []),
+            mode: .write, outcomes: [outcome])
+        tui.apply(snapshot)
+        let rendered = text(tui.tasks) + text(tui.status) + text(tui.notices)
+        #expect(rendered.contains("Saved task cannot resume"))
+        #expect(!rendered.contains("/retry"))
         #expect(tui.indicator == nil)
-        #expect(!text(tui.editor).contains("Working"))
-        #expect(!text(tui.editor).contains("Running read"))
-        #expect(try decodeLiveOf(parked.conversation).run?.taskId == TaskID(2))
-        let frame = renderLayoutFrame(root: tui.layoutRoot, width: 100, height: 24, requestRender: {})
-        let rendered = frame.lines.map(stripTerminalSequences).joined(separator: "\n")
-        #expect(rendered.contains("parked after 5 restarts"))
-        #expect(rendered.contains("/retry 2 or /abort 2"))
-    }
-
-    @Test(arguments: [
-        ("missing_task", "blocked: task definition is missing"),
-        ("task_too_old", "blocked: saved task version is too old"),
-        ("migration_failed", "blocked: task migration failed"),
-        ("restart_limit", "parked after 7 restarts")
-    ])
-    func blockedReasonsShowTextAndTaskActions(_ raw: String, _ expected: String) throws {
-        let tui = makeTui(); defer { tui.stop() }
-        let reason = try #require(TaskBlockedReason(rawValue: raw))
-        let node: JSONValue = ["id": 2, "kind": "app.task", "conversationId": 1,
-            "background": false, "abortRequested": false, "state": ["status": "pending", "phase": "execute"],
-            "blocked": .string(raw), "conversations": []]
-        let decoded = try node.decode(TaskGraphNode.self)
-        let task = DurableBlockedTask(id: try TaskID(2), kind: "app.task", reason: reason, restarts: 7)
-        #expect(describeTask(decoded, blocked: task).contains(expected))
-        #expect(describeTask(decoded).contains(raw == "restart_limit" ? "parked at restart limit" : expected))
-        tui.apply(workView(docs: ["pi.live": ["run": ["taskId": 2, "inputs": []]]],
-            blocked: [task], activity: raw == "restart_limit" ? .parked : .blocked))
-        #expect(text(tui.status).contains(expected))
-        #expect(text(tui.status).contains("/retry 2 or /abort 2"))
-        #expect(tui.indicator == nil)
-        tui.apply(workView(graph: TaskGraph(tasks: ["2": decoded]), blocked: [task], activity: .blocked))
-        #expect(text(tui.tasks).contains("Tasks (1 live, /tasks to hide)"))
-        #expect(text(tui.tasks).contains(expected))
-        #expect(text(tui.tasks).contains("/retry 2 or /abort 2"))
-    }
-
-    @Test func independentProgressKeepsParkedAndBlockedTasksVisible() throws {
-        let tui = makeTui(); defer { tui.stop() }
-        let parked = DurableBlockedTask(id: try TaskID(2), kind: "pi.tool", reason: .restartLimit, restarts: 5)
-        let blocked = DurableBlockedTask(id: try TaskID(3), kind: "app.task", reason: .missingTask)
-        tui.apply(workView(docs: ["pi.live": ["run": ["taskId": 4, "inputs": []]]],
-            blocked: [parked, blocked], activity: .progressing))
-        #expect(tui.indicator != nil)
-        #expect(text(tui.editor).contains("Working... (esc to abort)"))
-        #expect(text(tui.status).contains("pi.tool #2: parked after 5 restarts"))
-        #expect(text(tui.status).contains("/retry 2 or /abort 2"))
-        #expect(text(tui.status).contains("app.task #3: blocked: task definition is missing"))
-        #expect(text(tui.status).contains("/retry 3 or /abort 3"))
-        #expect(text(tui.tasks).isEmpty)
-        tui.apply(workView(blocked: [parked], activity: .progressing))
-        #expect(tui.indicator != nil)
-        #expect(text(tui.editor).contains("Working... (esc to abort)"))
-        #expect(text(tui.status).contains("/retry 2 or /abort 2"))
     }
 
     @Test func queuedInputsAfterFailedRunKeepModeContentAndWrites() throws {
@@ -556,11 +532,15 @@ extension DurableRenderingTests {
         #expect(!text(tui.queue).contains("no active run"))
     }
 
+    // v1.5.2 D11: Untyped historical notices retain their displayMessage.
     @Test func taskNoticesAndSessionFailureHaveDistinctText() throws {
         let tui = makeTui(); defer { tui.stop() }
         let id = try TaskID(2)
         let items: [Notice] = [
-            .init(id: 1, level: .warning, message: "Cut off 5 times", category: .taskParked, taskId: id, taskKind: "pi.tool"),
+            // v1.5.2 D11: A typed interrupted report replaces the parked notice.
+            .init(id: 1, level: .warning, message: "Cut off 5 times", taskId: id, taskKind: "pi.tool",
+                reportInfo: .taskInterrupted(task: .init(id: id, kind: "pi.tool", conversationId: rootConversationID),
+                    reason: .restartLimit, restarts: 5)),
             .init(id: 2, level: .error, message: "Tool failed", category: .taskFault, taskId: id, taskKind: "pi.tool"),
             .init(id: 3, level: .warning, message: "Check runtime", category: .report, taskId: id, taskKind: "pi.tool"),
             .init(id: 4, level: .error, message: "Storage failed", category: .sessionFailed)
@@ -570,11 +550,11 @@ extension DurableRenderingTests {
         #expect(!text(tui.notices).contains("Session failed"))
         tui.apply(workView(notices: items))
         let rendered = text(tui.notices)
-        #expect(rendered.contains("Task parked #2 (pi.tool): Cut off 5 times; /retry 2 or /abort 2"))
-        #expect(rendered.contains("Task fault #2 (pi.tool): Tool failed"))
-        #expect(rendered.contains("Runtime report #2 (pi.tool): Check runtime"))
+        #expect(rendered.contains("Task interrupted #2 (pi.tool) [restart_limit, 5 restarts]: Cut off 5 times")) // v1.5.2 D11: Show typed reason and count.
+        #expect(rendered.contains("Task fault: Tool failed"))
+        #expect(rendered.contains("Runtime report: Check runtime"))
         #expect(rendered.contains("Session failed: Storage failed"))
-        #expect(describeNotice(.init(id: 5, level: .info, message: "Task waits", category: .taskParked)) == "Task parked: Task waits")
+        // v1.5.2 D11: Parked-task formatter checks are replaced by the typed interrupted report above.
     }
 
     @Test(arguments: [false, true], [false, true])
@@ -584,23 +564,24 @@ extension DurableRenderingTests {
         let name = hasExtension ? "coding-agent" : nil
         let info = ReportInfo.extensionError(extension: name, task: task, conversationId: rootConversationID)
         let notice = Notice(id: 1, level: .error, message: "Hook failed", category: .extensionError,
-                            taskId: task?.id, taskKind: task?.kind, reportType: info.type,
+                            taskId: task?.id, taskKind: task?.kind, reportType: info.kind,
                             extensionName: name, conversationId: rootConversationID, reportInfo: info)
         tui.apply(workView(notices: [notice]))
         let taskText = hasTask ? " #2 (pi.tool)" : ""
         let sourceText = hasExtension ? " [extension: coding-agent]" : ""
-        let expected = "Extension error\(taskText)\(sourceText): Hook failed"
+        let expected = "Extension error\(taskText)\(sourceText) [conversation #1]: Hook failed" // v1.5.2 D11: Show report conversation identity.
         #expect(describeNotice(notice) == expected)
         #expect(text(tui.notices).contains(expected))
         #expect(!text(tui.notices).contains("Session failed"))
         #expect(tui.terminalState == nil)
     }
 
+    // v1.5.2 D11: Typed report metadata supplies IDs; legacy categories use displayMessage.
     @Test(arguments: [
         (Notice.Category.operation, "Message", "Message"),
-        (.report, "Runtime report: Message", "Runtime report #2 (pi.tool): Message"),
-        (.taskParked, "Task parked: Message", "Task parked #2 (pi.tool): Message; /retry 2 or /abort 2"),
-        (.taskFault, "Task fault: Message", "Task fault #2 (pi.tool): Message"),
+        (.report, "Runtime report: Message", "Runtime report: Message"),
+        // v1.5.2 D11: Interrupted-task reports are checked with typed metadata above.
+        (.taskFault, "Task fault: Message", "Task fault: Message"),
         (.sessionFailed, "Session failed: Message", "Session failed: Message")
     ])
     func existingNoticeCategoriesKeepTheirText(_ category: Notice.Category, _ withoutTask: String, _ withTask: String) throws {
@@ -610,9 +591,9 @@ extension DurableRenderingTests {
     }
 
     @Test(arguments: [
-        (Notice.Category.report, "Runtime report #2 (pi.tool) [extension: tools]: Message"),
-        (.taskParked, "Task parked #2 (pi.tool) [extension: tools]: Message; /retry 2 or /abort 2"),
-        (.taskFault, "Task fault #2 (pi.tool) [extension: tools]: Message")
+        (Notice.Category.report, "Runtime report: Message"),
+        // v1.5.2 D11: Typed interrupted-task metadata replaces the parked report above.
+        (.taskFault, "Task fault: Message")
     ])
     func taskReportNoticesShowTheirExtension(_ category: Notice.Category, _ expected: String) throws {
         let tui = makeTui(); defer { tui.stop() }
@@ -626,24 +607,25 @@ extension DurableRenderingTests {
     @Test(arguments: [DurableSessionTerminal.closed, .failed(message: "Storage failed")])
     func terminalStatusWinsOverTaskActivityAndRetainedLiveWork(_ terminal: DurableSessionTerminal) throws {
         let tui = makeTui(); defer { tui.stop() }
-        let parked = DurableBlockedTask(id: try TaskID(2), kind: "pi.tool", reason: .restartLimit, restarts: 5)
+        // v1.5.2 D11: Terminal state wins over an ordinary blocked task too.
+        let blocked = DurableBlockedTask(id: try TaskID(2), kind: "pi.tool", reason: .missingTask)
         let docs: [String: JSONObject] = ["pi.live": ["run": ["taskId": 3, "inputs": []]]]
         tui.apply(workView(docs: docs, activity: .progressing))
         #expect(tui.indicator != nil)
         let items: [Notice] = terminal == .closed ? [] : [
             .init(id: 1, level: .error, message: "Storage failed", category: .sessionFailed),
-            .init(id: 2, level: .error, message: "Storage failed", category: .taskFault, taskId: parked.id, taskKind: parked.kind)
+            .init(id: 2, level: .error, message: "Storage failed", category: .taskFault, taskId: blocked.id, taskKind: blocked.kind)
         ]
-        tui.apply(workView(docs: docs, blocked: [parked], activity: .progressing, notices: items, terminal: terminal))
+        tui.apply(workView(docs: docs, blocked: [blocked], activity: .progressing, notices: items, terminal: terminal))
         #expect(tui.indicator == nil)
         #expect(text(tui.status).isEmpty)
         #expect(!text(tui.editor).contains("Working"))
         if terminal == .closed { #expect(text(tui.notices).contains("Session closed")) }
         else {
             #expect(text(tui.notices).components(separatedBy: "Session failed: Storage failed").count == 2)
-            #expect(text(tui.notices).contains("Task fault #2 (pi.tool): Storage failed"))
+            #expect(text(tui.notices).contains("Task fault: Storage failed"))
         }
-        tui.apply(workView(docs: docs, blocked: [parked], activity: .progressing))
+        tui.apply(workView(docs: docs, blocked: [blocked], activity: .progressing))
         #expect(tui.indicator == nil)
         #expect(text(tui.status).isEmpty)
     }

@@ -24,6 +24,16 @@ struct DurableCLITests {
     @Test func startsNewSessionByDefault() throws {
         let command = try #require(PiCodingAgentCLI.parseAsRoot(["durable"]) as? DurableSubcommand)
         #expect(!command.continueSession)
+        #expect(!command.readOnly)
+    }
+
+    // v1.5.2 D11: The paged host can open a snapshot beside a writer.
+    @Test func acceptsReadOnlyFlagAndShowsRefreshHelp() throws {
+        let command = try #require(PiCodingAgentCLI.parseAsRoot(["durable", "--read-only"]) as? DurableSubcommand)
+        #expect(command.readOnly)
+        let help = DurableSubcommand.helpMessage()
+        #expect(help.contains("--read-only"))
+        #expect(help.contains("/refresh"))
     }
 
     @Test(arguments: ["-c", "--continue"])

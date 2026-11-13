@@ -17,7 +17,7 @@ private final class TerminalBackendFailure: Error, Sendable, LocalizedError {
     var errorDescription: String? { message }
 }
 
-private final class TerminalTestSource: DurableViewSource {
+private final class TerminalTestSource: DurableHostViewSource {
     private let view: Mutex<DurableView>
     init() {
         view = Mutex(.init(session: .init(id: "terminal", directory: "/tmp/terminal", cwd: "/tmp"),
@@ -25,6 +25,8 @@ private final class TerminalTestSource: DurableViewSource {
             conversations: [.init(id: rootConversationID, label: "main")],
             models: [.init(provider: "fake", modelId: "test", name: "Test", contextWindow: 1000)]))
     }
+    // v1.5.2 D11: The source supplies the host snapshot.
+    func hostCurrent() -> DurableHostView { d11HostView(current()) }
     func current() -> DurableView { view.withLock { $0 } }
     func subscribe(_ listener: @escaping @Sendable () -> Void) -> DurableViewSubscription {
         DurableViewSubscription {}
@@ -33,14 +35,16 @@ private final class TerminalTestSource: DurableViewSource {
     func fail() { terminate(.failed(message: "First cause")) }
     func terminate(_ terminal: DurableSessionTerminal) {
         view.withLock { current in
-            current = .init(session: current.session, conversation: current.conversation,
+            // v1.5.2 D11: This source has an empty transcript; do not read the legacy conversation.
+            current = .init(session: current.session,
+                conversation: .init(conversation: .init(id: rootConversationID), entries: [], docs: [:]),
                 conversations: current.conversations, models: current.models,
                 terminal: terminal)
         }
     }
 }
 
-private final class TerminalTestController: DurableController {
+private final class TerminalTestController: DurableHostController {
     private let actions = Mutex<[String]>([])
     var count: Int { actions.withLock { $0.count } }
     func submit(_ text: String, whenBusy: SubmitWhenBusy) async { record("submit") }
@@ -113,14 +117,18 @@ struct DurableTerminalTests {
         }
         await Task.yield()
         #expect(controller.count == 0)
-        #expect(exits == 1)
-        session.apply(source.current())
+        // v1.5.2 D11: Failure seals writes and leaves the recovery prompt open.
+        #expect(exits == 0)
+        session.apply(source.hostCurrent())
         session.terminalClosed()
+        #expect(exits == 0)
+        session.tui.editor.setText("")
+        session.tui.editor.handleInput("\u{0004}")
         #expect(exits == 1)
     }
 
     @Test(arguments: [false, true])
-    func closedObserverStopsWithoutViewNotification(_ failed: Bool) async {
+    func closedObserverStopsWithoutViewNotification(_ failed: Bool) async throws {
         let source = TerminalTestSource()
         let terminal = TerminalTestTerminal()
         let closed = HarnessChatSignal()
@@ -134,13 +142,22 @@ struct DurableTerminalTests {
         await terminal.started.wait()
         source.terminate(failed ? .failed(message: "First cause") : .closed)
         closed.signal()
+        if failed {
+            // v1.5.2 D11: Storage failure stays visible until the user quits.
+            for _ in 0..<200 where !terminal.writes.contains("/reopen or Ctrl-D to quit") {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            #expect(terminal.writes.contains("/reopen or Ctrl-D to quit"))
+            #expect(!terminal.stopped)
+            terminal.input?("\u{0004}")
+        }
         await run.value
         #expect(terminal.stopped)
         if failed { #expect(terminal.writes.contains("First cause")) }
         else { #expect(terminal.writes.contains("Session closed")) }
     }
 
-    @Test func actualBackendFailureStopsTheTuiAndWaitsForOneCleanup() async throws {
+    @Test func actualBackendFailureWaitsForQuitAndOneCleanup() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("tui-terminal-" + UUID().uuidString)
         let cwd = directory.appendingPathComponent("cwd")
         let agent = directory.appendingPathComponent("agent")
@@ -189,7 +206,7 @@ struct DurableTerminalTests {
             _ = await run.value
             throw error
         }
-        #expect(durable.view.current().terminal == .failed(message: original.message))
+        #expect(durable.hostView.hostCurrent().terminal == .failed(message: original.message))
         #expect(!finished.withLock { $0 })
         let commits = storage.commitCount
         terminal.input?("must not run")
@@ -198,6 +215,13 @@ struct DurableTerminalTests {
         terminal.input?("\u{001B}[Z")
         #expect(storage.commitCount == commits)
         cleanupRelease.signal()
+        // v1.5.2 D11: Cleanup finishes while the failed interface awaits quit.
+        for _ in 0..<200 where !terminal.writes.contains("/reopen or Ctrl-D to quit") {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(terminal.writes.contains("/reopen or Ctrl-D to quit"))
+        #expect(!finished.withLock { $0 })
+        terminal.input?("\u{0004}")
         let result = await run.value
         guard case .failed(let cause) = result else { Issue.record("Expected failed session"); return }
         #expect((cause as? TerminalBackendFailure) === original)
@@ -235,7 +259,9 @@ final class TerminalFailureStorage: DurableStorage {
     var commitCount: Int { state.withLock { $0.commits } }
     var closeCount: Int { state.withLock { $0.closes } }
     func failNextCommit(_ error: any Error) { state.withLock { $0.nextFailure = error } }
-    func commit(_ writes: [StorageWrite], context: ChordContext) async throws -> Seq {
+    // v1.5.2 D11: Exercise the batch commit surface so the D2 bridge can be removed.
+    func commit(_ batches: [[StorageWrite]], receive: @Sendable (Int, Seq) -> Void,
+                context: ChordContext) async throws -> CommitResult {
         let failure = state.withLock { state in
             state.commits += 1
             let failure = state.nextFailure
@@ -243,7 +269,7 @@ final class TerminalFailureStorage: DurableStorage {
             return failure
         }
         if let failure { throw failure }
-        return try await base.commit(writes, context: context)
+        return try await base.commit(batches, receive: receive, context: context)
     }
     func mintId<Kind: DurableIDKind>() async throws -> DurableID<Kind> {
         try await base.mintId()

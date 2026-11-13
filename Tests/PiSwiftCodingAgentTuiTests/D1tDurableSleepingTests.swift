@@ -48,6 +48,6 @@ extension D1tDurableSleepingTests {
         #expect(toolTestText(tui.tasks).isEmpty)
         tui.apply(view(.progressing))
         #expect(tui.indicator != nil)
-        #expect(toolTestText(tui.status).isEmpty)
+        #expect(toolTestText(tui.status).contains("Turn 0")) // v1.5.2 D11: The dock shows the saved turn count.
     }
 }

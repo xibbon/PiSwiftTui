@@ -8,7 +8,7 @@ import Synchronization
 import Testing
 @testable import PiSwiftCodingAgentTui
 
-private final class DurableInputSource: DurableViewSource {
+private final class DurableInputSource: DurableHostViewSource {
     private struct State {
         var view: DurableView
         var listener: (@Sendable () -> Void)?
@@ -17,6 +17,8 @@ private final class DurableInputSource: DurableViewSource {
     private let state: Mutex<State>
     private let queue = DispatchQueue(label: "durable-input-test")
     init(_ view: DurableView) { state = Mutex(State(view: view)) }
+    // v1.5.2 D11: The source supplies the host snapshot.
+    func hostCurrent() -> DurableHostView { d11HostView(current()) }
     func current() -> DurableView { state.withLock { $0.view } }
     func subscribe(_ listener: @escaping @Sendable () -> Void) -> DurableViewSubscription {
         state.withLock { $0.listener = listener }
@@ -34,7 +36,7 @@ private final class DurableInputSource: DurableViewSource {
     }
 }
 
-private actor RecordingDurableController: DurableController {
+private actor RecordingDurableController: DurableHostController {
     enum Action: Sendable, Equatable {
         case submit(String, SubmitWhenBusy)
         case compact(String?)
@@ -236,4 +238,32 @@ struct DurableInputTests {
         #expect(terminal.writes.contains("\u{001B}[?1049l"))
     }
 
+}
+
+// v1.5.2 D11: Existing rendering fixtures now use the paged host snapshot.
+// The fixture adapter keeps the saved entries and typed documents in one view.
+private struct D11SavedFixture: Decodable {
+    let conversation: ConversationView
+}
+
+func d11HostView(_ legacy: DurableView) -> DurableHostView {
+    // v1.5.2 D11: Read saved fixture data through Codable, not the deprecated host property.
+    let saved = try! JSONDecoder().decode(D11SavedFixture.self, from: JSONEncoder().encode(legacy))
+    return DurableHostView(legacy: legacy, transcript: TranscriptView(
+        conversation: saved.conversation.conversation,
+        docs: saved.conversation.docs,
+        items: saved.conversation.entries.map(TranscriptItem.entry)), mode: .write)
+}
+
+@MainActor extension DurableTui {
+    func apply(_ fixture: DurableView) { apply(d11HostView(fixture)) }
+}
+
+// v1.5.2 D11: Faux controllers implement the new host commands.
+extension DurableHostController {
+    func continueRun() async {}
+    func loadEarlier() async {}
+    func fillGap(_ gap: TranscriptGap) async {}
+    func setMaxTurns(_ value: Int?) async {}
+    func setCompactionPolicy(_ value: CompactionPolicyOverrides?) async {}
 }
